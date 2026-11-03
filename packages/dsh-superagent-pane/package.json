@@ -45,7 +45,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "dsh-superagent": "link:../dsh-superagent"
+    "dsh-superagent": "git+https://github.com/szmdshagent/dsh-superagent-plugins.git#34d3722d4405dbedd2616c37bee77de30f43e6a5&path:/packages/dsh-superagent"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "4.0.5-alpha.1",
