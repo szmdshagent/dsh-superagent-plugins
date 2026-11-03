@@ -59,7 +59,7 @@
           "source": {
             "type": "git",
             "url": "https://github.com/szmdshagent/dsh-superagent-plugins",
-            "commit": "0000000000000000000000000000000000000000",
+            "commit": "315dfcd736939d6439bd9a214f86e5d7c52da81a",
             "path": "packages/dsh-superagent"
           },
           "engines": {
@@ -100,7 +100,7 @@
           "source": {
             "type": "git",
             "url": "https://github.com/szmdshagent/dsh-superagent-plugins",
-            "commit": "0000000000000000000000000000000000000000",
+            "commit": "315dfcd736939d6439bd9a214f86e5d7c52da81a",
             "path": "packages/dsh-superagent-pane"
           },
           "engines": {
