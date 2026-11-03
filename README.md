@@ -11,7 +11,7 @@
 
 ## 安装 / Install
 
-1. 在 DSH 里打开 **Plugins → Experimental plugins**，打开 **Custom plugin indexes**。<br>In DSH, open **Plugins → Experimental plugins** and switch on **Custom plugin indexes**.
+1. 在 DSH 里打开 **Plugins → Experimental plugins**，启用 **Custom plugin indexes**。<br>In DSH, open **Plugins → Experimental plugins** and switch on **Custom plugin indexes**.
 2. 打开 **Discover** 标签页，选择 **Add index source**，填入索引 URL：<br>Open the **Discover** tab, choose **Add index source**, and enter the index URL:
 
    ```
