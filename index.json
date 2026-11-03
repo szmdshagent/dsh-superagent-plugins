@@ -1,0 +1,113 @@
+{
+  "format": 1,
+  "title": {
+    "en": "dsh-superagent plugins",
+    "zh": "dsh-superagent 插件"
+  },
+  "description": {
+    "en": "dsh-superagent and its sidebar dispatch panel, published as DSH bundles from one repository.",
+    "zh": "dsh-superagent 及其侧边栏派活面板，作为 DSH 组合包从同一个仓库发布。"
+  },
+  "metadata": {
+    "categories": {
+      "agent": {
+        "title": {
+          "en": "Agent",
+          "zh": "智能体"
+        }
+      },
+      "dispatch": {
+        "title": {
+          "en": "Dispatch",
+          "zh": "派活"
+        }
+      }
+    }
+  },
+  "plugins": [
+    {
+      "name": "dsh-superagent",
+      "title": {
+        "en": "dsh-superagent",
+        "zh": "dsh-superagent"
+      },
+      "description": {
+        "en": "A proactive agent for one GitHub repository: listens to GitHub and optionally Feishu, turns authorized requests into tickets, and executes each in its own DSH session.",
+        "zh": "面向单个 GitHub 仓库的主动式智能体：监听 GitHub（可选飞书），把获得授权的请求转成工单，并在独立的 DSH 会话里执行。"
+      },
+      "author": "DeepSeek Harness Team",
+      "homepage": "https://github.com/szmdshagent/dsh-superagent-plugins#readme",
+      "repository": {
+        "url": "https://github.com/szmdshagent/dsh-superagent-plugins",
+        "directory": "packages/dsh-superagent"
+      },
+      "metadata": {
+        "category": "agent",
+        "keywords": [
+          "superagent",
+          "github",
+          "feishu",
+          "tickets",
+          "agent",
+          "智能体"
+        ]
+      },
+      "versions": [
+        {
+          "version": "0.1.0",
+          "publishTimestamp": 1793742000,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/szmdshagent/dsh-superagent-plugins",
+            "commit": "0000000000000000000000000000000000000000",
+            "path": "packages/dsh-superagent"
+          },
+          "engines": {
+            "dsh": "^0.2.1-alpha.2"
+          }
+        }
+      ]
+    },
+    {
+      "name": "dsh-superagent-pane",
+      "title": {
+        "en": "Superagent Pane",
+        "zh": "派活面板"
+      },
+      "description": {
+        "en": "Sidebar dispatch panel for dsh-superagent: send tasks from the DSH web UI and watch what the worker is doing.",
+        "zh": "dsh-superagent 的侧边栏派活面板：在 DSH Web 界面派活，并查看 worker 正在做什么。"
+      },
+      "author": "szm",
+      "homepage": "https://github.com/szmdshagent/dsh-superagent-plugins#readme",
+      "repository": {
+        "url": "https://github.com/szmdshagent/dsh-superagent-plugins",
+        "directory": "packages/dsh-superagent-pane"
+      },
+      "metadata": {
+        "category": "dispatch",
+        "keywords": [
+          "dispatch",
+          "superagent",
+          "panel",
+          "派活"
+        ]
+      },
+      "versions": [
+        {
+          "version": "0.1.0",
+          "publishTimestamp": 1793742000,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/szmdshagent/dsh-superagent-plugins",
+            "commit": "0000000000000000000000000000000000000000",
+            "path": "packages/dsh-superagent-pane"
+          },
+          "engines": {
+            "dsh": ">=0.2.1-rc.3"
+          }
+        }
+      ]
+    }
+  ]
+}

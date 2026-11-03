@@ -1,0 +1,72 @@
+{
+  "name": "dsh-superagent-pane",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    "./package.json": "./package.json",
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./tidy": {
+      "types": "./lib/tidy.d.ts",
+      "default": "./lib/tidy.js"
+    },
+    "./client": "./lib/client.js",
+    "./guard": {
+      "types": "./lib/guard.d.ts",
+      "default": "./lib/guard.js"
+    }
+  },
+  "files": [
+    "lib"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-sidebar"
+      ]
+    },
+    "manifestVersion": 1
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0",
+    "dsh": ">=0.2.1-rc.3"
+  },
+  "scripts": {
+    "build": "tsdown",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "dsh-superagent": "link:../dsh-superagent"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "4.0.5-alpha.1",
+    "zod": "*"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.5-alpha.1",
+    "@types/node": "22.20.0",
+    "@types/react": "18.3.28",
+    "@types/react-dom": "18.3.7",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "tsdown": "0.22.14",
+    "typescript": "6.0.3"
+  },
+  "license": "MIT",
+  "author": "szm",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/szmdshagent/dsh-superagent-plugins.git",
+    "directory": "packages/dsh-superagent-pane"
+  },
+  "homepage": "https://github.com/szmdshagent/dsh-superagent-plugins#readme"
+}

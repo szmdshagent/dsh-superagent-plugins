@@ -1,0 +1,12 @@
+# Loads the panel dispatch plugin and the ticket tidy plugin into the superagent profile. Kept in this package so
+# upgrading dsh-superagent, which replaces its own source tree, cannot remove them.
+- insert:
+    - id: dsh-superagent-pane
+      name: dsh-superagent-pane
+    # Ticket tidy: writes each ended ticket's result back to its panel conversation, archives the worker session and
+    # retires the workspace once no other session is left. Turn removeDirectories on to also delete the work directory.
+    # worker 硬限制：Executor Session 改外部状态必须经 cc-worker。单列一条，插件页可见、可独立排查。
+    - id: dsh-superagent-pane-guard
+      name: dsh-superagent-pane/guard
+    - id: dsh-superagent-pane-tidy
+      name: dsh-superagent-pane/tidy
