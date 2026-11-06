@@ -675,8 +675,17 @@ window.__ModuleLoader__.load({
 						children: ["⚠ ", health?.detail ?? "执行器卡死，新消息投进去出不来。建议停止该工单后重新派活。"]
 					}),
 					expanded && stage !== "working" && summary && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
-						style: { opacity: .7 },
-						children: summary.length > 160 ? `${summary.slice(0, 160)}…` : summary
+						title: summary,
+						style: {
+							opacity: .7,
+							display: "-webkit-box",
+							WebkitLineClamp: 6,
+							WebkitBoxOrient: "vertical",
+							overflow: "hidden",
+							whiteSpace: "normal",
+							overflowWrap: "anywhere"
+						},
+						children: summary
 					})
 				]
 			});

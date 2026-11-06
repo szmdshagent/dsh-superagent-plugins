@@ -60,7 +60,7 @@ export function ThreadLine({ thread, ticketId, context }: { thread: ThreadRow; t
     <div className="dt-ticket-stage"><StageMark state={dot} icon={icon} label={label} /></div>
     <div className="dt-ticket-body">
       <div className="dt-row-title">
-        <button type="button" className="dt-open" title={thread.pollError} onClick={() => navigate({ page: 'trigger',
+        <button type="button" className="dt-open" title={thread.pollError || readableMarkers(t, thread.title)} onClick={() => navigate({ page: 'trigger',
           id: thread.key })}>{readableMarkers(t, thread.title)}</button>
       </div>
       <div className="dt-row-quote dt-line" title={quote || undefined}>{quote}</div>

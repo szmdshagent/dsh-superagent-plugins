@@ -14,12 +14,14 @@ type Input = TicketPageView['inputs'][number]
 function InputLine({ input, earlier = [] }: { input: Input; earlier?: { id: string; at: string; preview: string }[] }) {
   const { t, navigate } = usePanel()
   const trigger = input.kind === 'trigger' ? input.trigger : undefined
+  // 与按钮显示文本保持一致，供 title 提示完整内容
+  const triggerLabel = trigger ? `${actorName(t, trigger.actor)}${t('labelSeparator')}${readableMarkers(t, trigger.preview) || t('empty')}` : ''
   return <li className="dt-row">
     <Dot state={input.delivered ? 'idle' : 'warning'} label={input.delivered ? t('inputDelivered') : t('inputUndelivered')} />
     <div className="dt-row-main">
-      {trigger ? <div className="dt-row-title"><button type="button" className="dt-open" onClick={() => navigate({ page: 'trigger',
+      {trigger ? <div className="dt-row-title"><button type="button" className="dt-open" title={triggerLabel} onClick={() => navigate({ page: 'trigger',
         id: trigger.thread, query: { trigger: trigger.id } })}>
-        {actorName(t, trigger.actor)}{t('labelSeparator')}{readableMarkers(t, trigger.preview) || t('empty')}
+        {triggerLabel}
       </button></div> : <div className="dt-row-title">{valueLabel(t, 'input', input.kind)}</div>}
       <div className="dt-row-meta">{input.kind === 'trigger' && <span>{valueLabel(t, 'input', input.kind)}</span>}<When
         at={input.at} /></div>
@@ -160,7 +162,7 @@ export function TicketPage({ id }: { id: string }) {
       <InputList inputs={undelivered} />
     </Section>}
     {data.threads.length > 0 && <Section title={t('subscribedThreads')} count={data.threads.length}>
-      <ul className="dt-list">{data.threads.map(thread => <ThreadLine key={thread.key} thread={thread} ticketId={data.id}
+      <ul className="dt-list dt-detail-threads">{data.threads.map(thread => <ThreadLine key={thread.key} thread={thread} ticketId={data.id}
         context={thread.context} />)}</ul>
     </Section>}
     <div className="dt-details">

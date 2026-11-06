@@ -34,6 +34,10 @@
 .dt-open::after { content: ''; position: absolute; inset: 0; border-radius: 12px; }
 .dt-open:focus-visible { outline: none; }
 .dt-open-wrap { white-space: normal; }
+/* 详情页行标题允许 2 行，避免长标题被单行省略号截断（列表行标题由 .dt-ticket-body 规则保持单行） */
+.dt-row-title .dt-open { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; white-space: normal; overflow-wrap: anywhere; }
+/* 详情页 Subscribed Threads 行标题允许 3 行；列表页同样式的行仍保持单行 */
+.dt-detail-threads .dt-ticket-body .dt-row-title .dt-open { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; white-space: normal; overflow-wrap: anywhere; }
 .dt-open:focus-visible::after { outline: 2px solid var(--dsw-alias-brand-primary); outline-offset: 2px; }
 .dt-row-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 10px; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-caption); overflow-wrap: anywhere; }
 /* 引用/讨论预览允许换行，避免详情信息被单行省略号吃掉 */

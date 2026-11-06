@@ -340,7 +340,8 @@ function TicketBar({ ticket, activity, t, ccStatus, ccExpanded, onToggleCc, onIn
     {expanded && <CcPanel status={ccStatus} expanded={ccExpanded} onToggle={onToggleCc}
       onInterrupt={onInterrupt} onClear={onClear} busy={ccBusy} />}
     {zombie && <div style={{ color: '#e53e3e', fontSize: 11 }}>⚠ {health?.detail ?? '执行器卡死，新消息投进去出不来。建议停止该工单后重新派活。'}</div>}
-    {expanded && stage !== 'working' && summary && <div style={{ opacity: 0.7 }}>{summary.length > 160 ? `${summary.slice(0, 160)}…` : summary}</div>}
+    {expanded && stage !== 'working' && summary && <div title={summary} style={{ opacity: 0.7, display: '-webkit-box', WebkitLineClamp: 6,
+      WebkitBoxOrient: 'vertical', overflow: 'hidden', whiteSpace: 'normal', overflowWrap: 'anywhere' }}>{summary}</div>}
   </div>
 }
 
