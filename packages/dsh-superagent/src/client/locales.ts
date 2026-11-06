@@ -80,6 +80,7 @@ const TEXT = {
   automatedEarlier: ['同一发送者之前还有 {count} 条自动消息', '{count} earlier automated messages from the same sender'],
   collapse: ['收起', 'Collapse'],
   expand: ['展开全文', 'Show all'],
+  expandShort: ['展开', 'Expand'],
   cardMarker: ['[卡片消息]', '[card message]'],
   setupProblem: ['部署检查未通过：{detail}', 'Deployment check failed: {detail}'],
   hostNotRunning: ['dsh-superagent 没有响应：它可能正在重启；持续如此时，DSH 的日志写明原因，常见的是配置有误。', 'dsh-superagent is not answering: it may be restarting; if this persists, the DSH log names the cause, often a configuration error.'],
