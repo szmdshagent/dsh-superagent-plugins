@@ -53,6 +53,9 @@ export function ThreadLine({ thread, ticketId, context }: { thread: ThreadRow; t
   const live = thread.tickets.filter(ticket => ticket.state === 'open' && ticket.id !== ticketId)
   const { dot, icon, label } = threadMark(t, thread)
   const reaches = live.length > 0 && `${live[0]!.title}${live.length > 1 ? t('andMore', { count: live.length - 1 }) : ''}`
+  const quote = thread.latest
+    ? `${actorName(t, thread.latest.actor)}${t('labelSeparator')}${readableMarkers(t, thread.latest.preview) || t('empty')}`
+    : ''
   return <li className="dt-row dt-link dt-ticket">
     <div className="dt-ticket-stage"><StageMark state={dot} icon={icon} label={label} /></div>
     <div className="dt-ticket-body">
@@ -60,10 +63,7 @@ export function ThreadLine({ thread, ticketId, context }: { thread: ThreadRow; t
         <button type="button" className="dt-open" title={thread.pollError} onClick={() => navigate({ page: 'trigger',
           id: thread.key })}>{readableMarkers(t, thread.title)}</button>
       </div>
-      <div className="dt-row-quote dt-line">
-        {thread.latest && <>{actorName(t, thread.latest.actor)}{t('labelSeparator')}{readableMarkers(t, thread.latest.preview)
-          || t('empty')}</>}
-      </div>
+      <div className="dt-row-quote dt-line" title={quote || undefined}>{quote}</div>
       <div className="dt-row-meta dt-line">
         <ThreadChip thread={thread} />
         {context && <ContextTag />}
@@ -91,7 +91,7 @@ export function DecisionLine({ decision }: { decision: DecisionRow }) {
           {decision.ticketTitle ?? (decision.threadTitle ? readableMarkers(t, decision.threadTitle) : preview || t('empty'))}
         </button>
       </div>
-      <div className="dt-row-quote dt-line">{preview}</div>
+      <div className="dt-row-quote dt-line" title={preview || undefined}>{preview}</div>
       <div className="dt-row-meta dt-line">
         {reason && <span className="dt-line-text">{reason}</span>}
         {matched.length > 0 && <LabelValue label={t('ruleLabel')} value={matched.join(t('listSeparator'))} />}

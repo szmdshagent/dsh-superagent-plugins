@@ -36,7 +36,8 @@
 .dt-open-wrap { white-space: normal; }
 .dt-open:focus-visible::after { outline: 2px solid var(--dsw-alias-brand-primary); outline-offset: 2px; }
 .dt-row-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 10px; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-caption); overflow-wrap: anywhere; }
-.dt-row-quote { font-size: 13px; line-height: 20px; color: var(--dsw-alias-label-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 引用/讨论预览允许换行，避免详情信息被单行省略号吃掉 */
+.dt-row-quote { font-size: 13px; line-height: 20px; color: var(--dsw-alias-label-secondary); overflow: hidden; text-overflow: ellipsis; white-space: normal; overflow-wrap: anywhere; }
 .dt-clamp { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
 /* Transparent block borders preserve vertical spacing when line clamping clips padding. */
 .dt-banner:is(.dt-clamp, .dt-clamp-8) { padding-block: 0; border-block: 8px solid transparent; }
@@ -335,6 +336,8 @@ div.dt-preview-head { color: var(--dsw-alias-label-secondary); }
 .dt-ticket-actions, .dt-row-buttons, .dt-row-actions { pointer-events: none; }
 .dt-ticket-actions > *, .dt-row-buttons > *, .dt-row-actions > * { pointer-events: auto; }
 .dt-line { min-height: 20px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* 引用/讨论预览允许换行，最多 3 行再省略；特异性高于 .dt-line，可覆盖其 nowrap */
+.dt-row-quote.dt-line { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; white-space: normal; overflow-wrap: anywhere; }
 .dt-row-meta.dt-line { flex-wrap: nowrap; }
 .dt-line-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dt-error-text { color: var(--dsw-alias-state-error-primary); }
