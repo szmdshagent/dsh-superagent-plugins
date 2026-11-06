@@ -34,9 +34,14 @@
 .dt-open::after { content: ''; position: absolute; inset: 0; border-radius: 12px; }
 .dt-open:focus-visible { outline: none; }
 .dt-open-wrap { white-space: normal; }
+/* 详情页行标题允许 2 行，避免长标题被单行省略号截断（列表行标题由 .dt-ticket-body 规则保持单行） */
+.dt-row-title .dt-open { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; white-space: normal; overflow-wrap: anywhere; }
+/* 详情页 Subscribed Threads 行标题允许 3 行；列表页同样式的行仍保持单行 */
+.dt-detail-threads .dt-ticket-body .dt-row-title .dt-open { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; white-space: normal; overflow-wrap: anywhere; }
 .dt-open:focus-visible::after { outline: 2px solid var(--dsw-alias-brand-primary); outline-offset: 2px; }
 .dt-row-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 10px; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-caption); overflow-wrap: anywhere; }
-.dt-row-quote { font-size: 13px; line-height: 20px; color: var(--dsw-alias-label-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 引用/讨论预览允许换行，避免详情信息被单行省略号吃掉 */
+.dt-row-quote { font-size: 13px; line-height: 20px; color: var(--dsw-alias-label-secondary); overflow: hidden; text-overflow: ellipsis; white-space: normal; overflow-wrap: anywhere; }
 .dt-clamp { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
 /* Transparent block borders preserve vertical spacing when line clamping clips padding. */
 .dt-banner:is(.dt-clamp, .dt-clamp-8) { padding-block: 0; border-block: 8px solid transparent; }
@@ -335,6 +340,8 @@ div.dt-preview-head { color: var(--dsw-alias-label-secondary); }
 .dt-ticket-actions, .dt-row-buttons, .dt-row-actions { pointer-events: none; }
 .dt-ticket-actions > *, .dt-row-buttons > *, .dt-row-actions > * { pointer-events: auto; }
 .dt-line { min-height: 20px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* 引用/讨论预览允许换行，最多 3 行再省略；特异性高于 .dt-line，可覆盖其 nowrap */
+.dt-row-quote.dt-line { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; white-space: normal; overflow-wrap: anywhere; }
 .dt-row-meta.dt-line { flex-wrap: nowrap; }
 .dt-line-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dt-error-text { color: var(--dsw-alias-state-error-primary); }
@@ -380,3 +387,28 @@ a.dt-btn, a.dt-btn:hover { text-decoration: none; }
 .dt-admission-slot { display: inline-flex; flex: none; width: 16px; }
 .dt-info-warn { color: var(--dsw-alias-state-warn-primary); }
 .dt-field-segmented { max-width: 240px; }
+
+/* 长文本折叠块：折叠态限高约 3 行，框内可滚轮下滑看全文，控件见 .dt-fold-toggle；展开态由 is-expanded 去掉限高。 */
+.dt-fold { display: block; -webkit-line-clamp: none; -webkit-box-orient: initial; max-height: 4.65em; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; white-space: normal; overflow-wrap: anywhere; }
+.dt-fold::-webkit-scrollbar { width: 8px; }
+.dt-fold::-webkit-scrollbar-thumb { background: rgba(127,127,127,.35); border-radius: 4px; }
+/* `.dt-row-quote.dt-line`（0,2,0）自带 3 行 clamp，优先级高于 .dt-fold，这里同样覆盖成可滚动限高。 */
+.dt-row-quote.dt-line.dt-fold {
+  display: block; -webkit-line-clamp: none; -webkit-box-orient: initial; max-height: 4.65em; overflow-y: auto;
+  overscroll-behavior: contain; scrollbar-width: thin; white-space: normal; overflow-wrap: anywhere; text-overflow: clip;
+}
+/* 标题按钮自带 clamp 选择器（`.dt-row-title .dt-open` 等）优先级更高，这里同样改成可滚动限高。 */
+.dt-row-title .dt-open.dt-fold,
+.dt-detail-threads .dt-ticket-body .dt-row-title .dt-open.dt-fold {
+  display: block; -webkit-line-clamp: none; -webkit-box-orient: initial; max-height: 4.65em; overflow-y: auto;
+  overscroll-behavior: contain; scrollbar-width: thin; white-space: normal; overflow-wrap: anywhere;
+}
+/* MarkdownLite 的 flex 子块会让 Firefox 的 line-clamp 失效，折叠态改成普通块布局（间距用 margin 补齐）。 */
+.dt-fold .dt-md { display: block; }
+.dt-fold .dt-md > * + * { margin-top: 6px; }
+.dt-fold .dt-md ul, .dt-fold .dt-md ol { display: block; padding-left: 20px; }
+.dt-fold .dt-md li + li { margin-top: 2px; }
+/* 展开态：去掉 clamp、限高与裁剪，覆盖详情页线程行的三段式选择器（0,4,0）。 */
+.dt-fold.is-expanded, .dt-row-quote.is-expanded, .dt-trigger-text.is-expanded, .dt-row-title .dt-open.is-expanded, .dt-detail-threads .dt-ticket-body .dt-row-title .dt-open.is-expanded { display: block; -webkit-line-clamp: none; max-height: none; overflow: visible; }
+.dt-fold-toggle { position: relative; z-index: 1; align-self: flex-start; margin-top: 2px; font-size: 12px; line-height: 18px; }
+.dt-fold-toggle:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary); outline-offset: 2px; }

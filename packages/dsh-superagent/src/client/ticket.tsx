@@ -1,7 +1,8 @@
 /** Ticket detail page: stage and actions, Mandate details, undelivered/delivered Inputs, subscribed Threads, and Assignments. */
-import { useState, type ReactNode } from 'react'
+import { useRef, useState, type ReactNode } from 'react'
 import { ApiError, usePoll, type TicketPageView } from './api.ts'
 import { DisclosureRow, Dot, Icon, Tag, type IconName } from './controls.tsx'
+import { FoldedText, FoldedTitle, FoldToggle, useFold } from './fold.tsx'
 import { decisionMark, reportDot, ticketMark } from './marks.ts'
 import { usePanel } from './provider.tsx'
 import { settingsRoute } from './route.ts'
@@ -14,16 +15,18 @@ type Input = TicketPageView['inputs'][number]
 function InputLine({ input, earlier = [] }: { input: Input; earlier?: { id: string; at: string; preview: string }[] }) {
   const { t, navigate } = usePanel()
   const trigger = input.kind === 'trigger' ? input.trigger : undefined
+  // 与按钮显示文本保持一致，供 title 提示完整内容
+  const triggerLabel = trigger ? `${actorName(t, trigger.actor)}${t('labelSeparator')}${readableMarkers(t, trigger.preview) || t('empty')}` : ''
   return <li className="dt-row">
     <Dot state={input.delivered ? 'idle' : 'warning'} label={input.delivered ? t('inputDelivered') : t('inputUndelivered')} />
     <div className="dt-row-main">
-      {trigger ? <div className="dt-row-title"><button type="button" className="dt-open" onClick={() => navigate({ page: 'trigger',
-        id: trigger.thread, query: { trigger: trigger.id } })}>
-        {actorName(t, trigger.actor)}{t('labelSeparator')}{readableMarkers(t, trigger.preview) || t('empty')}
-      </button></div> : <div className="dt-row-title">{valueLabel(t, 'input', input.kind)}</div>}
+      {trigger ? <FoldedTitle text={triggerLabel} title={triggerLabel} onClick={() => navigate({ page: 'trigger',
+        id: trigger.thread, query: { trigger: trigger.id } })} /> : <div className="dt-row-title">{valueLabel(t, 'input',
+        input.kind)}</div>}
       <div className="dt-row-meta">{input.kind === 'trigger' && <span>{valueLabel(t, 'input', input.kind)}</span>}<When
         at={input.at} /></div>
-      {(input.kind === 'text' || input.kind === 'note') && input.text && <div className="dt-row-quote"><MarkdownLite text={input.text} /></div>}
+      {(input.kind === 'text' || input.kind === 'note') && input.text && <FoldedText text={input.text}
+        className="dt-row-quote"><MarkdownLite text={input.text} /></FoldedText>}
       {trigger?.handback && <Hint>{t('inputHandedBack', { reason: trigger.handback.reason })}</Hint>}
       <Earlier items={earlier} />
     </div>
@@ -35,6 +38,19 @@ function InputList({ inputs }: { inputs: Input[] }) {
   const shown = (input: Input) => ({ id: input.id, at: input.at, preview: input.kind === 'trigger' ? input.trigger?.preview ?? '' : '' })
   return <ul className="dt-list">{automatedRuns(inputs, sender).map(run => <InputLine key={run.item.id} input={run.item}
     earlier={run.earlier.map(shown)} />)}</ul>
+}
+
+/** 决策正文可折叠：「展开」控件放在链接外，避免在按钮里嵌套按钮。 */
+function TriggerLink({ text, meta, onClick }: { text: string; meta: ReactNode; onClick: () => void }) {
+  const ref = useRef<HTMLSpanElement>(null)
+  const { expanded, overflow, toggle } = useFold(ref, text)
+  return <>
+    <button type="button" className="dt-trigger-link" onClick={onClick}>
+      <span ref={ref} className={expanded ? 'dt-trigger-text is-expanded' : 'dt-trigger-text dt-fold'}>{text}</span>
+      <span className="dt-row-meta">{meta}</span>
+    </button>
+    <FoldToggle shown={overflow} expanded={expanded} onToggle={toggle} />
+  </>
 }
 
 function Details({ icon, title, open = false, children }: { icon: IconName; title: ReactNode; open?: boolean; children: ReactNode }) {
@@ -80,11 +96,9 @@ function MandateDetails({ ticket, actor }: { ticket: TicketPageView; actor: stri
   const facts = ticket.basis.facts.filter(item => !(item.name === 'sender' && item.value === actor))
   const direction = decision?.direction
   const rows: [string, ReactNode][] = decision ? [
-    [t('term.trigger'), <button type="button" className="dt-trigger-link" onClick={() => navigate({ page: 'trigger', id: decision.thread,
-      query: { trigger: decision.triggerIds[0] ?? '' } })}>
-      <span className="dt-trigger-text">{readableMarkers(t, decision.preview) || t('empty')}</span>
-      <span className="dt-row-meta"><span>{valueLabel(t, 'source', mandate.actor.source)} · {actor}</span><When at={decision.at} /></span>
-    </button>],
+    [t('term.trigger'), <TriggerLink text={readableMarkers(t, decision.preview) || t('empty')}
+      meta={<><span>{valueLabel(t, 'source', mandate.actor.source)} · {actor}</span><When at={decision.at} /></>}
+      onClick={() => navigate({ page: 'trigger', id: decision.thread, query: { trigger: decision.triggerIds[0] ?? '' } })} />],
     [t('term.decision'), <div className="dt-kv-stack">
       <span>{decisionMark(t, decision.outcome).label}</span>
       <Hint>{reasonLabel(t, decision.reason)}</Hint>
@@ -159,8 +173,8 @@ export function TicketPage({ id }: { id: string }) {
       <InputList inputs={undelivered} />
     </Section>}
     {data.threads.length > 0 && <Section title={t('subscribedThreads')} count={data.threads.length}>
-      <ul className="dt-list">{data.threads.map(thread => <ThreadLine key={thread.key} thread={thread} ticketId={data.id}
-        context={thread.context} />)}</ul>
+      <ul className="dt-list dt-detail-threads">{data.threads.map(thread => <ThreadLine key={thread.key} thread={thread} ticketId={data.id}
+        context={thread.context} fold />)}</ul>
     </Section>}
     <div className="dt-details">
       {/* A single Assignment adds nothing beyond the status line; list Assignments only once work has been resumed or handed over. */}
