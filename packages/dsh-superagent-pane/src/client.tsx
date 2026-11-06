@@ -537,10 +537,11 @@ function TicketBar({ ticket, activity, t, ccStatus, ccExpanded, onToggleCc, onIn
     {expanded && <CcPanel status={ccStatus} expanded={ccExpanded} onToggle={onToggleCc}
       onInterrupt={onInterrupt} onClear={onClear} busy={ccBusy} />}
     {zombie && <div style={{ color: '#e53e3e', fontSize: 11 }}>⚠ {health?.detail ?? '执行器卡死，新消息投进去出不来。建议停止该工单后重新派活。'}</div>}
-    {/* 展开态就是「展开看全文」：不再做行数/溢出截断，卡片自身负责折叠。
+    {/* 展开态就是「展开看全文」：摘要框限高 + 框内滚轮下滑，卡片自身负责折叠。
         运行中（working）也显示已有 summary——worker 在跑不代表报告内容不该看。 */}
     {expanded && summary && <div title={summary} data-pane-ticket-summary={ticket.id} style={{ opacity: 0.7,
-      whiteSpace: 'normal', overflowWrap: 'anywhere' }}>{summary}</div>}
+      whiteSpace: 'normal', overflowWrap: 'anywhere', maxHeight: 260, overflowY: 'auto',
+      overscrollBehavior: 'contain', scrollbarWidth: 'thin' }}>{summary}</div>}
     {expanded && <div data-pane-ticket-comment-box={ticket.id}
       style={{ display: 'flex', flexDirection: 'column', gap: 4, borderTop: '1px solid var(--dt-border, #333)', paddingTop: 5 }}>
       <div style={{ display: 'flex', gap: 4, alignItems: 'flex-end' }}>

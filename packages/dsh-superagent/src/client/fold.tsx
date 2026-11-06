@@ -3,14 +3,13 @@ import { useLayoutEffect, useRef, useState, type ReactNode, type RefObject } fro
 import { usePanel } from './provider.tsx'
 
 /**
- * 测量是否溢出。
- * 旧实现只在挂载时用 `useEffect` 测一次，并且只观察元素自身尺寸：折叠态高度被 clamp 固定在 3 行，
- * 字体/父级宽度稳定后内容变高也不会改变元素高度，ResizeObserver 不会再次触发，真正被裁剪的块因此
- * 一直拿不到「展开」控件。这里改成：
+ * 测量是否溢出（折叠态是否可滚动）。
+ * 旧实现用 `-webkit-line-clamp` 做 3 行硬截断，靠「自然高度 vs clamp 高度」判断；现在折叠态改成
+ * 「限高 + overflow-y:auto」，直接用 `scrollHeight > clientHeight + 1` 判断框内是否能滚动。
+ * 仍需处理的情况：
  * - `useLayoutEffect` 首测 + 一次 `requestAnimationFrame` 复测，等挂载那一帧的布局落定；
- * - 测量时临时去掉 clamp 取自然高度，再套 3 行 clamp 取折叠高度，两者比较，不依赖被裁剪后的 scrollHeight；
- * - 展开态（`is-expanded`）测量时临时补上 `dt-fold`，让 `.dt-fold .dt-md` 的块级规则生效，
- *   否则 Firefox 下 flex 子块会让 line-clamp 失效、宽度变化后误判为不溢出；
+ * - 元素可能正处于展开态（没有 `dt-fold`），测量时临时补上 `dt-fold` 并去掉 `is-expanded`，
+ *   否则量到的是展开后的无滚动高度，收起后「展开」控件会消失；
  * - 只响应宽度变化（重排）与字体加载，元素自身高度变化不重测，避免测量改样式造成观察者回环。
  */
 export function useFold(target: RefObject<HTMLElement>, content: string) {
@@ -29,22 +28,14 @@ export function useFold(target: RefObject<HTMLElement>, content: string) {
       measuring = true
       const savedStyle = element.getAttribute('style')
       const hadFoldClass = element.classList.contains('dt-fold')
+      const hadExpandedClass = element.classList.contains('is-expanded')
       if (!hadFoldClass) element.classList.add('dt-fold')
+      // 展开态没有限高，先临时收起才能量到折叠态的滚动几何。
+      if (hadExpandedClass) element.classList.remove('is-expanded')
       try {
-        // 自然高度：普通块布局，不裁剪。
-        element.style.display = 'block'
-        element.style.setProperty('-webkit-line-clamp', 'unset')
-        element.style.setProperty('-webkit-box-orient', 'initial')
-        element.style.overflow = 'visible'
-        const natural = element.scrollHeight
-        // 折叠高度：套用与 CSS 一致的 3 行 clamp。
-        element.style.display = '-webkit-box'
-        element.style.setProperty('-webkit-line-clamp', '3')
-        element.style.setProperty('-webkit-box-orient', 'vertical')
-        element.style.overflow = 'hidden'
-        const clamped = element.clientHeight
-        setOverflow(natural > clamped + 1)
+        setOverflow(element.scrollHeight > element.clientHeight + 1)
       } finally {
+        if (hadExpandedClass) element.classList.add('is-expanded')
         if (savedStyle === null) element.removeAttribute('style')
         else element.setAttribute('style', savedStyle)
         if (!hadFoldClass) element.classList.remove('dt-fold')

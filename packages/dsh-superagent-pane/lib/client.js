@@ -903,7 +903,11 @@ window.__ModuleLoader__.load({
 						style: {
 							opacity: .7,
 							whiteSpace: "normal",
-							overflowWrap: "anywhere"
+							overflowWrap: "anywhere",
+							maxHeight: 260,
+							overflowY: "auto",
+							overscrollBehavior: "contain",
+							scrollbarWidth: "thin"
 						},
 						children: summary
 					}),
