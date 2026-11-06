@@ -387,3 +387,15 @@ a.dt-btn, a.dt-btn:hover { text-decoration: none; }
 .dt-admission-slot { display: inline-flex; flex: none; width: 16px; }
 .dt-info-warn { color: var(--dsw-alias-state-warn-primary); }
 .dt-field-segmented { max-width: 240px; }
+
+/* 长文本折叠块：折叠态 3 行预览，控件见 .dt-fold-toggle；展开态由 is-expanded 去掉 clamp。 */
+.dt-fold { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; white-space: normal; overflow-wrap: anywhere; }
+/* MarkdownLite 的 flex 子块会让 Firefox 的 line-clamp 失效，折叠态改成普通块布局（间距用 margin 补齐）。 */
+.dt-fold .dt-md { display: block; }
+.dt-fold .dt-md > * + * { margin-top: 6px; }
+.dt-fold .dt-md ul, .dt-fold .dt-md ol { display: block; padding-left: 20px; }
+.dt-fold .dt-md li + li { margin-top: 2px; }
+/* 展开态：去掉 clamp 与裁剪，覆盖详情页线程行的三段式选择器（0,4,0）。 */
+.dt-fold.is-expanded, .dt-row-quote.is-expanded, .dt-trigger-text.is-expanded, .dt-row-title .dt-open.is-expanded, .dt-detail-threads .dt-ticket-body .dt-row-title .dt-open.is-expanded { display: block; -webkit-line-clamp: none; overflow: visible; }
+.dt-fold-toggle { position: relative; z-index: 1; align-self: flex-start; margin-top: 2px; font-size: 12px; line-height: 18px; }
+.dt-fold-toggle:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary); outline-offset: 2px; }
