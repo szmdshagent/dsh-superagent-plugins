@@ -1,4 +1,4 @@
-import { $ as settled, A as MandateBasis, B as TicketEndBy, C as Decision, D as Follow, E as Execution, F as Thread, G as followupOwners, H as TicketOutcome, I as ThreadFact, J as latestReport, K as isoTime, L as ThreadFacts, M as ReportState, N as Strength, O as FollowupRecords, P as Text, Q as runningAssignment, R as ThreadRef, S as ChannelRef, T as Evaluation, U as Trigger, V as TicketInput, W as TriggerDisposition, X as reached, Y as liveTicket, Z as readUntil, _ as ActorRef, a as DomainEvent, at as ReasonCode, b as AssignmentState, c as GateResult, ct as Config, d as Policy, et as threadKey, f as ReplyStatus, g as AcceptMode, h as SourceScope, i as Candidate, it as Reason, j as PolicyEffect, k as Mandate, l as OutboundMessage, lt as Deployment, m as ScopeResult, n as AssessmentOutcome, nt as waitsForPerson, o as DomainEvents, ot as reasonText, p as Repositories, q as latestAssignment, r as Assessor, rt as REASONS, s as Executor, st as said, t as ReceiveResult, tt as ticketOutcome, u as Outbox, ut as DeploymentConfig, v as AdmissionCell, w as DecisionKind, x as Attention, y as Assignment, z as Ticket } from "./intake-BntR4bhz.js";
+import { $ as reached, A as FollowupRecords, B as ThreadFacts, C as Collaboration, D as Evaluation, E as DecisionKind, F as ResultCard, G as TicketOutcome, H as Ticket, I as Strength, J as followupOwners, K as Trigger, L as Text, M as MandateBasis, N as PolicyEffect, O as Execution, P as ReportState, Q as liveTicket, R as Thread, S as ChannelRef, T as Decision, U as TicketEndBy, V as ThreadRef, W as TicketInput, X as latestAssignment, Y as isoTime, Z as latestReport, _ as ActorRef, a as DomainEvent, at as waitsForPerson, b as AssignmentState, c as GateResult, ct as ReasonCode, d as Policy, dt as Config, et as readUntil, f as ReplyStatus, ft as Deployment, g as AcceptMode, h as SourceScope, i as Candidate, it as ticketOutcome, j as Mandate, k as Follow, l as OutboundMessage, lt as reasonText, m as ScopeResult, n as AssessmentOutcome, nt as settled, o as DomainEvents, ot as REASONS, p as Repositories, pt as DeploymentConfig, q as TriggerDisposition, r as Assessor, rt as threadKey, s as Executor, st as Reason, t as ReceiveResult, tt as runningAssignment, u as Outbox, ut as said, v as AdmissionCell, w as CollaborationInput, x as Attention, y as Assignment, z as ThreadFact } from "./intake-BD28noXv.js";
 import { Context } from "@deepseek-ai/cordis";
 //#region src/core/part.d.ts
 interface EngineOptions {
@@ -12,6 +12,8 @@ interface EngineOptions {
   prepareTicket?: (ticket: Ticket, outcome: Extract<AssessmentOutcome, {
     kind: 'accept';
   }>) => Ticket;
+  /** 建单时是否自动评估协作组；默认开启，传 false 即退化为“只建单、不建自动组”。 */
+  collabAuto?: boolean;
   now?: () => string;
   emit?: (event: DomainEvent) => void;
 }
@@ -129,6 +131,23 @@ declare class Engine {
    */
   requestStatus(ticketId: string): boolean;
   /**
+   * 把一张 open 工单加进协作组或改组：组内最多四张，可写组内角色与对同组其他工单的依赖，自依赖或成环则拒绝。
+   * 每次写入都是全量的：未给的 role 与 dependsOn 会被清除。组只是协作与看板事实，不授予权限，也不写实施计划。
+   * @throws UserError 工单未知或已结束、组名或角色不合法、组已满、依赖越界或成环。
+   */
+  collab(ticketId: string, change: CollaborationInput): Ticket;
+  /**
+   * 解散一张工单所在的协作组（人工覆盖手段，自动组同样适用）：清掉组内所有成员的组关系，
+   * 此后的终态报告不再互相广播。只改协作与看板事实，不动授权、assignment 或订阅。
+   * @returns 被移出组的工单 id；没有组时为空。
+   */
+  dissolveCollab(ticketId: string): string[];
+  /**
+   * 清理指向已不存在工单的悬空订阅，返回清掉的条数。启动时调用一次；每次 Trigger fanout 前 Intake 还会清理涉及的 Thread。
+   * 不删除已结束但仍有记录的订阅：人类追问仍可唤醒它们，机器人消息由 Intake 跳过。
+   */
+  cleanSubscriptions(): number;
+  /**
    * Queue a message for the Channel its purpose names: an acknowledgement or an answer goes where the person's message was
    * written, attention where the message that raised the question was, else, like a result, to the conversation the ticket
    * started in. A message queued before is not queued again (see `Replies.reply`).
@@ -233,7 +252,7 @@ declare class Engine {
 /** What Sources ask and tell the Engine. */
 type EngineForSources = Pick<Engine, 'receive' | 'bindThread' | 'threadClosed'>;
 /** What the main Session asks of the Engine. */
-type EngineForMainSession = Pick<Engine, 'candidate' | 'candidateDelivered' | 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note'>;
+type EngineForMainSession = Pick<Engine, 'candidate' | 'candidateDelivered' | 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note' | 'collab' | 'dissolveCollab'>;
 /** What people ask of the Engine, through the panel or the main Session. */
 type EngineForPeople = Pick<Engine, 'stopTicket' | 'retryTicket' | 'reevaluate' | 'unsubscribe' | 'dismiss'>;
 /** What Settings tells the Engine. */
@@ -252,6 +271,11 @@ declare const USER_ERRORS: {
   readonly unknownPromptRevision: readonly ["missing", "Unknown prompt revision {revision}"];
   readonly unknownPromptPart: readonly ["refused", "Unknown built-in prompt part {part}"];
   readonly ticketEnded: readonly ["refused", "Ticket has ended"];
+  readonly collabGroupInvalid: readonly ["refused", "A collaboration group needs a name of 1-64 characters without spaces or slashes"];
+  readonly collabRoleInvalid: readonly ["refused", "A collaboration role must be a single line of at most 40 characters"];
+  readonly collabGroupFull: readonly ["refused", "A collaboration group holds at most 4 tickets"];
+  readonly collabDependency: readonly ["refused", "A dependency must name another open ticket in the same collaboration group"];
+  readonly collabCycle: readonly ["refused", "Those dependencies would close a cycle in the collaboration group"];
   readonly assignmentEnded: readonly ["refused", "Assignment has ended; a newer assignment owns this ticket"];
   readonly evalFinished: readonly ["refused", "Eval {eval} has finished or a later eval replaced it; decide the trigger's current eval"];
   readonly notAdmissible: readonly ["refused", "Trigger is not admissible: {reason}"];
@@ -358,6 +382,32 @@ declare function ticketStage(ticket: Ticket): TicketStage;
 /** True when an open ticket is stalled on a blocked/failed report without a newer human follow-up, or has a failed input delivery. */
 declare function canRetry(ticket: Ticket): boolean;
 //#endregion
+//#region src/core/results.d.ts
+/** 结果卡注入时最多带 3 张，避免把新工单的首次上下文撑大。 */
+declare const RESULT_CARDS = 3;
+/** 从文本里截取仓库路径和裸文件名；跳过 URL、资源名和 node_modules。 */
+declare function artifactPaths(text: string): string[];
+/**
+ * 从一段文本提取匹配键：GitHub repo、产物完整路径、非通用文件名和模块目录。
+ * 只用确定性词法，不做相似度、不调 LLM；宁可少匹配，避免把无关工单的结论注入新单。
+ */
+declare function domainKeys(text: string): string[];
+/**
+ * 从一张 ready 报告生成结果卡。只截取报告文本与其中出现的产物路径，不读会话、不调用模型；
+ * `keys` 是同一份文本的确定性索引键，供 `matchResultCards` 使用。
+ */
+declare function resultCard(ticket: Pick<Ticket, 'id' | 'title'>, report: {
+  summary: string;
+  at: string;
+}): ResultCard;
+/**
+ * 命中同域结果卡：必须共享模块级键（带目录的完整路径或目录），或查询显式引用了该工单 id。
+ * 通用裸文件名（package.json、README.md、index.ts 等）与仅同 repo 的 GitHub 键都不足以注入。
+ */
+declare function matchResultCards(tickets: readonly Pick<Ticket, 'id' | 'result'>[], query: string, limit?: number): ResultCard[];
+/** 把结果卡排成一条 note：结论、产物、关键数字和只读入口；不包含完整报告。 */
+declare function resultCardNote(cards: readonly ResultCard[]): string;
+//#endregion
 //#region src/core/ids.d.ts
 declare function key(...values: string[]): string;
 //#endregion
@@ -366,4 +416,4 @@ declare const name = "dsh-superagent";
 declare const inject: string[];
 declare function apply(ctx: Context, config: DeploymentConfig): Promise<void>;
 //#endregion
-export { AcceptMode, ActorRef, AdmissionCell, AssessmentOutcome, Assessor, Assignment, AssignmentState, Attention, Candidate, ChannelRef, Config, Decision, DecisionKind, type Deployment, type DeploymentConfig, DomainEvent, DomainEvents, Engine, type EngineForExecutor, type EngineForMainSession, type EngineForPeople, type EngineForSettings, type EngineForSources, type EngineOptions, Evaluation, Execution, Executor, Follow, FollowupRecords, GateResult, Mandate, MandateBasis, MemoryRepositories, OutboundMessage, Outbox, type Outcome, Policy, PolicyEffect, REASONS, type Reason, type ReasonCode, type ReceiveResult, type Reply, type ReplyRequest, ReplyStatus, ReportState, Repositories, ScopeResult, SourceScope, Strength, Text, Thread, ThreadFact, ThreadFacts, ThreadRef, Ticket, TicketEndBy, TicketInput, TicketOutcome, type TicketStage, Trigger, TriggerDisposition, USER_ERRORS, UserError, type UserErrorCode, type WorkerReport, apply, canRetry, followupOwners, inject, isoTime, key, latestAssignment, latestReport, liveTicket, name, reached, readUntil, reasonText, runningAssignment, said, settled, threadKey, ticketOutcome, ticketStage, waitsForPerson };
+export { AcceptMode, ActorRef, AdmissionCell, AssessmentOutcome, Assessor, Assignment, AssignmentState, Attention, Candidate, ChannelRef, Collaboration, CollaborationInput, Config, Decision, DecisionKind, type Deployment, type DeploymentConfig, DomainEvent, DomainEvents, Engine, type EngineForExecutor, type EngineForMainSession, type EngineForPeople, type EngineForSettings, type EngineForSources, type EngineOptions, Evaluation, Execution, Executor, Follow, FollowupRecords, GateResult, Mandate, MandateBasis, MemoryRepositories, OutboundMessage, Outbox, type Outcome, Policy, PolicyEffect, REASONS, RESULT_CARDS, type Reason, type ReasonCode, type ReceiveResult, type Reply, type ReplyRequest, ReplyStatus, ReportState, Repositories, ResultCard, ScopeResult, SourceScope, Strength, Text, Thread, ThreadFact, ThreadFacts, ThreadRef, Ticket, TicketEndBy, TicketInput, TicketOutcome, type TicketStage, Trigger, TriggerDisposition, USER_ERRORS, UserError, type UserErrorCode, type WorkerReport, apply, artifactPaths, canRetry, domainKeys, followupOwners, inject, isoTime, key, latestAssignment, latestReport, liveTicket, matchResultCards, name, reached, readUntil, reasonText, resultCard, resultCardNote, runningAssignment, said, settled, threadKey, ticketOutcome, ticketStage, waitsForPerson };

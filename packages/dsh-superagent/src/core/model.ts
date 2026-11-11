@@ -253,8 +253,10 @@ export type TicketInput =
   /** A human's message on one of its Threads resumed the ended ticket under its unchanged Mandate. */
   | { id: string; kind: 'resumed'; triggerId: string; at: string }
   | { id: string; kind: 'text'; text: string; at: string }
-  /** A fact the main Session gave the ticket from other work: context, which asks for nothing and grants nothing. */
-  | { id: string; kind: 'note'; text: string; at: string }
+  /** A fact the main Session gave the ticket from other work, or a group member's terminal report: context, which asks for nothing and grants nothing. */
+  | { id: string; kind: 'note'; text: string; at: string
+    /** 来源工单：同组协作广播的 note 记录是哪张工单的报告，其他 note 没有。 */
+    from?: string }
 
 /**
  * How a Policy change bears on a ticket: the rules it was accepted under that changed, with their instruction now, or no
@@ -273,6 +275,31 @@ export type TicketEndBy = 'executor' | 'human'
 export type TicketOutcome = 'completed' | 'merged' | 'closed' | 'dropped' | 'stopped'
 /** A question for a person; `triggerId` is the human message that raised it, whose conversation it goes back to. */
 export interface Attention { id: string; question: string; triggerId?: string }
+/**
+ * 协作组成员关系：一组最多四张工单，`role` 说明该工单在组内的分工，`dependsOn` 列出它等结果的同组工单。
+ * 这只是路由与看板事实，不授予权限，也不改变工单的授权或批次边界。
+ * 人工工具只写 group/role/dependsOn；建单钩子（`src/core/collab-auto.ts`）命中的自动组在同一字段上补
+ * `auto`、置信度、信号、写域与 2 h TTL。旧数据没有 `auto` 即为人工组，自动聚类不会并入人工组。
+ */
+export interface Collaboration {
+  group: string; role?: string; dependsOn?: string[]
+  auto?: true; confidence?: number; signals?: string[]; writeScopes?: string[]; expiresAt?: string
+}
+/** 给工单加组或改组时提交的内容；`role` 与 `dependsOn` 传 `null` 表示清除。 */
+export interface CollaborationInput { group: string; role?: string | null; dependsOn?: readonly string[] | null }
+/**
+ * L1 结果卡：工单 ready 时从报告文本截取的只读摘要，供同域新工单复用，不建立会话、不唤醒原工单。
+ * `keys` 是 repo/模块/产物路径的确定性索引键，不进入投递文本。
+ */
+export interface ResultCard {
+  ticketId: string
+  title: string
+  conclusion: string
+  artifacts: string[]
+  numbers: string[]
+  at: string
+  keys: string[]
+}
 /** Ticket aggregate: an authorized work item with its assignments, channels, thread bindings, and inputs. */
 export interface Ticket {
   id: string
@@ -305,6 +332,10 @@ export interface Ticket {
   execution?: Execution
   /** The latest failed delivery of an Input to its worker, until a delivery succeeds. */
   delivery?: { error: string; at: string }
+  /** 可选协作组关系；没有组的工单与引入协作组之前的行为完全一致。 */
+  collab?: Collaboration
+  /** 最新一次 ready 报告生成的结果卡；工单结束后仍保留，供同域新单只读复用。 */
+  result?: ResultCard
 }
 /**
  * A Thread a ticket follows, by its key: `own` when the ticket opened it, such as its own pull request, and when and how it

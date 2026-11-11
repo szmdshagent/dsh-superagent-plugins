@@ -13,6 +13,8 @@ export interface EngineOptions {
   executor: Executor
   outbox: Outbox
   prepareTicket?: (ticket: Ticket, outcome: Extract<AssessmentOutcome, { kind: 'accept' }>) => Ticket
+  /** 建单时是否自动评估协作组；默认开启，传 false 即退化为“只建单、不建自动组”。 */
+  collabAuto?: boolean
   now?: () => string
   emit?: (event: DomainEvent) => void
 }

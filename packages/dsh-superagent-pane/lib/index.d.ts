@@ -14,12 +14,26 @@ declare module '@deepseek-ai/cordis' {
       };
       /** 主 Session 的会话 id（Runtime 公开字段），自愈用。 */
       readonly masterId?: string;
-      /** 宿主 Store 的工单集合（Runtime 公开字段），自愈时取活跃工单的 worker 会话。 */
+      /** 引擎（Runtime 公开字段）；搁浅消息自愈用 `reevaluate` 重新入队。 */
+      readonly engine?: {
+        reevaluate(triggerId: string): boolean;
+      };
+      /** 宿主 Store（Runtime 公开字段），自愈与分流判断用。 */
       readonly store?: {
         readonly tickets?: {
           open?: () => readonly {
+            id?: string;
             sessionId?: string;
+            ended?: unknown;
           }[];
+          get?(id: string): any;
+        };
+        readonly threads?: {
+          get?(key: string): any;
+        };
+        readonly triggers?: {
+          get?(id: string): any;
+          disposition?(id: string): any;
         };
       };
       context(kind: {
@@ -35,6 +49,7 @@ declare module '@deepseek-ai/cordis' {
         state: {
           get<V>(key: any): V | undefined;
           set<V>(key: any, value: V | undefined): void;
+          keys(prefix: string): string[];
         };
       };
     };
@@ -81,7 +96,16 @@ declare const inject: string[];
  * 对话模式刻意走「影子线程」`<对话>~chat`：引擎的 gate 规定「线程有自己的工单时，一律消息归该工单」
  * （followup 分支先于准入表生效），所以只要还在原线程上，对话消息就会被排进运行中工单的队列、router 收不到。
  * 影子线程永不被工单订阅，router 任何时刻都能立刻接话；回复经 channel 地址仍回落到原对话显示。
+ *
+ * 派活模式**只在会话线程上的工单已卡死（zombie，永远接不了手）时**才走一条子线程（`<对话>~d<base36>`，
+ * 由调用方通过 `options.thread` 指定）：死工单仍占着订阅，fanout 会把消息并进去，而 intake 又因为
+ * followupOwners 非空永不排 Eval，这条消息就永远搁浅（2026-11-03 的 897f223d… 即此）。子线程上没有订阅者，
+ * 消息会进 Eval 由主 Session 分诊（可 attach 也可新建工单）。健康/待命的工单不触发改投：它对运行中工单的
+ * 正常跟进必须留在原线程，交给该工单的 worker 处理，否则会另起新工单、原工单永远收不到跟进。
+ * 无论走哪条线程，`channel` 始终指回原会话，回复仍显示在原对话里。
  */
-declare function paneTrigger(conversation: string, text: string, sender?: string, mode?: 'dispatch' | 'chat'): Trigger;
+declare function paneTrigger(conversation: string, text: string, sender?: string, mode?: 'dispatch' | 'chat', options?: {
+  thread?: string;
+}): Trigger;
 declare function apply(ctx: Context): void;
 export { apply, inject, name, paneTrigger };

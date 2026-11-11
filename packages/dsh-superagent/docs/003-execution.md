@@ -10,6 +10,7 @@ Each open Ticket has one stage, determined by what it is waiting for. Read the t
 | --- | --- | --- |
 | person / delivery | Delivering an Input to the Executor Session failed; it is retried after 2 seconds, then after a delay that doubles up to a minute, and a success, a new Assignment or the Ticket's end clears it | Input undelivered |
 | person / answer | It has an Attention | Awaiting answer |
+| working | An Input was delivered to the worker at or after its latest Report, so that Report is stale | Working |
 | person / review | The latest Report is `ready` | Awaiting review |
 | person / blocked, failed | The latest Report is `blocked` or `failed`, and no person's message reached the Ticket since | Blocked · Failed |
 | working / queued | No Assignment, or a pending one | Queued |

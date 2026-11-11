@@ -2,11 +2,14 @@
 import { key } from './ids.ts'
 import { UserError } from './errors.ts'
 import { latestAssignment, latestReport, liveTicket, readUntil, runningAssignment, settled, threadKey, waitsForPerson } from './model.ts'
-import type { Assignment, ChannelRef, Evaluation, Follow, Mandate, PolicyEffect, ThreadRef, Ticket, TicketEndBy, TicketInput, TicketOutcome,
-  Trigger, TriggerDisposition } from './model.ts'
+import type { Assignment, ChannelRef, CollaborationInput, Evaluation, Follow, Mandate, PolicyEffect, ReportState, ThreadRef, Ticket,
+  TicketEndBy, TicketInput, TicketOutcome, Trigger, TriggerDisposition } from './model.ts'
 import type { AssessmentOutcome } from './ports.ts'
 import { EnginePart, type EngineOptions } from './part.ts'
 import type { Replies } from './replies.ts'
+import { matchResultCards, resultCardNote } from './results.ts'
+import { ACTIVITY_MS, AUTO_GROUP_TTL_MS, UNRELATED, collabView, planAutoGroup } from './collab-auto.ts'
+import type { AutoCandidate, CandidateGroup } from './collab-auto.ts'
 import { canRetry } from './stage.ts'
 
 const sameChannel = (a: ChannelRef, b: ChannelRef): boolean => JSON.stringify(a) === JSON.stringify(b)
@@ -19,6 +22,10 @@ export const automatic = (input: TicketInput | undefined): boolean => input?.kin
 const readBefore = (input: Extract<TicketInput, { kind: 'trigger' }>, until: string): boolean => input.readAt === undefined
   ? (input.deliveredAt && input.deliveredAt > input.at ? input.deliveredAt : input.at) <= until : !!input.readAt && input.readAt < until
 const STATUS_REQUEST = 'Report the current ticket status with orchestrator_report. This is a status-only request: do not resume implementation or perform external actions.'
+/** 协作组上限：联系人手一屏能看完，也限制并发放大的成本。 */
+const GROUP_LIMIT = 4
+/** 会广播给同组的报告终态；progress、waiting 和 dropped 不广播（dropped 是空转，不是可复用结果）。 */
+const SHARED_REPORTS: ReadonlySet<ReportState> = new Set(['ready', 'blocked', 'failed'])
 
 /**
  * Manages each ticket's lifecycle: creates the ticket for an accept decision with its Mandate, Subscriptions, and first
@@ -47,6 +54,25 @@ export class Tickets extends EnginePart {
       if (channel && !ticket.channels.some(item => sameChannel(item, channel))) ticket.channels.push(channel)
     }
     ticket = this.options.prepareTicket?.(ticket, outcome) ?? ticket
+    // L1 结果卡：新单首次启动就带上同域 ready 单的只读结论。卡片记成一条 note，但刻意不放进 undelivered，
+    // 因此不追加投递、不新建 assignment；它随首次 launch 的 assignment 文本一起发给 worker。
+    const query = [ticket.title, mandate.scope, ...triggerIds.flatMap(triggerId => {
+      const trigger = this.repo.triggers.get(triggerId)
+      return trigger ? [trigger.text, trigger.url ?? ''] : []
+    })].join('\n').slice(0, 4_000)
+    const cards = matchResultCards(this.repo.tickets.list(), query)
+    if (cards.length) {
+      const at = this.now()
+      const text = resultCardNote(cards)
+      ticket.inputs.push({ id: key('input', id, 'result-cards', ...cards.map(card => card.ticketId)), kind: 'note', text, at })
+      if (ticket.execution) {
+        ticket.execution = { ...ticket.execution,
+          assignment: ticket.execution.assignment ? `${ticket.execution.assignment}\n\n${text}` : text }
+      }
+    }
+    // 批次 2：建单即做一次确定性自动组队。与 create 的其余写入同属 repo.atomic，
+    // 组名、置信度与写域随工单一并落盘；没有命中时工单形状与引入自动组队前完全一致。
+    this.autoCollab(ticket, at)
     const assignment = this.newAssignment(ticket)
     this.repo.tickets.save(ticket)
     for (const triggerId of triggerIds) for (const ref of this.repo.triggers.get(triggerId)?.threads ?? []) this.subscribe(id, ref)
@@ -69,6 +95,167 @@ export class Tickets extends EnginePart {
     ticket.updatedAt = this.now()
     this.repo.tickets.save(ticket)
     return ticket
+  }
+  /**
+   * 给一张 open 工单加组或改组，全量写入组内角色与依赖：未给的 role 与 dependsOn 会被清除。
+   * 一组最多四张工单；依赖只能指向同组的其他 open 工单，不能自依赖或成环。组关系只是路由与看板事实，不改授权、不建批次。
+   * @throws UserError 工单未知或已结束、组名或角色不合法、组已满、依赖越界或成环。
+   */
+  collab(ticketId: string, change: CollaborationInput): Ticket {
+    const ticket = this.require(ticketId)
+    if (!liveTicket(ticket)) throw new UserError('ticketEnded')
+    const group = change.group.trim()
+    if (!group || group.length > 64 || /[\s/]/.test(group)) throw new UserError('collabGroupInvalid')
+    const role = change.role?.trim() || undefined
+    if (role && (role.length > 40 || /[\r\n]/.test(role))) throw new UserError('collabRoleInvalid')
+    const dependsOn = [...new Set(change.dependsOn ?? [])]
+    if (dependsOn.length > GROUP_LIMIT - 1) throw new UserError('collabDependency')
+    const members = this.repo.tickets.list().filter(item => item.collab?.group === group && item.id !== ticketId)
+    if (members.length >= GROUP_LIMIT) throw new UserError('collabGroupFull')
+    const dependencies = dependsOn.filter(id => id !== ticketId && this.repo.tickets.get(id)?.collab?.group === group
+      && liveTicket(this.repo.tickets.get(id)!))
+    if (dependencies.length !== dependsOn.length) throw new UserError('collabDependency')
+    // 本次写入只改本工单的出边，任何新环都必须经过本工单：从每个依赖出发能回到本工单即成环。
+    const edges = new Map<string, readonly string[]>(members.map(item => [item.id, item.collab?.dependsOn ?? []]))
+    edges.set(ticketId, dependencies)
+    const seen = new Set<string>()
+    const stack = [...dependencies]
+    while (stack.length) {
+      const id = stack.pop()!
+      if (id === ticketId) throw new UserError('collabCycle')
+      if (seen.has(id)) continue
+      seen.add(id)
+      stack.push(...edges.get(id) ?? [])
+    }
+    ticket.collab = { group, ...(role ? { role } : {}), ...(dependencies.length ? { dependsOn: dependencies } : {}) }
+    ticket.updatedAt = this.now()
+    this.repo.tickets.save(ticket)
+    return this.require(ticketId)
+  }
+  /**
+   * 建单时的自动组队：取最近活动的 open 工单，用 `collab-auto` 的确定性规则决定加入已有自动组
+   * 或与一张相关工单新建组。只改 `collab` 与首次 assignment 文本，不新增 note、不唤醒任何工单；
+   * 人工组（没有 `auto` 标记）不参与自动合并。由 `create` 在同一个事务里调用。
+   */
+  private autoCollab(ticket: Ticket, at: string): void {
+    if (this.options.collabAuto === false || ticket.collab) return
+    const view = collabView(ticket, this.ticketThreads(ticket))
+    const candidates: AutoCandidate[] = this.repo.tickets.open()
+      .filter(candidate => candidate.id !== ticket.id)
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).slice(0, 20)
+      .flatMap(candidate => {
+        const candidateView = collabView(candidate, this.ticketThreads(candidate))
+        const group = this.candidateGroup(candidate, candidateView)
+        return [{ view: candidateView, ...(group ? { group } : {}) }]
+      })
+    const plan = planAutoGroup(view, candidates, at)
+    if (!plan) return
+    ticket.collab = { group: plan.group, auto: true, confidence: plan.confidence, signals: plan.signals,
+      writeScopes: view.writeScopes, expiresAt: plan.expiresAt, ...(plan.dependsOn.length ? { dependsOn: plan.dependsOn } : {}) }
+    // 首次 assignment 就告诉 worker 读组看板；不额外投递 note、不额外唤醒。
+    if (ticket.execution) {
+      const line = `Collaboration group: ${plan.group}. Read group/${plan.group} first; group notes are terminal results only.`
+      ticket.execution = { ...ticket.execution,
+        assignment: ticket.execution.assignment ? `${ticket.execution.assignment}\n\n${line}` : line }
+    }
+    // 新建组时把组名、置信度与 TTL 写回另一张成员单。
+    if (!plan.created) return
+    for (const id of plan.members) {
+      if (id === ticket.id) continue
+      const member = this.repo.tickets.get(id)
+      if (!member) continue
+      member.collab = { group: plan.group, auto: true, confidence: plan.confidence, signals: plan.signals,
+        writeScopes: collabView(member, this.ticketThreads(member)).writeScopes, expiresAt: plan.expiresAt }
+      this.repo.tickets.save(member)
+    }
+  }
+  /** 一张工单的 Thread key，取自它的 origin triggers 与它跟随的 Thread。 */
+  private ticketThreads(ticket: Ticket): string[] {
+    return [...new Set(ticket.origin.triggerIds.flatMap(id => this.repo.triggers.get(id)?.threads ?? []).map(threadKey)
+      .concat((ticket.follows ?? []).map(follow => follow.thread)))]
+  }
+  /**
+   * 候选工单所在的自动组视图；人工组或混合组返回 undefined，自动组队就不会把新单塞进人工组。
+   */
+  private candidateGroup(ticket: Ticket, view: ReturnType<typeof collabView>): CandidateGroup | undefined {
+    const name = ticket.collab?.group
+    if (!name) return undefined
+    const members = this.repo.tickets.list().filter(item => item.collab?.group === name)
+    // 人工组或人工/自动混合组：返回 auto=false，自动聚类会直接跳过，绝不改写人工组。
+    if (!ticket.collab?.auto || members.some(item => !item.collab?.auto)) return { id: name, auto: false, members: [] }
+    const expiresAt = members.flatMap(item => item.collab?.expiresAt ? [item.collab.expiresAt] : []).sort()[0]
+    return { id: name, auto: true, ...(expiresAt ? { expiresAt } : {}),
+      members: members.map(item => item.id === ticket.id ? view : collabView(item, this.ticketThreads(item))) }
+  }
+  /**
+   * 解散一张工单所在的协作组（人工工具的覆盖手段）：清掉所有成员的 `collab`，因此不再广播终态。
+   * @returns 被移出组的工单 id；没有组时为空。
+   */
+  dissolveCollab(ticketId: string): string[] {
+    const name = this.repo.tickets.get(ticketId)?.collab?.group
+    if (!name) return []
+    const members = this.repo.tickets.list().filter(item => item.collab?.group === name)
+    for (const member of members) { delete member.collab; this.repo.tickets.save(member) }
+    return members.map(member => member.id)
+  }
+  /**
+   * 时钟触发的自动组回收：全部成员结束、成员少于两张、2 h TTL 到期、成员报告与组无关，
+   * 或 30 min 内没有任何组内 note 被投递（近似“无交叉读取”）时解散。返回解散的组数。
+   */
+  dissolveDueCollab(): number {
+    const groups = new Map<string, Ticket[]>()
+    for (const ticket of this.repo.tickets.list()) {
+      const name = ticket.collab?.group
+      if (name) groups.set(name, [...groups.get(name) ?? [], ticket])
+    }
+    let dissolved = 0
+    for (const [, members] of groups) {
+      // 只要有一张成员是人工加入的，整个组按人工组处理，不自动解散。
+      if (members.some(member => !member.collab?.auto)) continue
+      if (!this.collabDissolvable(members)) continue
+      for (const member of members) { delete member.collab; this.repo.tickets.save(member) }
+      dissolved++
+    }
+    return dissolved
+  }
+  /** 一个自动组是否已满足解散条件；规则见 `dissolveDueCollab`。 */
+  private collabDissolvable(members: readonly Ticket[]): boolean {
+    if (members.length < 2) return true
+    if (members.every(member => !liveTicket(member))) return true
+    const expiry = members.flatMap(member => member.collab?.expiresAt ? [Date.parse(member.collab.expiresAt)] : [])
+      .filter(Number.isFinite).sort((a, b) => a - b)[0]
+    if (expiry !== undefined && expiry <= Date.parse(this.now())) return true
+    if (members.some(member => {
+      const report = latestReport(member)
+      return report?.state === 'dropped' && UNRELATED.test(report.summary)
+    })) return true
+    return this.noCrossRead(members)
+  }
+  /**
+   * 30 min 内没有交叉读取。note 没有 readAt，这里用两个确定性近似：
+   * 组内 note 仍在本单 `undelivered` 里就是没投递；投递过则取该单最新 assignment 的 `deliveredAt`。
+   */
+  private noCrossRead(members: readonly Ticket[]): boolean {
+    const live = members.filter(liveTicket)
+    if (!live.length) return true
+    const now = Date.parse(this.now())
+    const notes = live.flatMap(member => member.inputs.flatMap(input => input.kind === 'note' && input.from && input.from !== member.id
+      ? [{ member, input }] : []))
+    let last = Number.NaN
+    if (!notes.length) {
+      const expiry = members.flatMap(member => member.collab?.expiresAt ? [Date.parse(member.collab.expiresAt)] : [])
+        .filter(Number.isFinite).sort((a, b) => a - b)[0]
+      last = expiry === undefined ? Number.NaN : expiry - AUTO_GROUP_TTL_MS
+    } else {
+      const delivered = notes.filter(({ member, input }) => !member.undelivered.includes(input.id))
+      last = delivered.length
+        ? Math.max(...delivered.flatMap(({ member }) => {
+          const at = Date.parse(latestAssignment(member)?.deliveredAt ?? '')
+          return Number.isFinite(at) ? [at] : []
+        }))
+        : Math.max(...notes.map(({ input }) => Date.parse(input.at)).filter(Number.isFinite))
+    }
+    return Number.isFinite(last) && now - last >= ACTIVITY_MS
   }
   /**
    * Record that a Thread open tickets follow closed, and end each one done with its Threads (see `followsDone`), unless its
@@ -205,6 +392,26 @@ export class Tickets extends EnginePart {
       // Include `at` in the input key so repeated transitions between the same policy versions still record a new input.
       if (effect) this.addInput(ticket, { id: key('input', ticket.id, 'policy', from, to, at), kind: 'policy-changed', from, to, at, effect })
     }
+  }
+  /**
+   * 清理指向已不存在工单的悬空订阅，以及它们残留的 context 标记；返回清掉的订阅数。
+   * 已结束但记录仍在的工单保留订阅：同 Thread 上的人类追问仍可唤醒它（见 `wake`），
+   * 系统/机器人消息由 `Intake.receive` 跳过，不产生无效 fanout。
+   */
+  cleanSubscriptions(threadKeys?: readonly string[]): number {
+    let removed = 0
+    const threads = threadKeys?.length ? threadKeys.flatMap(key => this.repo.threads.get(key) ?? []) : this.repo.threads.list()
+    for (const thread of threads) {
+      const kept = thread.subscriptions.filter(id => this.repo.tickets.get(id))
+      const context = thread.context?.filter(id => kept.includes(id))
+      const changed = kept.length !== thread.subscriptions.length || (context?.length ?? 0) !== (thread.context?.length ?? 0)
+      if (!changed) continue
+      removed += thread.subscriptions.length - kept.length
+      thread.subscriptions = kept
+      if (context) thread.context = context
+      this.repo.threads.save(thread)
+    }
+    return removed
   }
   /**
    * Drop a Thread's Subscriptions, every ticket's or only `ticketId`'s, and say so; false when none dropped. A ticket that
@@ -357,6 +564,8 @@ export class Tickets extends EnginePart {
     // The Assignments the end stops end with it; the ticket's end says why.
     for (const assignment of stopping) { assignment.state = 'ended'; assignment.endedAt = at }
     this.repo.tickets.save(ticket)
+    // 订阅不随 ended 删除：已结束单的订阅是同 thread 人类追问历史的索引（候选卡、related_tickets 都读它）；
+    // Intake 对机器人/CI 消息跳过已结束单，只让人类消息按 `wake` 语义唤醒它。
     this.letGo(ticketId, waiting, left)
     this.emit('ticket.ended', { ticketId, by, outcome, ...why })
     for (const assignment of stopping) this.options.executor.stop(ticket, assignment, reason ?? outcome)
@@ -398,6 +607,23 @@ export class Tickets extends EnginePart {
     const at = this.now()
     this.addInput(ticket, { id: key('input', ticketId, 'note', at, text), kind: 'note', text, at })
     return this.require(ticketId)
+  }
+  /**
+   * 把一张工单的终态报告（ready/blocked/failed）广播给同组其他工单：每条 note 记录来源工单和结果指针，
+   * 按 assignmentId+state 幂等。progress/waiting/dropped 不广播——dropped 表示没有可复用结果，广播它只会制造空转噪声。
+   * 活着的工单照常收到并投递；已结束的工单只落输入，addInput 不会唤醒它。
+   */
+  shareReport(ticketId: string, assignmentId: string, state: ReportState): void {
+    if (!SHARED_REPORTS.has(state)) return
+    const source = this.repo.tickets.get(ticketId)
+    const group = source?.collab?.group
+    if (!source || !group) return
+    const at = this.now()
+    for (const member of this.repo.tickets.list()) {
+      if (member.id === ticketId || member.collab?.group !== group) continue
+      const text = `Group ${group}: ticket ${ticketId} reported ${state}. Result: ticket/${ticketId}/result.`
+      this.addInput(member, { id: key('input', member.id, 'collab', ticketId, assignmentId, state), kind: 'note', text, at, from: ticketId })
+    }
   }
   /**
    * Subscribe an open ticket to a Thread its Executor found related, for context: see `Thread.context`.

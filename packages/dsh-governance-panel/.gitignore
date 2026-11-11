@@ -1,0 +1,44 @@
+# 依赖
+node_modules/
+.pnpm-store/
+
+# 临时产物 / 截图 / 笔记
+shots/
+notes/
+tmp/
+*.log
+*.bak*
+*.preseed-*
+*.orig
+*.rej
+*.tmp
+*.swp
+*~
+screenshot*.png
+*.png
+*.jpg
+*.jpeg
+
+# 构建缓存（不忽略 lib/，生产直接加载 lib/index.js）
+.cache/
+.tsbuildinfo
+*.tsbuildinfo
+dist-coverage/
+
+# 凭据与环境文件（一律不入库）
+.env
+.env.*
+*.env
+*.pem
+*.key
+*.p12
+*.crt
+credentials*
+secrets*
+*credential*.json
+*secret*.json
+token*.json
+
+# 系统垃圾
+.DS_Store
+Thumbs.db

@@ -1,0 +1,9 @@
+# Loads the worker execution layer as its own bundle entry.
+# Kept in this package so upgrading dsh-superagent, which replaces its own source tree,
+# cannot remove it. Two entries on purpose: the guard is listed separately so it shows
+# up in the plugin page and can be disabled or rolled back without touching the rest.
+- insert:
+    - id: dsh-superagent-executor
+      name: dsh-superagent-executor
+    - id: dsh-superagent-executor-guard
+      name: dsh-superagent-executor/guard

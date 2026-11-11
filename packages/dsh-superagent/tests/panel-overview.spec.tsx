@@ -157,3 +157,13 @@ it('says when no Source is on, an Eval is past its deadline or a message keeps f
   await click('评估超时未决定：#9 迟迟未决')
   expect(server.requests.some(request => request.path.startsWith('threads/github:9'))).toBe(true)
 })
+
+it('drops the answer link on a pending Ticket whose Channel has no URL, without touching its other actions', async () => {
+  // A panel conversation answers in place: its Source link is an empty string, so there is nowhere to open.
+  server.person = [{ ...server.person[0]!, reply: { source: 'feishu', url: '', label: { zh: '飞书消息', en: 'Feishu message' } } },
+    server.person[1]!]
+  await mount()
+  expect(all('.dt-ticket-actions a')).toEqual([])
+  expect(all('.dt-ticket-actions button').map(button => button.textContent)).toContain(zh.stop)
+  expect(text()).not.toContain('去飞书回答')
+})

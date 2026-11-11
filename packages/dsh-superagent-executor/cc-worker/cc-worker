@@ -1,0 +1,1504 @@
+#!/bin/bash
+# cc-worker —— superagent worker 的 Claude Code 执行器（"手脚"）。
+# 用户已明确同意：无头模式跳过权限审批（--dangerously-skip-permissions），仅限 VM 内、szm 用户。
+# 把一条任务交给无头模式的 Claude Code（VM 上的 claude CLI）执行：
+#   会话 id 由本脚本预分配并立即落盘（.cc-worker/session_id），因此即使进程被杀/超时，
+#   之后同一目录的调用仍能 --resume 续跑；resume 目标不存在时自动回退为新开会话。
+#   完整事件流写入 <dir>/.cc-worker/log.jsonl；stdout 只输出一行 JSON 结果。
+# 用法：
+#   cc-worker run "任务描述" [--dir DIR] [--new] [--model NAME] [--timeout SECONDS] [--max-turns N] [--prompt-file FILE] [--hard-budget-gate]
+#   结果 JSON：{"ok":true,"result":"...","session_id":"...","cost_usd":...,"duration_s":...,"log":"..."}
+set -u
+
+# --- GitHub over SSH（2026-11-06 注入；备份 cc-worker.bak-gitssh-*）---
+# 背景：dsh 生成的 worker-gitconfig 里有 url."https://github.com/".insteadOf=git@github.com:，
+# 会把 SSH 地址反向改写成 HTTPS；但本机 HTTPS 到 github.com 被 GnuTLS 干扰（recv error -54），
+# SSH 才是唯一可用通道。这里用 GIT_CONFIG_COUNT 追加一条更高优先级的 insteadOf，
+# 把 https://github.com/ 重写回 git@github.com:，覆盖 worker-gitconfig 里的反规则。
+# 只影响本进程及其子进程；不改 dsh 源码、不改 worker-gitconfig（它每次派活都会重写）。
+if [ -n "${GIT_CONFIG_GLOBAL:-}" ]; then
+  GIT_CONFIG_COUNT=1
+  GIT_CONFIG_KEY_0='url.git@github.com:.insteadOf'
+  GIT_CONFIG_VALUE_0='https://github.com/'
+  export GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
+fi
+# --- 注入结束 ---
+PROMPT=""; DIR=""; NEW=0; MODEL="deepseek"; TMO="1800"
+# team 子命令（2026-11-11）：统筹 -> 并行 -> 汇总。缺省关闭，行为与旧版一致。
+MODE_TEAM=0; TEAM_WORKERS=3
+# 协作 lane：缺省 main = 旧行为（状态文件就在 $DIR/.cc-worker 下）。
+# 传 --lane w1 时状态文件落到 $DIR/.cc-worker/lanes/w1，锁与会话各自独立，可与其它 lane 并行。
+# --task "一句话分工" 只是登记用途（写 $BASE/task.txt），面板会把它显示在这张工单的分工列表里；不影响执行。
+# 协作 lane 的命名规范：ccw1、ccw2、ccw3…（面板显示同名；旧的 w1/w2 会显示成 ccw1/ccw2）。
+# 2026-11-11 加：为「一张工单多 worker 协作」铺路；不加此参数时行为不变。
+LANE="${CC_LANE:-main}"
+# 轮次预算：默认兜底 120 轮，拦住失控的长会话（实测有工单跑到 567 轮）。
+# 但有些任务天然连贯、切分即失效（探索性排查、必须连续观察的调试、目标尚未成形），
+# 这类任务用 --max-turns unlimited 显式放行，且必须用 --why 写明理由；
+# 理由会落进结果 JSON，事后可审计该不该放行，而不是靠模型自说自话。
+MAXTURNS="120"
+TURNS_UNLIMITED=0
+WHY=""
+# 上下文警戒线：只告警、不直接换会话；真正的换会话由 decide.py 在 resume 前判定。
+# 267000 = AUTO_COMPACT_WINDOW(254000) x 1.05：必须高于压缩触发点，否则健康会话
+# 在压缩之前就必然先告警（2026-11-04 审计实测：3 次告警全部命中饱和值、同一工单 5 分钟 3 连报）。
+# 2026-11-06 起 decide.py 的兜底阈值：会话文件 >=20MB、上一轮 cache_read >=80万、
+# 或 assignments >5 就换会话；>=50MB 强制换。压缩生效时仍可续跑，压缩没触发时由这些阈值兜底。
+MAX_CONTEXT_TOKENS="267000"
+# 预算闸门（2026-11-04，2026-11-06 调整）：默认只观测、不阻断。
+# 模型自预估不可靠：3 组真实短任务 A/B 没有可测 token 节省，反而增加固定开销/误杀。
+# 现在：计划可选、只记录；硬闸门只保留“同一工具调用重复第 3 次”+ 超时/--max-turns。
+# 需要原来的强制预估：加 --hard-budget-gate；--no-budget-gate 可完全关闭。
+BUDGET_GATE=1
+HARD_GATE="${HARD_GATE:-0}"
+ALLOW_RESUME=1
+# 必须显式给 --dir：所有工单共用 $PWD 会让不同工单的 Claude Code 会话串味，
+# 面板按工单目录找 .cc-worker 也就永远读不到。
+REQUIRE_DIR=1
+case "${1:-}" in
+  run) shift;;
+  team) MODE_TEAM=1; shift;;
+esac
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dir) DIR="$2"; shift 2;;
+    --new) NEW=1; shift;;
+    --model) MODEL="$2"; shift 2;;
+    --timeout) TMO="$2"; shift 2;;
+    --max-turns) MAXTURNS="$2"; shift 2;;
+    --why) WHY="$2"; shift 2;;
+    --max-context-tokens) MAX_CONTEXT_TOKENS="$2"; shift 2;;
+    --no-resume) ALLOW_RESUME=0; shift;;
+    --lane) LANE="$2"; shift 2;;
+    --workers) TEAM_WORKERS="$2"; shift 2;;
+    --task) TASK="$2"; shift 2;;
+    --no-budget-gate) BUDGET_GATE=0; shift;;
+    --hard-budget-gate) HARD_GATE=1; shift;;
+    --prompt-file) PROMPT="$(cat -- "$2" 2>/dev/null)"; shift 2;;
+    -*) shift;;
+    *) PROMPT="${PROMPT:+$PROMPT }$1"; shift;;
+  esac
+done
+if [ -z "$PROMPT" ]; then echo '{"ok":false,"error":"empty prompt"}'; exit 2; fi
+# 没给 --dir 就拒绝：绝不回落到 $PWD，否则会话会串到别的工单去。
+if [ -z "$DIR" ]; then
+  echo '{"ok":false,"error":"missing --dir: pass the ticket directory, e.g. --dir /home/szm/.dsh/state/superagent/work/<ticket>"}'
+  exit 2
+fi
+case "$DIR" in
+  /home/szm/.dsh/state/superagent/work/*) ;;
+  *) echo "{\"ok\":false,\"error\":\"--dir must be a ticket directory under /home/szm/.dsh/state/superagent/work, got: $DIR\"}"; exit 2;;
+esac
+# lane 名只允许安全字符：它会拼进路径，绝不能带 / 或 ..
+case "$LANE" in
+  ""|*[!A-Za-z0-9_-]*) echo '{"ok":false,"error":"invalid --lane: use letters, digits, - and _ only"}'; exit 2;;
+esac
+# 状态根：main 与旧版完全一致；其它 lane 各占一个子目录。
+CCROOT="$DIR/.cc-worker"
+if [ "$LANE" = "main" ]; then BASE="$CCROOT"; else BASE="$CCROOT/lanes/$LANE"; fi
+# 导出给子进程（decide.py 靠它构造自己的状态路径），必须与 $BASE 口径一致。
+export CC_LANE="$LANE"
+mkdir -p "$BASE/runs" || { echo '{"ok":false,"error":"bad dir"}'; exit 2; }
+# 分工登记（面板展示用）：只写不改执行逻辑；任务描述里有换行就压成一行。
+if [ -n "${TASK:-}" ]; then
+  printf '%s\n' "$(printf '%s' "$TASK" | tr '\n' ' ')" > "$BASE/task.txt" 2>/dev/null || true
+fi
+
+# === team 子命令：统筹 -> 并行 -> 汇总（2026-11-11 第二步）===
+if [ "$MODE_TEAM" = "1" ]; then
+  # 嵌套保护：team 里再调 team 会指数膨胀
+  if [ "${CC_TEAM_DEPTH:-0}" -ge 1 ]; then
+    echo '{"ok":false,"error":"team cannot be nested (CC_TEAM_DEPTH already set)"}'; exit 2
+  fi
+  export CC_TEAM_DEPTH=1
+  SELF="$(readlink -f "$0")"
+  case "$TEAM_WORKERS" in
+    ''|*[!0-9]*) TEAM_WORKERS=3;;
+  esac
+  [ "$TEAM_WORKERS" -lt 1 ] 2>/dev/null && TEAM_WORKERS=1
+  [ "$TEAM_WORKERS" -gt 4 ] 2>/dev/null && TEAM_WORKERS=4
+
+  PLAN="$CCROOT/team-plan.json"
+  LEAD_BASE="$CCROOT/lanes/lead"
+  SHARED="$CCROOT/shared"
+  # 两层共享：工单内（shared/findings）与全局（跨工单可复用知识）。
+  GLOBAL_SHARED="$HOME/.dsh/state/superagent/shared/knowledge"
+  mkdir -p "$SHARED/findings" "$SHARED/artifacts" "$GLOBAL_SHARED" 2>/dev/null || true
+  rm -f "$PLAN"
+
+  echo "[team] 阶段1/3 统筹：拆解任务（lead lane，最多 $TEAM_WORKERS 个子任务）" >&2
+  "$SELF" run "你是统筹 worker。总任务如下：
+
+$PROMPT
+
+请把任务拆成最多 $TEAM_WORKERS 个**互不依赖、可并行**的子任务。要求：
+1. 每个子任务写清：做什么、验收标准、禁止触碰的范围（避免两个 worker 改同一文件）。
+2. 用 Write 工具把计划写到 $PLAN，内容必须是 JSON 数组，元素形如：
+   [{\"lane\":\"ccw1\",\"task\":\"子任务描述（含验收与禁止事项）\"}, {\"lane\":\"ccw2\",\"task\":\"...\"}]
+   其中 lane 依次用 ccw1、ccw2、ccw3…（最多 $TEAM_WORKERS 个）。
+3. 如果任务确实不可拆分（强依赖、探索性、必须连续观察），就写一个空数组 []。
+4. 写完后只回答 PLAN_DONE，不要自己执行子任务。
+
+工单内共享区：$SHARED（findings/ 可写中间结论，artifacts/ 可登记产物路径）。" \
+    --dir "$DIR" --lane lead --max-turns 12 --timeout 600 >/dev/null 2>&1
+
+  # 解析计划：每行 "lane<TAB>task"
+  PLAN_TSV="$(python3 -c '
+import json, sys, re
+try:
+    data = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    sys.exit(0)
+if not isinstance(data, list):
+    sys.exit(0)
+for item in data[:8]:
+    if not isinstance(item, dict):
+        continue
+    lane = str(item.get("lane") or "").strip()
+    task = str(item.get("task") or "").replace("\n", " ").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", lane) or not task:
+        continue
+    print(lane + "\t" + task)
+' "$PLAN" 2>/dev/null)"
+
+  if [ -z "$PLAN_TSV" ]; then
+    echo "[team] 计划为空或解析失败 -> 降级为单 worker 直跑" >&2
+    exec "$SELF" run "$PROMPT" --dir "$DIR" --lane main --max-turns "$MAXTURNS" --timeout "$TMO"
+  fi
+
+  echo "[team] 阶段2/3 并行执行：" >&2
+  echo "$PLAN_TSV" | while IFS="$(printf '\t')" read -r L T; do
+    [ -z "$L" ] && continue
+    echo "  - $L: $T" >&2
+  done
+
+  PIDS=""
+  i=0
+  while IFS="$(printf '\t')" read -r L T; do
+    [ -z "$L" ] && continue
+    i=$((i + 1))
+    # 关键：重定向在 exec 之前求值，目录必须先存在，否则子进程根本起不来（2026-11-11 实测）。
+    mkdir -p "$CCROOT/lanes/$L" 2>/dev/null || true
+    "$SELF" run "$T
+
+工单内共享区：$SHARED。开始前可读 $SHARED/findings/ 避免重复劳动；
+完成或卡住时写一条 $SHARED/findings/$L.md（DONE/BLOCKED + 一句结论）。
+全局知识库：$GLOBAL_SHARED（跨工单）。只读，先看 index.md，只挑与本任务相关的条目，不要全量读。
+本任务产出了可复用的结论时，追加一行到 $GLOBAL_SHARED/index.md，并在同名 .md 里写正文。" \
+      --dir "$DIR" --lane "$L" --task "$T" --timeout "$TMO" --max-turns "$MAXTURNS" \
+      > "$CCROOT/lanes/$L/result.json" 2>"$CCROOT/lanes/$L/stderr.log" &
+    PIDS="$PIDS $!"
+  done <<< "$PLAN_TSV"
+
+  # 零 token 监督：轮询判活 + 超时强杀，不经过模型。
+  DEADLINE=$(( $(date +%s) + TMO ))
+  while :; do
+    ALIVE=0
+    for pid in $PIDS; do kill -0 "$pid" 2>/dev/null && ALIVE=$((ALIVE + 1)); done
+    [ "$ALIVE" -eq 0 ] && break
+    if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+      echo "[team] 超时(${TMO}s)：终止剩余 $ALIVE 路 lane" >&2
+      for pid in $PIDS; do kill -TERM "$pid" 2>/dev/null; done
+      sleep 5
+      for pid in $PIDS; do kill -KILL "$pid" 2>/dev/null; done
+      break
+    fi
+    sleep 5
+  done
+  FAILED=0
+  for pid in $PIDS; do
+    wait "$pid" 2>/dev/null || FAILED=$((FAILED + 1))
+  done
+  echo "[team] 并行完成：$i 路，失败 $FAILED 路" >&2
+
+  # 冲突检测：各 lane「改动文件」段落里的路径若重叠，写进 conflicts.md 交给统筹裁决。
+  python3 "$HOME/cc-diag/team_conflicts.py" "$CCROOT" 2>/dev/null || true
+
+  echo "[team] 阶段3/3 汇总（resume lead，读全部 lane 交接）" >&2
+  COLLECT=""
+  while IFS="$(printf '\t')" read -r L T; do
+    [ -z "$L" ] && continue
+    HF="$CCROOT/lanes/$L/handoff.md"
+    COLLECT="$COLLECT
+
+===== $L（任务：$T）=====
+$(cat "$HF" 2>/dev/null || echo '（无交接单）')"
+  done <<< "$PLAN_TSV"
+
+  "$SELF" run "各子 worker 已全部结束。以下是它们的交接单，请汇总成一个协调一致的结果：
+
+$COLLECT
+
+$(if [ -s "$SHARED/conflicts.md" ]; then echo "===== 自动冲突检测 ====="; cat "$SHARED/conflicts.md"; fi)
+
+要求：
+1. 冲突或矛盾由你裁决，并说明依据（上面「自动冲突检测」里的重叠路径优先处理）。
+2. 有 worker 失败/无交接的，明确标出缺口。
+3. 最终给出一份统一结论，写入工单共享区 $SHARED/findings/final.md。" \
+    --dir "$DIR" --lane lead --max-turns 20 --timeout 900 \
+    > "$CCROOT/team-summary.json" 2>"$CCROOT/team-summary.err"
+
+  echo "[team] 完成。汇总结果：$CCROOT/team-summary.json" >&2
+  cat "$CCROOT/team-summary.json" 2>/dev/null || echo '{"ok":false,"error":"summary missing"}'
+  exit 0
+fi
+cd "$DIR" || exit 2
+LOG="$BASE/log.jsonl"; SIDF="$BASE/session_id"; ERRF="$BASE/stderr.log"
+# 同一 lane 串行执行：拿到锁才跑（最多等 600 秒），防两个进程并发写同一 Claude Code 会话。
+# 锁按 lane 独立：不同 lane 各拿自己的锁，因此可以并行；同 lane 仍然串行。
+exec 9>"$BASE/lock"
+flock -w 600 9 || { echo "{\"ok\":false,\"error\":\"another cc-worker is running in lane ${LANE} (waited 600s)\"}"; exit 3; }
+RUNLOG="$BASE/runs/$(date +%Y%m%d-%H%M%S).jsonl"
+# 反馈边：把历史上「实际/预估」的中位倍率算出来，写进下一次的提示词。
+BUDGET_LEDGER="$BASE/budget-ledger.jsonl"
+BUDGET_GLOBAL="$HOME/.dsh/state/superagent/budget-ledger.jsonl"
+BUDGET_CALIB=""
+if [ "$BUDGET_GATE" = 1 ]; then
+  BUDGET_CALIB="$(python3 - "$BUDGET_LEDGER" "$BUDGET_GLOBAL" <<'PYCAL' 2>/dev/null
+import json, statistics, sys
+def load(path, limit):
+    out = []
+    try:
+        for line in open(path, encoding="utf-8", errors="replace"):
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            if r.get("plan_found") and r.get("est_steps") and r.get("act_steps") is not None:
+                out.append(r)
+    except Exception:
+        pass
+    v2 = [r for r in out if r.get("schema") == "p0-v1"]
+    return (v2 if len(v2) >= 3 else out)[-limit:]
+
+# 本工单样本优先；不足 3 条则退回全局最近 20 条，避免每个新工单从零开始。
+rows = load(sys.argv[1], 8)
+source = "本工单"
+if len(rows) < 3 and len(sys.argv) > 2:
+    rows = load(sys.argv[2], 20)
+    source = "全局"
+if not rows:
+    print("无历史校准数据；固定开销提示：空任务实测 input 约 21K（系统提示+工具定义），预估必须计入这个底。")
+else:
+    sr = [r["act_steps"] / r["est_steps"] for r in rows if r.get("est_steps")]
+    tr = []
+    for r in rows:
+        # 被硬闸门 kill 的 run 没有完整 result，token 不完整，不进入 token 倍率。
+        if r.get("capped") or r.get("violation"):
+            continue
+        est = r.get("est_input")
+        act = r.get("act_input_total")
+        if act is None:
+            act = (r.get("act_input") or 0) + (r.get("act_cache_read") or 0)
+        if est and act:
+            tr.append(act / est)
+    rr = [r["context_rereads"] for r in rows
+          if r.get("context_rereads") is not None and not r.get("capped")]
+    out = []
+    if sr:
+        out.append("%s steps 实际/预估中位倍率 %.2f（%d 次）" % (source, statistics.median(sr), len(sr)))
+    if tr:
+        out.append("%s input_tokens（含缓存）实际/预估中位倍率 %.2f（%d 次）" % (source, statistics.median(tr), len(tr)))
+    if rr:
+        out.append("%s context_rereads 中位 %.2f（%d 次）" % (source, statistics.median(rr), len(rr)))
+    viol = [r for r in rows if r.get("violation")]
+    if viol:
+        vc = {}
+        for r in viol:
+            vc[r["violation"]] = vc.get(r["violation"], 0) + 1
+        out.append("历史硬闸门违规 %d 次（%s）；steps 宁多报勿少报，超 1.5 倍会被终止"
+                   % (len(viol), "，".join("%s×%d" % (k, v) for k, v in sorted(vc.items()))))
+    out.append("固定开销：空任务实测 input 约 21K（系统提示+工具定义），预估必须计入这个底")
+    print("；".join(out))
+PYCAL
+)"
+  [ -z "$BUDGET_CALIB" ] && BUDGET_CALIB="无历史校准数据。"
+fi
+# 后端：VM 可达的 superagent 路由器（8788，全链 deepseek）；model 名会被路由器覆盖，与配置保持一致即可。
+export ANTHROPIC_BASE_URL="http://192.168.206.1:8788"
+export ANTHROPIC_AUTH_TOKEN="local-router"
+export ANTHROPIC_MODEL="$MODEL"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="$MODEL"
+export ANTHROPIC_SMALL_FAST_MODEL="$MODEL"
+export CLAUDE_CODE_MAX_OUTPUT_TOKENS="32000"
+# 上下文管理：直接对齐 dsh 的 compaction-basic，两个变量分工不同，缺一不可。
+#   MAX_CONTEXT_TOKENS    = 声明窗口容量（dsh DEFAULT_CONTEXT_WINDOW = 262144）
+#   AUTO_COMPACT_WINDOW   = 实际压缩触发点（dsh threshold = min(0.8*W, W-reserved-65536) = 202464）
+# 原值 500000 无依据：CC 会把 50 万当窗口，实测 83 个会话一次都没压缩，峰值冲到 392005。
+# 对齐后压缩点 163840 始终低于路由最窄上游千帆的 300000，夜间不会再被踢出千帆。
+export CLAUDE_CODE_MAX_CONTEXT_TOKENS="400000"
+export CLAUDE_CODE_AUTO_COMPACT_WINDOW="254000"
+export DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1 DISABLE_AUTOUPDATER=1
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+BASE_ARGS=(--dangerously-skip-permissions --output-format stream-json --verbose)
+# 轮次预算裁决：unlimited 显式放行，但必须留下理由；其它值作为硬上限传给 Claude Code。
+case "$MAXTURNS" in
+  unlimited|unlimited|none|off|0)
+    TURNS_UNLIMITED=1
+    if [ -z "${WHY// /}" ]; then
+      echo '{"ok":false,"error":"--max-turns unlimited requires --why: state why this task cannot be split, e.g. --why \"steps depend on each other, each fix decides the next probe\""}'
+      exit 2
+    fi
+    echo "cc-worker: turns unlimited, reason: $WHY" >&2
+    ;;
+  "")
+    MAXTURNS="120"
+    BASE_ARGS+=(--max-turns "$MAXTURNS")
+    ;;
+  *)
+    BASE_ARGS+=(--max-turns "$MAXTURNS")
+    ;;
+esac
+# 把裁决结果传给结果汇总脚本，写进 JSON 供事后核对估算准不准。
+export CC_MAX_TURNS="$MAXTURNS"
+export CC_TURNS_UNLIMITED="$TURNS_UNLIMITED"
+export CC_TURNS_WHY="$WHY"
+
+# 会话 id：预分配 + 立即落盘（进程被杀也不丢，下次可续跑）。
+# 有旧 id 且非 --new 时走 resume；否则用新 id 并以 --session-id 指定创建。
+# --- 上下文预算裁决：resume 之前先估这个会话现在有多长 ---------------------
+# 读本工单最近两次 run 的 modelUsage.cacheReadInputTokens（会话累计），用增量 / 轮次
+# 估算当前上下文大小。超过 MAX_CONTEXT_TOKENS 就把 resume 降级成新会话。
+# 为什么不用累计值：累计是会话一生的总和，跑得久就越接近任何阈值，
+# 会拦掉健康的长会话却放过上下文巨大的短会话，方向是错的。
+if [ "$NEW" = 0 ] && [ "$ALLOW_RESUME" = 1 ] && [ -s "$SIDF" ] && [ -d "$BASE/runs" ]; then
+  CTX=$(python3 - "$DIR" <<'PYCTX' 2>/dev/null
+import glob, json, os, sys
+d = sys.argv[1]
+runs = []
+for f in sorted(glob.glob(os.path.join(d, ".cc-worker", "runs", "*.jsonl")), key=os.path.getmtime):
+    try:
+        for line in open(f, encoding="utf-8", errors="replace"):
+            if '"result"' not in line:
+                continue
+            r = json.loads(line)
+            if r.get("type") != "result":
+                continue
+            cr = 0
+            for mu in (r.get("modelUsage") or {}).values():
+                if isinstance(mu, dict):
+                    cr += mu.get("cacheReadInputTokens") or 0
+            runs.append((cr, r.get("num_turns") or 0))
+    except Exception:
+        continue
+if not runs:
+    print(0)
+else:
+    # 上下文估算的唯一可靠来源：一次 run 的「cacheRead 增量 / 该 run 的轮次」。
+    # 不能直接用累计值 cr/turns —— 会话被重置后累计归零，那个比值毫无意义。
+    # 也不能用相邻 run 的差值 —— run 的轮次与它内部实际增长不线性。
+    #
+    # 做法：对每个 run 求「相对它之前所有 run 的最小累计值」的增量（即重启后的净增长），
+    # 再除以该 run 的轮次，取所有正估计的中位数。
+    ests = []
+    floor_cr = 0
+    for cr, t in runs:
+        if cr < floor_cr:
+            floor_cr = cr            # 会话被重置，累计值回落
+        delta = cr - floor_cr
+        if delta > 0 and t >= 3:
+            ests.append(int(delta / t))
+        floor_cr = max(floor_cr, cr) if cr >= floor_cr else floor_cr
+    if ests:
+        ests.sort()
+        est = ests[len(ests) // 2]
+    else:
+        est = 0
+    # 上限取「声明窗口 x 0.95」= 380000，而不是旧的硬 cap 262144：
+    # 262144 会让告警永远打印 262144（饱和值），真实水位不可见。
+    print(min(max(est, 0), 380000))
+PYCTX
+)
+  case "$CTX" in
+    ""|*[!0-9]*) CTX=0 ;;
+  esac
+  if [ "$CTX" -ge "$MAX_CONTEXT_TOKENS" ]; then
+    # 只告警，不打断。压缩负责把上下文压回来，换会话会丢工作记忆。
+    # 去重：同工单同 session 在 300 秒内只报一次，避免同一问题连刷多条。
+    STAMP="$BASE/ctx-alert.stamp"
+    _sid="$(cat "$SIDF" 2>/dev/null)"
+    _dedupe=0
+    if [ -s "$STAMP" ]; then
+      read -r _lsid _lts < "$STAMP" 2>/dev/null || true
+      case "${_lts:-}" in ''|*[!0-9]*) _lts=0 ;; esac
+      if [ "${_lsid:-}" = "$_sid" ] && [ $(( $(date +%s) - _lts )) -lt 300 ]; then
+        _dedupe=1
+      fi
+    fi
+    if [ "$_dedupe" = 0 ]; then
+      printf '%s %s\n' "$_sid" "$(date +%s)" > "$STAMP"
+      echo "$(date -Is) cc-worker: context ${CTX} tokens >= alert line ${MAX_CONTEXT_TOKENS}; compaction may not have fired" >> "$BASE/fallback.log"
+      echo "cc-worker: 警告——会话上下文约 ${CTX} token，已超警戒线 ${MAX_CONTEXT_TOKENS}，压缩可能没触发" >&2
+    fi
+  fi
+fi
+
+
+if [ "$NEW" = 1 ] || [ ! -s "$SIDF" ]; then
+  SID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+  printf '%s\n' "$SID" > "$SIDF"
+  MODE="new"
+else
+  SID="$(cat "$SIDF")"
+  MODE="resume"
+fi
+
+# === preseed guard begin ===
+# 预置/克隆会话守卫：某个 sid 的会话文件在「正常生命周期之外」突然变得很大，说明它是被
+# 别的脚本整份 cp 进来的（实测 /home/szm/cc-diag/ab-topup.sh 把 52MB 旧会话拷成新 sid，
+# 首轮把 42.4M 缓存整体重放，单轮 $29.73）。这种「预置历史」绕过 decide.py 的换会话裁决，
+# 必须在这里改名备份，按空会话继续。
+# 两个入口都要管，且都不能误伤：
+#   - MODE=new：新 uuid 不该有会话文件，有且 ≥阈值就是预置，直接备份；
+#   - MODE=resume：正常长会话必须放过，只有「文件首行 sessionId 与本轮 SID 不符」才判定为
+#     被 cp 过来的克隆（克隆会继承别人的历史，却用新 sid 记账）。
+# 阈值 CC_PRESEED_GUARD_MB（默认 20），总开关 CC_PRESEED_GUARD=0。
+PRESEED_MB="${CC_PRESEED_GUARD_MB:-20}"
+if [ "${CC_PRESEED_GUARD:-1}" != "0" ]; then
+  _PS_OUT="$(python3 - "$DIR" "$SID" "$PRESEED_MB" "$MODE" <<'PYGUARD' 2>/dev/null || echo "skip"
+import json, os, sys, time
+d, sid, mb, mode = sys.argv[1], sys.argv[2], float(sys.argv[3] or 20), sys.argv[4]
+try:
+    enc = d.replace("/", "-").replace(".", "-")
+    p = os.path.join(os.path.expanduser("~/.claude/projects"), enc, sid + ".jsonl")
+    size = os.path.getsize(p)          # 目录不存在/文件不存在都会抛 OSError -> skip
+except Exception:
+    print("skip"); raise SystemExit(0)
+if size < mb * 1048576:
+    print("skip"); raise SystemExit(0)
+if mode != "new":
+    # resume 的大文件通常是正常长会话，不能动。唯一例外是「克隆」：会话文件首行
+    # 记的是它出生时的 sessionId，被 cp 过来的文件首行 sid 与本轮 SID 不符。
+    try:
+        with open(p, encoding="utf-8", errors="replace") as f:
+            first = f.readline()
+        born = str((json.loads(first) or {}).get("sessionId") or "")
+    except Exception:
+        born = ""
+    if not born or born == sid:
+        print("skip"); raise SystemExit(0)
+bak = "%s.preseed-%s" % (p, time.strftime("%Y%m%d-%H%M%S"))
+try:
+    os.replace(p, bak)
+except Exception as e:
+    print("fail\t%s\t%d\t%s" % (p, size, e)); raise SystemExit(0)
+print("moved\t%s\t%d\t%s" % (bak, size, p))
+PYGUARD
+)"
+  case "$_PS_OUT" in
+    moved*)
+      _PS_BAK="$(printf '%s' "$_PS_OUT" | cut -f2)"
+      _PS_SIZE="$(printf '%s' "$_PS_OUT" | cut -f3)"
+      # 备份掉预置/克隆文件后，本轮一定按空会话跑：resume 的目标已经不存在了。
+      MODE="new"
+      echo "$(date -Is) cc-worker: preseed guard: moved pre-seeded session ${_PS_SIZE}B to ${_PS_BAK} (${PRESEED_MB}MB threshold); starting empty session $SID" >> "$BASE/fallback.log"
+      echo "cc-worker: 警告——会话 $SID 带预置/克隆历史（${_PS_SIZE} 字节），已改名备份为 $(basename "$_PS_BAK")，本轮按空会话跑" >&2
+      ;;
+    fail*)
+      _PS_ERR="$(printf '%s' "$_PS_OUT" | cut -f4)"
+      echo "$(date -Is) cc-worker: preseed guard: rename failed for $SID: ${_PS_ERR}" >> "$BASE/fallback.log"
+      ;;
+    *)
+      ;;
+  esac
+fi
+# === preseed guard end ===
+
+# === cctrim hook begin ===
+# 会话膨胀治理：resume 前按实测数据判定是否瘦身/换会话（2026-11-05 加）
+#   瘦身 = 把历史里的 image 块换成占位符（文本不动），实测 51MB→5.2MB，resume 兼容已验证
+#   换会话 = 派活次数 >5、会话文件 >=20MB、上一轮 cache_read >=80万，或 >=50MB 强制；
+#            换之前生成/沿用 handoff.md，新会话开场注入，避免无限重放历史
+# 关闭：CC_NOTRIM=1 环境变量，或 --no-trim 参数
+if [ "$MODE" = "resume" ] && [ "${CC_NOTRIM:-0}" != "1" ]; then
+  _DEC="$(python3 "$HOME/cc-diag/decide.py" "$DIR" "$SID" 2>/dev/null || echo none)"
+  case "$_DEC" in
+    trim)
+      _TRIMMED="$(python3 "$HOME/cc-diag/decide.py" "$DIR" "$SID" --trim 2>&1 || echo failed)"
+      echo "$(date -Is) cc-worker: cctrim $_TRIMMED" >> "$BASE/switch.log"
+      ;;
+    switch)
+      python3 "$HOME/cc-diag/decide.py" "$DIR" "$SID" --handoff >/dev/null 2>&1 || true
+      SID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+      printf '%s\n' "$SID" > "$SIDF"
+      MODE="new"
+      python3 "$HOME/cc-diag/decide.py" "$DIR" "$SID" --mark-switched >/dev/null 2>&1 || true
+      _SWWHY="$(cat "$BASE/switch-reason" 2>/dev/null || true)"
+      echo "$(date -Is) cc-worker: cctrim switch to $SID (handoff written; reason=${_SWWHY:-?})" >> "$BASE/switch.log"
+      ;;
+    switch-trim)
+      _TRIMMED="$(python3 "$HOME/cc-diag/decide.py" "$DIR" "$SID" --trim 2>&1 || echo failed)"
+      python3 "$HOME/cc-diag/decide.py" "$DIR" "$SID" --handoff >/dev/null 2>&1 || true
+      SID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+      printf '%s\n' "$SID" > "$SIDF"
+      MODE="new"
+      python3 "$HOME/cc-diag/decide.py" "$DIR" "$SID" --mark-switched >/dev/null 2>&1 || true
+      _SWWHY="$(cat "$BASE/switch-reason" 2>/dev/null || true)"
+      echo "$(date -Is) cc-worker: cctrim $_TRIMMED then switch to $SID (reason=${_SWWHY:-?})" >> "$BASE/switch.log"
+      ;;
+    orphan)
+      export CC_ORPHAN="$DIR"
+      echo "$(date -Is) cc-worker: orphan dir, reported only (no delete)" >> "$BASE/switch.log"
+      ;;
+    *)
+      ;;
+  esac
+fi
+# === cctrim hook end ===
+
+
+run_claude() {  # $1=会话id  $2=new|resume
+  local sid="$1" mode="$2" args=("${BASE_ARGS[@]}")
+  if [ "$mode" = "resume" ]; then args+=(--resume "$sid"); else args+=(--session-id "$sid"); fi
+  local IF="$BASE/interrupt"
+  local PIDF="$BASE/claude.pid"
+  local WATCH_PID=""
+  # 中断旁路：面板写 .cc-worker/interrupt 后，本监视 1 秒内按 pid 文件杀掉 claude 整个进程组，
+  # 保留会话 id 供 --resume 续跑。新一轮开始时清掉上一次的残留标记，避免刚启动就被误杀。
+  rm -f "$IF" "$PIDF"
+  # 记住启动时的父进程：dsh-superagent 若被 kill -9，本进程被 init(1) 收养，父 pid 变成 1。
+  # 注意必须在子 shell 外用 ps 实时查——子 shell 的 $PPID 恒等于主 shell，不会随收养改变。
+  # 宿主存活判据：DSH 会把 cc-worker 挂到 systemd --user 之下（父进程是 2741，不是 dsh 主进程），
+  # 所以不能靠 $PPID 判断。这里直接记住 dsh-superagent 的主进程 PID，之后每一轮确认它还活着。
+  # 读不到主进程（不是由 systemd 起的，比如手工调试）就不做父死子亡，避免误杀。
+  local HOST_PID=""
+  HOST_PID=$(systemctl --user show -p MainPID --value dsh-superagent 2>/dev/null | tr -d " ")
+  case "$HOST_PID" in
+    ""|0|*[!0-9]*) HOST_PID="" ;;
+  esac
+  ( while :; do
+      sleep 1
+      # 父死子必死：宿主进程没了就把 claude 整组收掉，别把僵尸留给下一轮启动。
+      if [ -n "$HOST_PID" ] && ! kill -0 "$HOST_PID" 2>/dev/null; then
+        local gp=""
+        [ -s "$PIDF" ] && gp="$(cat "$PIDF" 2>/dev/null)"
+        echo "$(date -Is) cc-worker: host ${HOST_PID} gone, killing claude group (pid ${gp:-?})" >> "$BASE/fallback.log"
+        if [ -n "$gp" ]; then
+          kill -TERM "-$gp" 2>/dev/null || kill -TERM "$gp" 2>/dev/null
+          sleep 2
+          kill -KILL "-$gp" 2>/dev/null || kill -KILL "$gp" 2>/dev/null
+        fi
+        exit 0
+      fi
+      if [ -e "$IF" ]; then
+        # 读 pid 文件（由本函数在启动 claude 后立刻写入）；连带同组子进程一起收掉。
+        local tp=""
+        [ -s "$PIDF" ] && tp="$(cat "$PIDF" 2>/dev/null)"
+        echo "$(date -Is) cc-worker: interrupt requested, stopping claude (pid ${tp:-?})" >> "$BASE/fallback.log"
+        if [ -n "$tp" ]; then
+          kill -TERM "-$tp" 2>/dev/null || kill -TERM "$tp" 2>/dev/null
+          sleep 2
+          kill -KILL "-$tp" 2>/dev/null || kill -KILL "$tp" 2>/dev/null
+        fi
+        exit 0
+      fi
+      # claude 已自行退出就收工，别一直挂着。
+      if [ -s "$PIDF" ] && ! kill -0 "$(cat "$PIDF" 2>/dev/null)" 2>/dev/null; then exit 0; fi
+    done ) &
+  WATCH_PID=$!
+  # setsid 让 claude 自成进程组，中断时可以整组收掉（含它派生的后台作业）。
+  setsid timeout "$TMO" claude "${args[@]}" -p "$PROMPT" > "$RUNLOG" 2> "$ERRF" &
+  local CL_PID=$!
+  echo "$CL_PID" > "$PIDF"
+  # 硬闸门：合法 BUDGET_PLAN 出现之前，任何 tool_use 都直接杀进程组。
+  GATE_PID=""
+  rm -f "$BASE/budget-violation" "$BASE/budget-status.json"
+  if [ "$BUDGET_GATE" = 1 ]; then
+    python3 - "$RUNLOG" "$PIDF" "$BASE/budget-violation" "$MAXTURNS" "$BASE/budget-status.json" "$HARD_GATE" <<'PYGATE' 2>/dev/null &
+import json, math, os, signal, sys, time
+
+runlog, pidf, viol, cap = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+status = sys.argv[5] if len(sys.argv) > 5 else ""
+hard = (sys.argv[6] if len(sys.argv) > 6 else "0") == "1"
+
+
+def claude_pid():
+    try:
+        return int(open(pidf).read().strip())
+    except Exception:
+        return 0
+
+
+def kill_group(p):
+    try:
+        os.killpg(os.getpgid(p), signal.SIGTERM)
+    except Exception:
+        try:
+            os.kill(p, signal.SIGTERM)
+        except Exception:
+            pass
+
+
+def plan_from_text(t):
+    i = t.find("BUDGET_PLAN")
+    if i < 0:
+        return None
+    j = t.find("{", i)
+    if j < 0:
+        return "bad"
+    depth = 0
+    for k in range(j, len(t)):
+        if t[k] == "{":
+            depth += 1
+        elif t[k] == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(t[j:k + 1])
+                except Exception:
+                    return "bad"
+    return "bad"
+
+
+def valid(pl):
+    return (isinstance(pl, dict)
+            and isinstance(pl.get("steps"), int) and pl["steps"] >= 0
+            and isinstance(pl.get("input_tokens"), int) and pl["input_tokens"] > 0)
+
+
+def record(kind):
+    try:
+        with open(viol, "w", encoding="utf-8") as f:
+            f.write(kind)
+    except Exception:
+        pass
+
+
+def cap_exceeded(pl, capn):
+    split = str(pl.get("split", "none") or "none").strip().lower()
+    return (capn is not None and pl["steps"] > capn
+            and split in ("", "none", "n/a"))
+
+
+def tool_key(name, inp):
+    """同一工具调用的归一化键；读预算状态文件不算重复。"""
+    if name == "Bash":
+        cmd = " ".join(str(inp.get("command") or "").split())
+        if "budget-status.json" in cmd:
+            return None
+        return "Bash::" + cmd
+    if name == "Read":
+        fp = str(inp.get("file_path") or "")
+        if "budget-status.json" in fp:
+            return None
+        return "Read::%s|%s|%s" % (fp, inp.get("offset"), inp.get("limit"))
+    if name == "Grep":
+        return "Grep::%s|%s|%s" % (inp.get("pattern"), inp.get("path"), inp.get("glob"))
+    # job_output 轮询同一个作业时 timeout_ms 每次都可能不同，按命令文本比对会漏判；
+    # 按 job_id 归一化，同一个作业被反复等待超过阈值即视为忙等。
+    if name in ("job_output", "JobOutput"):
+        jid = str(inp.get("job_id") or inp.get("jobId") or "")
+        if not jid:
+            return None
+        return "job_output::" + jid
+    if name in ("job_list", "JobList"):
+        return "job_list"
+    return None  # 其他工具不参与重复检测，避免误杀 orchestrator_report 等
+
+
+pos = 0
+plan = None
+tools = 0
+limit = None
+context_size = None
+total_in = 0
+total_out = 0
+counts = {}
+dup_count = 0
+duplicates = []
+seen_usage = set()
+
+
+def write_status(violation=None):
+    if not status:
+        return
+    try:
+        rereads = round(total_in / context_size, 2) if context_size else None
+        advice = "on track"
+        if violation:
+            advice = "budget gate violation: " + violation
+        elif dup_count:
+            advice = ("duplicate tool call detected: reuse the previous result "
+                      "or change the command/range")
+        elif limit is not None and tools >= limit:
+            advice = "step budget exhausted: wrap up now or emit a revised BUDGET_PLAN"
+        elif limit is not None and tools >= max(1, int(limit * 0.8)):
+            advice = "approaching step budget: wrap up or revise"
+        elif (context_size and plan and plan.get("steps")
+              and rereads is not None and rereads > plan["steps"] * 1.2):
+            advice = "context rereads exceed plan: wrap up or revise"
+        elif plan is None:
+            advice = ("waiting for BUDGET_PLAN" if hard else "no plan (optional)")
+        data = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "planned_steps": (plan or {}).get("steps"),
+            "steps_used": tools,
+            "step_limit": limit,
+            "context_size": context_size,
+            "context_rereads": rereads,
+            "input_tokens_used": total_in,
+            "output_tokens_used": total_out,
+            "duplicate_count": dup_count,
+            "duplicates": duplicates[-5:],
+            "violation": violation,
+            "advice": advice,
+        }
+        tmp = status + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, status)
+    except Exception:
+        pass
+
+
+try:
+    capn = int(cap)
+except Exception:
+    capn = None
+
+drain = 5
+while True:
+    p = claude_pid()
+    exited = bool(p and not os.path.exists("/proc/%d" % p))
+    try:
+        with open(runlog, "rb") as f:
+            f.seek(pos)
+            chunk = f.read()
+            pos = f.tell()
+    except Exception:
+        chunk = b""
+    if chunk:
+        for line in chunk.decode("utf-8", "replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            if ev.get("type") != "assistant":
+                continue
+            msg = ev.get("message") or {}
+            for b in (msg.get("content") or []):
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "text":
+                    pl = plan_from_text(b.get("text") or "")
+                    if pl is None or pl == "bad":
+                        continue
+                    if plan is None:
+                        if not valid(pl):
+                            if hard:
+                                record("invalid-plan")
+                                write_status(violation="invalid-plan")
+                                kill_group(p)
+                                sys.exit(0)
+                            # 软模式：计划无效就当没有计划，不影响执行
+                        else:
+                            plan = pl
+                            if hard:
+                                if cap_exceeded(pl, capn):
+                                    record("over-budget-plan")
+                                    write_status(violation="over-budget-plan")
+                                    kill_group(p)
+                                    sys.exit(0)
+                                limit = max(1, int(math.ceil(pl["steps"] * 1.5)))
+                            # 软模式不用计划限制步数；--max-turns/超时是硬边界
+                    else:
+                        if not valid(pl) or pl["steps"] < tools:
+                            if hard:
+                                record("invalid-revision")
+                                write_status(violation="invalid-revision")
+                                kill_group(p)
+                                sys.exit(0)
+                        else:
+                            plan = pl
+                            if hard:
+                                if cap_exceeded(pl, capn):
+                                    record("over-budget-plan")
+                                    write_status(violation="over-budget-plan")
+                                    kill_group(p)
+                                    sys.exit(0)
+                                limit = max(1, int(math.ceil(pl["steps"] * 1.5)))
+                elif b.get("type") == "tool_use":
+                    if plan is None and hard:
+                        record("tool-before-plan")
+                        write_status(violation="tool-before-plan")
+                        kill_group(p)
+                        sys.exit(0)
+                    tools += 1
+                    name = b.get("name") or ""
+                    inp = b.get("input") or {}
+                    k = tool_key(name, inp)
+                    if k is not None:
+                        counts[k] = counts.get(k, 0) + 1
+                        if counts[k] >= 2:
+                            dup_count += 1
+                            duplicates.append(k[:200])
+                            if len(duplicates) > 20:
+                                duplicates = duplicates[-20:]
+                        if counts[k] >= 3:
+                            record("duplicate-step")
+                            write_status(violation="duplicate-step")
+                            kill_group(p)
+                            sys.exit(0)
+                    if limit is not None and tools > limit:
+                        record("plan-overrun")
+                        write_status(violation="plan-overrun")
+                        kill_group(p)
+                        sys.exit(0)
+            u = msg.get("usage") or {}
+            mid = msg.get("id") or ""
+            # 同一条 assistant 消息会被拆成 thinking/text 多个事件，usage 相同；
+            # 按 message.id 去重，否则上下文重读次数和总 input 都会翻倍。
+            usage_key = mid if mid else (u.get("input_tokens"),
+                                         u.get("cache_read_input_tokens"),
+                                         u.get("output_tokens"))
+            if u and usage_key not in seen_usage:
+                seen_usage.add(usage_key)
+                cur = (u.get("input_tokens") or 0) + (u.get("cache_read_input_tokens") or 0)
+                if cur > 0:
+                    context_size = cur
+                total_in += cur
+                total_out += u.get("output_tokens") or 0
+    write_status()
+    if exited:
+        drain -= 1
+        if drain <= 0:
+            break  # 退出后连续 5 轮（约 1 秒）无新事件才收工
+    else:
+        drain = 5
+    time.sleep(0.2)
+
+PYGATE
+    GATE_PID=$!
+  fi
+  wait "$CL_PID"; RC=$?
+  # 等闸门自己读完最后一段 runlog（最多约 1.2 秒），再兜底 kill。
+  if [ -n "$GATE_PID" ]; then
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+      kill -0 "$GATE_PID" 2>/dev/null || break
+      sleep 0.1
+    done
+    kill "$GATE_PID" 2>/dev/null
+  fi
+  kill "$WATCH_PID" 2>/dev/null
+  rm -f "$PIDF"
+  # 被中断时明确标注，worker 才知道是人为中止而不是崩溃。
+  if [ -e "$IF" ]; then RC=130; fi
+  rm -f "$IF"
+  return $RC
+}
+
+# 预算闸门：必须在提示词最前面，先于任务正文，确保模型先估计再动手。
+if [ "$BUDGET_GATE" = 1 ] && [ "$HARD_GATE" = 1 ]; then
+  PROMPT="[BUDGET GATE - 开始任何工作之前必须完成]
+在调用任何工具之前，先输出一行（单独一行，合法 JSON，不要代码块、不要解释）：
+BUDGET_PLAN {\"steps\": <整数，预计本 run 的工具调用步数>, \"input_tokens\": <整数，预计本 run 累计输入 token，含缓存重读>, \"output_tokens\": <整数，预计输出 token>, \"split\": \"<若 steps 会超过本次预算，写拆分方案；否则 none>\", \"basis\": \"<一句话：要读什么、跑什么、为什么是这个量级>\"}
+
+即使本任务不需要调用工具，也必须先输出 BUDGET_PLAN（steps=0）和 STEP_PLAN（stop_when 写「已给出答案」），再回答。
+
+然后输出一份最多 8 行的最小执行路径（不要代码块）：
+STEP_PLAN
+1. <工具/命令/文件 + 目的>
+2. ...
+stop_when: <拿到什么证据或完成什么就停，不再补验证>
+reuse_first: <先读哪些已有产出/上轮报告/git diff，避免重跑>
+
+规则（违反即视为本次运行无效）：
+1. 没有先输出 BUDGET_PLAN 就调用工具，运行时硬闸门会立即终止整轮。
+2. 预估必须给出具体数字，禁止写「视情况而定」。
+3. 若预估 steps 超过本次 --max-turns 预算（${MAXTURNS}），不要开始执行：输出 BUDGET_PLAN 后直接给拆分方案并结束。
+4. steps 按工具调用次数计（1 次工具调用 = 1 步）。硬闸门会累计实际工具调用：超过预估 steps 的 1.5 倍仍未给出合法修正版，整轮会被立即终止（plan-overrun）。
+5. 执行中一旦发现实际工具调用数将超过预估的 1.5 倍，必须在下一次调用工具之前输出一行修正版 BUDGET_PLAN；修正版的 steps 不得小于已执行步数。
+6. STEP_PLAN 的步数必须与 BUDGET_PLAN.steps 一致；按路径执行，不要边做边找。
+7. 同一命令、同一文件同一区间、同一 grep 模式最多执行 2 次；第 3 次会被硬闸门终止（duplicate-step）。需要重跑时改变参数，或先读已有结果。
+8. 优先复用已有产出：上一轮 report、investigation.md、git diff、已经跑过的测试结果。达到 stop_when 后停止，不要补验证。
+9. 工具输出保持短：用 grep -n、sed -n、head；不要 cat 整文件、不要 ls -R；wc 只在需要判断文件大小时用。
+10. 不确定是否继续、或想确认还剩多少预算时，先运行 cat .cc-worker/budget-status.json；看到 advice 含 wrap_up / duplicate 时先处理再继续。
+11. 能合并的步骤必须合并：多个 grep 模式放同一条 grep -E；同一文件多个区间用一次 sed -n 'a,b;c,d'；不要为了「先看看」单独跑 wc -l 或 ls。
+12. 引用某份报告时，先看同目录有没有 fix/final/verification/更新版报告；有更新版优先读，避免只读旧报告得出过时结论。
+13. 最终回答只写任务要求的要点，每条不超过 3 行；不要复述执行过程，不要补背景。
+[BUDGET CALIBRATION] ${BUDGET_CALIB}
+注意：input_tokens 是「本 run 累计输入」。每一轮工具调用都会把完整上下文重新发送一次，所以：
+- 纯回答（0 次工具）：约 1 次固定开销 ≈ 21K；
+- 每次工具调用：约再计一次固定开销（21K）+ 该次工具输出；
+- 最终回答：再计一次固定开销。
+按「固定开销 × (工具调用步数 + 1) + 读取/命令输出」估，不要只算一次 21K。
+
+$PROMPT"
+elif [ "$BUDGET_GATE" = 1 ]; then
+  PROMPT="[BUDGET PLAN - 可选，不阻断]
+如果你预计本任务超过 3 个工具步骤，可先输出一行（单独一行，合法 JSON，不要代码块）：
+BUDGET_PLAN {\"steps\": <整数>, \"input_tokens\": <整数>, \"output_tokens\": <整数>, \"split\": \"none\"}
+
+这不是硬性门禁：没有计划也可以直接开始；计划只用于事后校准，不会因为没有计划而终止。
+真正会终止本次运行的只有：同一 Bash/Read/Grep 调用重复第 3 次、--max-turns 用尽、超时。
+若要预估 input_tokens，按「固定开销 × (工具调用步数 + 1) + 读取/命令输出」粗算，固定开销约 21K。
+优先复用已有产出，拿到目标证据就停，不要为了补验证多跑。
+[BUDGET CALIBRATION] ${BUDGET_CALIB}
+
+$PROMPT"
+fi
+# === cctrim handoff contract ===
+# 让模型在最终回答末尾写结构化交接：机械提取只能拿到"改过哪些文件/跑过哪些命令"，
+# 拿不到决策、未解决问题和下一步，新会话读到的是空壳（实测 335B 全是"（无）"）。
+PROMPT="$PROMPT
+[HANDOFF CONTRACT]
+在最终回答的最末尾追加一段交接，用下面的固定标题。不要放进代码块，不要调用 Write 工具；
+cc-worker 会从最终回答里提取并落盘，这段不会出现在给编排器的 result 里。
+## HANDOFF
+### 目标与验收
+### 当前状态：done / doing / blocked
+### 决策与理由（含被否方案）
+### 改动文件与验证（路径、行号、命令、结果）
+### 证据指针（路径；只摘关键行，不要贴全文/图片/base64）
+### 未解决问题 / 风险
+### 接手约束（必须做 / 禁止做）
+### 下一步（一条命令）
+### 不要重复
+只写本 run 的增量，不复述任务背景；每节最多 5 行。
+每节必须有正文：至少一句具体结论（文件、命令、路径或数字）。确实没有内容的节写「无」。
+「接手约束」写清楚下一轮必须执行的一条可验证命令，以及明确禁止的动作/路径；没有就写「无」。
+「下一步」必须是一条可直接执行的命令或「无」；「证据指针」至少给一个路径或行号。
+不允许只列标题不写内容——那样 cc-worker 会判定为无效交接并丢弃。
+[HANDOFF CONTRACT END]"
+# === cctrim handoff contract ===
+# === cctrim handoff inject ===
+# 新会话开场注入交接单：本 lane 上一轮换会话时生成的 $BASE/handoff.md（main lane 即 .cc-worker/handoff.md）
+# 只在 MODE=new 时生效，resume 不注入（历史已在会话里）。
+if [ "$MODE" = "new" ] && [ -s "$BASE/handoff.md" ]; then
+  _HOF="$BASE/handoff.md"
+  _HAG=$(( $(date +%s) - $(stat -c %Y "$_HOF" 2>/dev/null || echo 0) ))
+  if [ "$_HAG" -gt 86400 ]; then
+    # 交接单过期：归档不注入，避免几天后还拿旧内容当上下文
+    mkdir -p "$BASE/handoff-archive" 2>/dev/null || true
+    mv -f "$_HOF" "$BASE/handoff-archive/expired-$(date +%Y%m%d-%H%M%S).md" 2>/dev/null || true
+    echo "$(date -Is) cc-worker: handoff expired (${_HAG}s > 86400s), archived not injected" >> "$BASE/switch.log"
+  else
+    PROMPT="[交接单 - 上一轮结束时的交接，供你接续工作]
+$(cat "$_HOF")
+
+[本次任务]
+$PROMPT"
+    export CC_HANDOFF_USED=1
+    echo "$(date -Is) cc-worker: handoff injected ($(wc -c < "$_HOF") bytes)" >> "$BASE/switch.log"
+  fi
+fi
+# === cctrim handoff inject ===
+
+START=$(date +%s)
+if [ "$MODE" = "resume" ]; then
+  run_claude "$SID" resume; RC=$?
+  # 回退：resume 目标不存在（如预分配后从未成功启动过），用同一 id 新开会话。
+  if [ $RC -ne 0 ] && grep -qiE "no conversation found|no such session|session id .* not found" "$ERRF" "$RUNLOG" 2>/dev/null; then
+    echo "$(date -Is) cc-worker: resume target $SID missing; falling back to a fresh session" >> "$BASE/fallback.log"
+    run_claude "$SID" new; RC=$?
+  fi
+else
+  run_claude "$SID" new; RC=$?
+fi
+# === cctrim handoff consume ===
+# 交接单只用一次：本轮注入过且执行成功，立即归档，避免下次新会话重复注入旧内容。
+# 成功判据：RC==0，或 runlog 里有 is_error=false 的 result 事件。
+# 实测坑（2026-11-05）：claude CLI 因 unrecognized_model 之类告警返回非 0，
+# 但结果事件里 is_error=false —— 只看 RC 会让交接单永远挂住、每轮重复注入。
+_HOF_OK=0
+if [ "$RC" -eq 0 ]; then
+  _HOF_OK=1
+elif [ -f "$RUNLOG" ] && python3 -c '
+import json, sys
+for l in open(sys.argv[1], encoding="utf-8", errors="replace"):
+    try: e = json.loads(l)
+    except Exception: continue
+    if e.get("type") == "result":
+        sys.exit(0 if e.get("is_error") is False else 1)
+sys.exit(1)
+' "$RUNLOG" 2>/dev/null; then
+  _HOF_OK=1
+fi
+echo "$(date -Is) cc-worker: handoff consume-check rc=$RC ok=$_HOF_OK" >> "$BASE/switch.log"
+# 只归档"本轮注入的旧交接"：本轮模型新写的交接 mtime 晚于 START，必须保留。
+_HOF_MT=$(stat -c %Y "$BASE/handoff.md" 2>/dev/null || echo 0)
+_HOF_CONSUMED=0
+if [ "${CC_HANDOFF_USED:-0}" = "1" ] && [ "$_HOF_OK" = "1" ] && [ -s "$BASE/handoff.md" ] && [ "$_HOF_MT" -le "$START" ]; then
+  mkdir -p "$BASE/handoff-archive" 2>/dev/null || true
+  mv -f "$BASE/handoff.md" "$BASE/handoff-archive/$(date +%Y%m%d-%H%M%S).md" 2>/dev/null || true
+  _HOF_CONSUMED=1
+  echo "$(date -Is) cc-worker: handoff consumed and archived" >> "$BASE/switch.log"
+fi
+# === cctrim handoff consume ===
+# === cctrim handoff extract ===
+# 模型写了交接就落盘（原子写，mtime 晚于 START）；没写则保留上一份，不覆盖。
+CC_HANDOFF_WRITTEN="$(python3 "$HOME/cc-diag/extract_handoff.py" "$RUNLOG" "$DIR" 2>/dev/null || echo 'not found')"
+export CC_HANDOFF_WRITTEN
+echo "$(date -Is) cc-worker: handoff extract: $CC_HANDOFF_WRITTEN" >> "$BASE/switch.log"
+# 状态与事件流：面板读 handoff-state.json，周报读全局 handoff-events.jsonl。
+python3 "$HOME/cc-diag/handoff_state.py" "$DIR" "$SID" "${CC_HANDOFF_USED:-0}" "${_HOF_CONSUMED:-0}" "$CC_HANDOFF_WRITTEN" "$_HOF_OK" 2>/dev/null || true
+# === cctrim handoff extract ===
+cp -f "$RUNLOG" "$LOG"
+# 压缩解除：本 run 发生过 compact_boundary 说明压缩确实生效，清掉告警戳并留一行日志，
+# 这样 fallback.log 能直接看出"告警 -> 已压缩"的闭环，而不用人工去翻 jsonl。
+if grep -q '"subtype":"compact_boundary"' "$RUNLOG" 2>/dev/null; then
+  _cb="$(python3 - "$RUNLOG" <<'PYCB' 2>/dev/null
+import json, sys
+for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
+    try:
+        r = json.loads(line)
+    except Exception:
+        continue
+    if r.get("type") == "system" and r.get("subtype") == "compact_boundary":
+        m = r.get("compact_metadata") or {}
+        print("%s->%s" % (m.get("pre_tokens"), m.get("post_tokens")))
+        break
+PYCB
+)"
+  rm -f "$BASE/ctx-alert.stamp"
+  echo "$(date -Is) cc-worker: 已压缩（${_cb:-?}），告警解除" >> "$BASE/fallback.log"
+fi
+DUR=$(( $(date +%s) - START ))
+CC_BUDGET_VIOLATION=""
+if [ -s "$BASE/budget-violation" ]; then
+  CC_BUDGET_VIOLATION="$(cat "$BASE/budget-violation" 2>/dev/null)"
+  echo "$(date -Is) cc-worker: BUDGET GATE VIOLATION (${CC_BUDGET_VIOLATION}); claude killed" >> "$BASE/fallback.log"
+fi
+export CC_BUDGET_VIOLATION
+python3 - "$LOG" "$SIDF" "$SID" "$RC" "$DUR" "$ERRF" "$RUNLOG" <<'PY'
+import json, sys, os, time
+log, sidf, sid_default, rc, dur, errf = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5]), sys.argv[6]
+runlog = sys.argv[7] if len(sys.argv) > 7 else log
+
+def read_handoff_state():
+    """读本轮 cc-worker 刚写的 handoff-state.json；读不到返回空对象。"""
+    p = os.path.join(os.path.dirname(log), "handoff-state.json")
+    try:
+        with open(p, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+_hs = read_handoff_state()
+result = sid = cost = None
+num_turns = None
+# is_error 轮的错误子类型（如 error_max_turns）。非空表示这一轮花了钱但没拿到结果，
+# 台账仍要记（钱是真花掉的），结果以 ok:false 返回。
+run_error = None
+tok_in = tok_cr = tok_out = 0
+parse_error = None
+try:
+    with open(log, encoding="utf-8") as f:
+        lines = [l for l in f if l.strip()]
+    # 预算计划：取第一条 BUDGET_PLAN（模型若中途修正，修正版会出现在后面，
+    # 这里保留首次估计用于校准「事前估计」的准确度）。
+    bp = None
+    bp_note = None
+    for l in lines:
+        if "BUDGET_PLAN" not in l:
+            continue
+        try:
+            ev = json.loads(l)
+        except Exception:
+            continue
+        if ev.get("type") != "assistant":
+            continue
+        for b in ((ev.get("message") or {}).get("content") or []):
+            if not isinstance(b, dict) or b.get("type") != "text":
+                continue
+            i = (b.get("text") or "").find("BUDGET_PLAN")
+            if i < 0:
+                continue
+            s = b["text"][i + len("BUDGET_PLAN"):].strip()
+            j = s.find("{")
+            if j < 0:
+                continue
+            depth = 0
+            for k in range(j, len(s)):
+                if s[k] == "{":
+                    depth += 1
+                elif s[k] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            bp = json.loads(s[j:k + 1])
+                        except Exception:
+                            bp_note = "BUDGET_PLAN 不是合法 JSON"
+                        break
+            if bp is not None:
+                break
+        if bp is not None:
+            break
+
+    def strip_handoff(text):
+        """去掉结果末尾的 ## HANDOFF 交接段（已单独落盘，不交给编排器）。"""
+        i = text.rfind("## HANDOFF")
+        if i < 0:
+            return text
+        tail = text[i:]
+        # 只有确实含契约固定小节才剥离，避免误删正文里提到的同名标题
+        if "### " not in tail:
+            return text
+        return text[:i].strip()
+
+    def strip_budget_plan(text):
+        """去掉结果开头的 BUDGET_PLAN {...}，避免污染交付文本。"""
+        i = text.find("BUDGET_PLAN")
+        if i < 0:
+            return text
+        j = text.find("{", i)
+        if j < 0:
+            return text[:i].strip()
+        depth = 0
+        for k in range(j, len(text)):
+            if text[k] == "{":
+                depth += 1
+            elif text[k] == "}":
+                depth -= 1
+                if depth == 0:
+                    return (text[:i] + text[k + 1:]).strip()
+        return text
+
+    def strip_step_plan(text):
+        """去掉结果里的 STEP_PLAN 规划块（零工具任务会把计划和答案写在一起）。"""
+        i = text.find("STEP_PLAN")
+        if i < 0:
+            return text
+        j = text.find("reuse_first:", i)
+        if j >= 0:
+            k = text.find("\n", j)
+            if k < 0:
+                k = len(text)
+            return (text[:i] + text[k + 1:]).strip()
+        k = text.find("\n\n", i)
+        if k >= 0:
+            return (text[:i] + text[k + 2:]).strip()
+        return text[:i].strip()
+
+    def tool_key(name, inp):
+        """与硬闸门一致：只对 Bash/Read/Grep 判重复；读预算状态文件不算。"""
+        if name == "Bash":
+            cmd = " ".join(str(inp.get("command") or "").split())
+            if "budget-status.json" in cmd:
+                return None
+            return "Bash::" + cmd
+        if name == "Read":
+            fp = str(inp.get("file_path") or "")
+            if "budget-status.json" in fp:
+                return None
+            return "Read::%s|%s|%s" % (fp, inp.get("offset"), inp.get("limit"))
+        if name == "Grep":
+            return "Grep::%s|%s|%s" % (inp.get("pattern"), inp.get("path"), inp.get("glob"))
+        return None
+
+    def compute_metrics(lines):
+        """从 stream-json 统计工具步数、重复、上下文大小与重读次数。"""
+        tools = 0
+        counts = {}
+        latest_in = latest_cr = 0
+        ctx_total = 0
+        out_tokens = 0
+        seen_usage = set()
+        for l in lines:
+            try:
+                ev = json.loads(l)
+            except Exception:
+                continue
+            if ev.get("type") != "assistant":
+                continue
+            msg = ev.get("message") or {}
+            for b in (msg.get("content") or []):
+                if isinstance(b, dict) and b.get("type") == "tool_use":
+                    tools += 1
+                    k = tool_key(b.get("name") or "", b.get("input") or {})
+                    if k is not None:
+                        counts[k] = counts.get(k, 0) + 1
+            u = msg.get("usage") or {}
+            mid = msg.get("id") or ""
+            usage_key = mid if mid else (u.get("input_tokens"),
+                                         u.get("cache_read_input_tokens"),
+                                         u.get("output_tokens"))
+            if u and usage_key not in seen_usage:
+                seen_usage.add(usage_key)
+                i_in = u.get("input_tokens") or 0
+                i_cr = u.get("cache_read_input_tokens") or 0
+                cur = i_in + i_cr
+                if cur > 0:
+                    latest_in, latest_cr = i_in, i_cr
+                    ctx_total += cur
+                out_tokens += u.get("output_tokens") or 0
+        ctx_size = (latest_in + latest_cr) if (latest_in or latest_cr) else None
+        return {
+            "tool_count": tools,
+            "duplicate_count": sum(max(0, v - 1) for v in counts.values()),
+            "context_size": ctx_size,
+            "context_rereads": (round(ctx_total / ctx_size, 2) if ctx_size and ctx_total else None),
+            "context_tokens_total": ctx_total,
+            "output_tokens_events": out_tokens,
+        }
+
+    def prior_baseline(runlog, sid):
+        """同 session 上一条 run 的 result.modelUsage 累计值，作为 resume 首轮基线。"""
+        d = os.path.dirname(runlog) or "."
+        cur = os.path.basename(runlog)
+        best = None
+        try:
+            names = sorted(n for n in os.listdir(d) if n.endswith(".jsonl") and n < cur)
+        except Exception:
+            return (0, 0, 0)
+        for nm in names:
+            p = os.path.join(d, nm)
+            try:
+                for l in open(p, encoding="utf-8", errors="replace"):
+                    try:
+                        ev = json.loads(l)
+                    except Exception:
+                        continue
+                    if ev.get("type") != "result" or (ev.get("session_id") or "") != sid:
+                        continue
+                    pi = pc = po = 0
+                    for mu in (ev.get("modelUsage") or {}).values():
+                        if isinstance(mu, dict):
+                            pi += mu.get("inputTokens") or 0
+                            pc += mu.get("cacheReadInputTokens") or 0
+                            po += mu.get("outputTokens") or 0
+                    best = (pi, pc, po)
+            except Exception:
+                continue
+        return best or (0, 0, 0)
+
+    _m = compute_metrics(lines)
+    for l in reversed(lines):
+        try: ev = json.loads(l)
+        except Exception: continue
+        if ev.get("type") == "result":
+            result = ev.get("result"); sid = ev.get("session_id") or sid_default; cost = ev.get("total_cost_usd")
+            num_turns = ev.get("num_turns")
+            for _mu in (ev.get("modelUsage") or {}).values():
+                if isinstance(_mu, dict):
+                    tok_in += _mu.get("inputTokens") or 0
+                    tok_cr += _mu.get("cacheReadInputTokens") or 0
+                    tok_out += _mu.get("outputTokens") or 0
+            if ev.get("is_error"):
+                # 这里以前是直接 sys.exit(0)，导致 is_error 轮（几乎全是 error_max_turns）
+                # 的钱完全没进台账：今日 68 轮、约 $143 的原始金额因此从治理面板消失。
+                # 现在只记下错误类型，继续走后面的「写台账」流程，最后再以 ok:false 退出。
+                run_error = str(ev.get("subtype") or "error")
+            break
+    if not sid:
+        # 未拿到 result 事件：尽量从任意事件里捡回 session_id（首条 system 事件就带）。
+        for l in lines:
+            try: ev = json.loads(l)
+            except Exception: continue
+            if ev.get("session_id"): sid = ev["session_id"]; break
+except Exception as e:
+    parse_error = e
+if result:
+    result = strip_budget_plan(result)
+    result = strip_step_plan(result)
+    result = strip_handoff(result)
+if sid:
+    cur = open(sidf).read().strip() if os.path.exists(sidf) else ""
+    if cur != sid: open(sidf, "w").write(sid + "\n")
+sid = sid or sid_default
+if parse_error is not None:
+    print(json.dumps({"ok": False, "error": "parse-failure: %s" % parse_error, "session_id": sid, "log": log}, ensure_ascii=False)); sys.exit(0)
+_viol = os.environ.get("CC_BUDGET_VIOLATION") or ""
+if _viol:
+    # violation-ledger-v1：违规 run 也要进台账，否则校准只看成功样本，看不到低估的后果。
+    _tools = _m["tool_count"]
+    _plan_ok = (isinstance(bp, dict)
+                and isinstance(bp.get("steps"), int) and bp["steps"] >= 0
+                and isinstance(bp.get("input_tokens"), int) and bp["input_tokens"] > 0)
+    _hints = {
+        "tool-before-plan": "model used a tool before a valid BUDGET_PLAN; the run was killed",
+        "invalid-plan": "BUDGET_PLAN was invalid (steps must be an integer >= 0, input_tokens > 0); the run was killed",
+        "over-budget-plan": "planned steps exceeded --max-turns and no split was given; the run was killed",
+        "plan-overrun": "actual tool calls exceeded 1.5x the planned steps without a valid revised BUDGET_PLAN; the run was killed",
+        "invalid-revision": "the revised BUDGET_PLAN was invalid or smaller than the steps already executed; the run was killed",
+        "duplicate-step": "the same Bash/Read/Grep call was repeated 3 times; the run was killed",
+    }
+    _ledger = os.path.join(os.path.dirname(log), "budget-ledger.jsonl")
+    _prev = None
+    try:
+        for _line in open(_ledger, encoding="utf-8", errors="replace"):
+            try:
+                _prev = json.loads(_line)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    if _prev and _prev.get("session_id") == sid and not _prev.get("capped"):
+        _p_in = _prev.get("act_input_cum") or 0
+        _p_cr = _prev.get("act_cache_read_cum") or 0
+        _p_out = _prev.get("act_output_cum") or 0
+        _baseline = "ledger"
+    else:
+        # resume 首轮：台账里没有同 session 的有效累计值，回读上一份 run 日志。
+        _p_in, _p_cr, _p_out = prior_baseline(runlog, sid)
+        _baseline = "runlog" if (_p_in or _p_cr or _p_out) else "none"
+    _d_in = tok_in - _p_in if tok_in >= _p_in else tok_in
+    _d_cr = tok_cr - _p_cr if tok_cr >= _p_cr else tok_cr
+    _d_out = tok_out - _p_out if tok_out >= _p_out else tok_out
+    _steps_act = _tools
+    _budget = {"plan_found": _plan_ok, "plan": bp, "violation": _viol,
+               "act_steps": _steps_act, "tool_count": _tools,
+               "act_input": _d_in, "act_output": _d_out, "act_cache_read": _d_cr,
+               "act_input_total": _d_in + _d_cr,
+               "context_size": _m["context_size"],
+               "context_rereads": _m["context_rereads"],
+               "context_tokens_total": _m["context_tokens_total"],
+               "duplicate_count": _m["duplicate_count"],
+               "capped": True, "baseline_source": _baseline}
+    if _plan_ok:
+        _budget["est_steps"] = bp.get("steps")
+        _budget["est_input"] = bp.get("input_tokens")
+        _budget["est_output"] = bp.get("output_tokens")
+        _budget["step_ratio"] = (_steps_act / bp["steps"]) if (bp.get("steps") and _steps_act is not None) else None
+        _budget["input_ratio"] = ((_d_in + _d_cr) / bp["input_tokens"]) if bp.get("input_tokens") else None
+        _budget["input_ratio_net"] = (_d_in / bp["input_tokens"]) if bp.get("input_tokens") else None
+    try:
+        _rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "run": os.path.basename(runlog),
+                "session_id": sid, "plan_found": _plan_ok, "violation": _viol,
+                "schema": "p0-v1",
+                "est_steps": (bp or {}).get("steps"), "est_input": (bp or {}).get("input_tokens"),
+                "est_output": (bp or {}).get("output_tokens"),
+                "act_steps": _steps_act, "tool_count": _tools,
+                "act_input": _d_in, "act_output": _d_out, "act_cache_read": _d_cr,
+                "act_input_total": _d_in + _d_cr,
+                "context_size": _m["context_size"],
+                "context_rereads": _m["context_rereads"],
+                "context_tokens_total": _m["context_tokens_total"],
+                "duplicate_count": _m["duplicate_count"],
+                "capped": True, "baseline_source": _baseline,
+                "act_input_cum": tok_in, "act_cache_read_cum": tok_cr, "act_output_cum": tok_out,
+                "cost_usd": cost, "max_turns": os.environ.get("CC_MAX_TURNS"),
+                "handoff_written": os.environ.get("CC_HANDOFF_WRITTEN"),
+                "handoff_status": _hs.get("status"),
+                "handoff_injected": _hs.get("injected"),
+                "handoff_consumed": _hs.get("consumed"),
+                "handoff_anomalies": _hs.get("anomalies")}
+        with open(_ledger, "a", encoding="utf-8") as _f:
+            _f.write(json.dumps(_rec, ensure_ascii=False) + "\n")
+        _g = os.path.expanduser("~/.dsh/state/superagent/budget-ledger.jsonl")
+        os.makedirs(os.path.dirname(_g), exist_ok=True)
+        with open(_g, "a", encoding="utf-8") as _f:
+            _f.write(json.dumps(_rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+    print(json.dumps({"ok": False,
+                      "error": "budget gate violated: %s" % _viol,
+                      "hint": _hints.get(_viol, "budget gate violation; the run was killed"),
+                      "session_id": sid, "log": log,
+                      "budget": _budget},
+                     ensure_ascii=False))
+    sys.exit(0)
+if result is None and run_error is None:
+    err = ""
+    try:
+        err = open(errf, encoding="utf-8").read()[-300:]
+    except Exception:
+        pass
+    msg = ("timeout after %ds" % dur) if rc == 124 else (("interrupted by user after %ds" % dur) if rc == 130 else ("no result event (rc=%d) %s" % (rc, err)))
+    print(json.dumps({"ok": False, "error": msg, "session_id": sid, "log": log,
+                      "hint": "same-directory rerun resumes this session" if sid else ""}, ensure_ascii=False)); sys.exit(0)
+# 实际增量：台账上一条同会话记录是累计值基准，换会话则按全部增量算。
+ledger = os.path.join(os.path.dirname(log), "budget-ledger.jsonl")
+prev = None
+try:
+    for line in open(ledger, encoding="utf-8", errors="replace"):
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        prev = r
+except Exception:
+    pass
+if prev and prev.get("session_id") == sid and not prev.get("capped"):
+    p_in = prev.get("act_input_cum") or 0
+    p_cr = prev.get("act_cache_read_cum") or 0
+    p_out = prev.get("act_output_cum") or 0
+    baseline_source = "ledger"
+else:
+    p_in, p_cr, p_out = prior_baseline(runlog, sid)
+    baseline_source = "runlog" if (p_in or p_cr or p_out) else "none"
+d_in = tok_in - p_in if tok_in >= p_in else tok_in
+d_cr = tok_cr - p_cr if tok_cr >= p_cr else tok_cr
+d_out = tok_out - p_out if tok_out >= p_out else tok_out
+
+_steps_act = _m["tool_count"]
+budget = {"plan_found": bool(bp), "plan": bp, "note": bp_note,
+          "act_steps": _steps_act, "tool_count": _m["tool_count"],
+          "act_input": d_in, "act_output": d_out, "act_cache_read": d_cr,
+          "act_input_total": d_in + d_cr,
+          "context_size": _m["context_size"],
+          "context_rereads": _m["context_rereads"],
+          "context_tokens_total": _m["context_tokens_total"],
+          "duplicate_count": _m["duplicate_count"],
+          "capped": False, "baseline_source": baseline_source}
+if bp:
+    budget["est_steps"] = bp.get("steps")
+    budget["est_input"] = bp.get("input_tokens")
+    budget["est_output"] = bp.get("output_tokens")
+    budget["step_ratio"] = (_steps_act / bp["steps"]) if (bp.get("steps") and _steps_act is not None) else None
+    budget["input_ratio"] = ((d_in + d_cr) / bp["input_tokens"]) if (bp.get("input_tokens") and bp["input_tokens"] > 0) else None
+    budget["input_ratio_net"] = (d_in / bp["input_tokens"]) if (bp.get("input_tokens") and bp["input_tokens"] > 0) else None
+try:
+    rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "run": os.path.basename(runlog),
+           "session_id": sid, "plan_found": bool(bp), "schema": "p0-v1",
+           "est_steps": (bp or {}).get("steps"), "est_input": (bp or {}).get("input_tokens"),
+           "est_output": (bp or {}).get("output_tokens"),
+           "act_steps": _steps_act, "tool_count": _m["tool_count"],
+           "act_input": d_in, "act_output": d_out, "act_cache_read": d_cr,
+           "act_input_total": d_in + d_cr,
+           "context_size": _m["context_size"],
+           "context_rereads": _m["context_rereads"],
+           "context_tokens_total": _m["context_tokens_total"],
+           "duplicate_count": _m["duplicate_count"],
+           # 不用 capped 表达错误轮：capped=True 会让下一轮拒绝拿它当累计基线（见下方
+           # `not prev.get("capped")`），error 轮的 cost/token 其实是完整的，必须能当基线。
+           "capped": False, "baseline_source": baseline_source,
+           "act_input_cum": tok_in, "act_cache_read_cum": tok_cr, "act_output_cum": tok_out,
+           "cost_usd": cost, "max_turns": os.environ.get("CC_MAX_TURNS"),
+           "error": run_error,
+           "handoff_written": os.environ.get("CC_HANDOFF_WRITTEN"),
+           "handoff_status": _hs.get("status"),
+           "handoff_injected": _hs.get("injected"),
+           "handoff_consumed": _hs.get("consumed"),
+           "handoff_anomalies": _hs.get("anomalies")}
+    with open(ledger, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    # 全局台账：供新工单的首次校准使用。
+    gledger = os.path.expanduser("~/.dsh/state/superagent/budget-ledger.jsonl")
+    try:
+        os.makedirs(os.path.dirname(gledger), exist_ok=True)
+        with open(gledger, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+    if not bp:
+        with open(os.path.join(os.path.dirname(log), "fallback.log"), "a", encoding="utf-8") as f:
+            f.write("%s cc-worker: budget plan missing (steps=%s, input=%s)\n"
+                    % (time.strftime("%Y-%m-%d %H:%M:%S"), num_turns, d_in))
+except Exception:
+    pass
+
+_ok = run_error is None
+print(json.dumps({"ok": _ok,
+                  "result": result,
+                  **({"error": "claude-reported-error: " + run_error,
+                      "hint": "该轮已花钱但没产出结果，成本已记入台账；同目录重跑会 resume 这个会话"}
+                     if run_error else {}),
+                  "session_id": sid, "cost_usd": cost,
+                  "duration_s": dur, "num_turns": num_turns,
+                  "max_turns": ("unlimited" if os.environ.get("CC_TURNS_UNLIMITED") == "1" else os.environ.get("CC_MAX_TURNS")),
+                  "tokens": {"input": tok_in, "cache_read": tok_cr, "output": tok_out,
+                             "input_total": tok_in + tok_cr},
+                  "orphan": os.environ.get("CC_ORPHAN") or None,
+                  "handoff": os.environ.get("CC_HANDOFF_WRITTEN") or None,
+                  "handoff_state": {k: _hs.get(k) for k in
+                                    ("status", "injected", "consumed", "extract_ok",
+                                     "anomalies", "streak")},
+                  "budget": budget,
+                  "log": log}, ensure_ascii=False))
+PY

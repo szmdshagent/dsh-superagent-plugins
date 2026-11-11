@@ -222,3 +222,21 @@ it('sends one stop for a double click on Confirm', async () => {
   await act(async () => { confirm.click(); confirm.click() })
   expect(server.requests.filter(request => request.path === 'tickets/t1/stop')).toHaveLength(1)
 })
+
+it('shows a Channel without a URL as plain text instead of a link that opens the panel itself', async () => {
+  const t1 = server.ticketDetails.t1!
+  // A panel conversation links nowhere; a Feishu Channel keeps its URL.
+  server.ticketDetails.t1 = { ...t1, stage: 'person', action: 'answer', attention: { id: 'q1', question: '需要确认按钮颜色' },
+    channels: [{ source: 'pane', url: '', label: { zh: '面板对话 main', en: 'Panel conversation main' } }, ...t1.channels] }
+  at({ page: 'execution', id: 't1' })
+  await mount()
+  // The answer action in the banner has no destination either, so it does not render.
+  expect(all('.dt-banner a')).toEqual([])
+  await click(zh['term.channel'])
+  expect(all('.dt-disclosure-body a').map(link => link.getAttribute('href'))).toEqual(['https://applink.feishu.cn/client/chat/open?openChatId=oc_1',
+    'https://github.com/acme/widgets/issues/42'])
+  expect(all('.dt-disclosure-body a')).not.toContainEqual(expect.objectContaining({ href: '' }))
+  // The panel conversation is still named, as text rather than an anchor.
+  expect(all('.dt-disclosure-body .dt-inline-link').map(item => [item.tagName, item.textContent])).toContainEqual(['SPAN', '面板对话 main'])
+  expect(document.querySelectorAll('a[href=""]')).toHaveLength(0)
+})

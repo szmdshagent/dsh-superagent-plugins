@@ -479,6 +479,11 @@ window.__ModuleLoader__.load({
 			unknownPromptRevision: ["missing", "Unknown prompt revision {revision}"],
 			unknownPromptPart: ["refused", "Unknown built-in prompt part {part}"],
 			ticketEnded: ["refused", "Ticket has ended"],
+			collabGroupInvalid: ["refused", "A collaboration group needs a name of 1-64 characters without spaces or slashes"],
+			collabRoleInvalid: ["refused", "A collaboration role must be a single line of at most 40 characters"],
+			collabGroupFull: ["refused", "A collaboration group holds at most 4 tickets"],
+			collabDependency: ["refused", "A dependency must name another open ticket in the same collaboration group"],
+			collabCycle: ["refused", "Those dependencies would close a cycle in the collaboration group"],
 			assignmentEnded: ["refused", "Assignment has ended; a newer assignment owns this ticket"],
 			evalFinished: ["refused", "Eval {eval} has finished or a later eval replaced it; decide the trigger's current eval"],
 			notAdmissible: ["refused", "Trigger is not admissible: {reason}"],
@@ -1868,7 +1873,15 @@ window.__ModuleLoader__.load({
 				children: label ?? t("openSession")
 			});
 		}
+		/** External link; an empty `href` (a Source that has no URL, such as a panel conversation) renders as plain text without an anchor. */
 		function ExternalLink({ href, children, icon = "external" }) {
+			if (!href) return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+				className: "dt-inline-link dt-icon-link",
+				children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)(Icon, {
+					name: icon,
+					size: 13
+				}), children]
+			});
 			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("a", {
 				className: "dt-inline-link dt-icon-link",
 				href,
@@ -1879,7 +1892,9 @@ window.__ModuleLoader__.load({
 				}), children]
 			});
 		}
+		/** Action link; an empty `href` means there is nowhere to go (for example a Source without a URL), so nothing renders. */
 		function ActionLink({ href, children, icon = "external" }) {
+			if (!href) return null;
 			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("a", {
 				className: "dt-btn dt-btn-outline dt-btn-sm",
 				href,
@@ -4219,6 +4234,11 @@ window.__ModuleLoader__.load({
 			"userError.unknownPromptRevision": ["没有提示词版本 {revision}。", USER_ERRORS.unknownPromptRevision[1]],
 			"userError.unknownPromptPart": ["没有内置提示词段落 {part}。", USER_ERRORS.unknownPromptPart[1]],
 			"userError.ticketEnded": ["工单已结束。", USER_ERRORS.ticketEnded[1]],
+			"userError.collabGroupInvalid": ["协作组名需要 1-64 个字符，且不能含空格或斜杠。", USER_ERRORS.collabGroupInvalid[1]],
+			"userError.collabRoleInvalid": ["协作角色必须是单行，最多 40 个字符。", USER_ERRORS.collabRoleInvalid[1]],
+			"userError.collabGroupFull": ["一个协作组最多包含 4 张工单。", USER_ERRORS.collabGroupFull[1]],
+			"userError.collabDependency": ["依赖必须指向同一协作组中另一张进行中的工单。", USER_ERRORS.collabDependency[1]],
+			"userError.collabCycle": ["这些依赖会在协作组内形成环。", USER_ERRORS.collabCycle[1]],
 			"userError.assignmentEnded": ["这个派工已结束，工单已由较新的派工接手。", USER_ERRORS.assignmentEnded[1]],
 			"userError.evalFinished": ["评估 {eval} 已结束，或已被之后的评估取代；请对这个触发当前的评估做决定。", USER_ERRORS.evalFinished[1]],
 			"userError.notAdmissible": ["这个触发未通过准入：{reason}", USER_ERRORS.notAdmissible[1]],

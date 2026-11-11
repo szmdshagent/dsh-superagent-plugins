@@ -8,7 +8,10 @@ const ticket = (overrides: Partial<Ticket> = {}): Ticket => ({ id: 't', title: '
 const attention = { id: 'q', question: '?' }
 /** A person's message that reached the Ticket after its report. */
 const answered = { inputs: [{ id: 'i', kind: 'trigger' as const, triggerId: 'e', at: 'later', human: true as const }] }
-const reportedAt = (state: ReportState) => reported(state, { report: { state, summary: '', at: 'earlier' } })
+const reportedAt = (state: ReportState, overrides: Partial<Assignment> = {}) =>
+  reported(state, { report: { state, summary: '', at: 'earlier' }, ...overrides })
+/** 一个在报告之后又收到 Input、worker 已被唤醒的 Assignment。 */
+const woken = (state: ReportState, overrides: Partial<Assignment> = {}) => reportedAt(state, { deliveredAt: 'later', ...overrides })
 const ended = { at: '', by: 'executor' as const, reason: 'closed', outcome: 'closed' as const }
 
 // The rows of the docs/003 table, in order; a Ticket that matches several rows takes the first.
@@ -27,6 +30,12 @@ describe('ticketStage', () => {
     ['no Assignment', ticket({ assignments: [] }), { stage: 'working', action: 'queued' }],
     ['a pending Assignment', ticket({ assignments: [reported('failed', { state: 'ended' }), assignment({ state: 'pending' })] }), { stage: 'working', action: 'queued' }],
     ['a waiting Report', ticket({ assignments: [reported('waiting')] }), { stage: 'idle' }],
+    // 最新 Report 之后（或同一时刻）有 Input 送达 worker 时，该 Report 已过期：worker 回到了工作状态。
+    ['a waiting Report an Input reached since', ticket({ assignments: [woken('waiting')] }), { stage: 'working' }],
+    ['a waiting Report an Input reached before', ticket({ assignments: [reportedAt('waiting', { deliveredAt: 'before' })] }), { stage: 'idle' }],
+    ['a ready Report an Input reached since', ticket({ assignments: [woken('ready')] }), { stage: 'working' }],
+    ['a failed Report an Input reached since', ticket({ assignments: [woken('failed')] }), { stage: 'working' }],
+    ['an ended Assignment an Input reached since', ticket({ assignments: [woken('waiting', { state: 'ended' })] }), { stage: 'idle' }],
     ['an ended Assignment', ticket({ assignments: [assignment({ state: 'ended' })] }), { stage: 'idle' }],
     ['a running Assignment', ticket(), { stage: 'working' }],
     ['a progress Report', ticket({ assignments: [reported('progress')] }), { stage: 'working' }],

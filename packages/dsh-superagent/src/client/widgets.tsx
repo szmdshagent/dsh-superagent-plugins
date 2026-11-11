@@ -94,10 +94,14 @@ export function SessionButton({ sessionId, label,
   return <Button variant={variant} size="sm" icon={<Icon name="session" size={14} />}
     onClick={() => { openSession(sessionId).catch(error => notify(errorText(error))) }}>{label ?? t('openSession')}</Button>
 }
+/** External link; an empty `href` (a Source that has no URL, such as a panel conversation) renders as plain text without an anchor. */
 export function ExternalLink({ href, children, icon = 'external' }: { href: string; children: ReactNode; icon?: IconName }) {
+  if (!href) return <span className="dt-inline-link dt-icon-link"><Icon name={icon} size={13} />{children}</span>
   return <a className="dt-inline-link dt-icon-link" href={href} {...external}><Icon name={icon} size={13} />{children}</a>
 }
+/** Action link; an empty `href` means there is nowhere to go (for example a Source without a URL), so nothing renders. */
 export function ActionLink({ href, children, icon = 'external' }: { href: string; children: ReactNode; icon?: IconName }) {
+  if (!href) return null
   return <a className="dt-btn dt-btn-outline dt-btn-sm" href={href} {...external}><span className="dt-btn-icon"><Icon name={icon}
     size={14} /></span>{children}</a>
 }

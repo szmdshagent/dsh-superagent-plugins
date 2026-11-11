@@ -66,13 +66,26 @@ const NO_WAIT = 'Reports, follow_up notices, new candidates and a background job
 /** What a main Session under `standard` is told when its command would wait the shell's default. */
 const DEFAULT_WAIT = 'This shell waits up to 60 seconds by default: pass timeoutMs of at most 30000, or run_in_background, '
   + 'as a waiting step holds back new candidates.'
+/**
+ * Tools the main Session never calls but a Team bundle registers into every Agent scope it sees: it routes, assesses and
+ * replies, and delegates all work to tickets, so their schemas only cost bytes in every request.
+ */
+const ROUTER_UNUSED_TOOLS: ReadonlySet<string> = new Set(['spawn_teammate', 'team_task_create', 'team_task_get', 'team_task_list',
+  'team_task_update', 'wait_agent', 'send_message', 'list_agents', 'interrupt_agent'])
+/**
+ * The prompt entries the same Team bundle registers beside those tools: its policy section and the identity context naming
+ * `list_agents` and `send_message`. A complete prompt drops the section, but a context is rendered into every request's
+ * runtime snapshot whatever sections exist, so both are dropped here too, leaving no text about a tool the schemas omit.
+ */
+const ROUTER_UNUSED_PROMPT: ReadonlySet<string> = new Set(['team:policy', 'team:identity'])
 /** `sleep` at a command position: the start, after ; & | ( { ! ` or a newline, or after a keyword or a command that runs it. */
 const SLEEP = /(?:^|[;&|({!`\n]|\b(?:do|then|else|elif|if|while|until|time|exec|nohup|command|env)\s)\s*(?:\S*\/)?sleep\b/
 /**
- * The main Session's guard: it refuses a bash command that runs sleep or asks to hold the step longer than 30 seconds, and a
- * job wait longer than 5 seconds. Under `standard`, as a main Session created before the router preset runs, the shell holds
- * a command 60 seconds and a job wait lasts 30 seconds by default, so a command needs a timeout or the background, and a
- * job wait its timeout; the router preset ends both after 5 seconds.
+ * The main Session's guard: it refuses a bash command that runs sleep or asks to hold the step longer than 30 seconds, a
+ * job wait longer than 5 seconds, and a `wait_agent` wait of any length, whose answer never arrives before its timeout.
+ * Under `standard`, as a main Session created before the router preset runs, the shell holds a command 60 seconds and a job
+ * wait lasts 30 seconds by default, so a command needs a timeout or the background, and a job wait its timeout; the router
+ * preset ends both after 5 seconds.
  */
 function noWait({ name, arguments: input }: { name: string; arguments: unknown }, routed: () => boolean): string | undefined {
   const args = (input ?? {}) as { command?: unknown; timeoutMs?: unknown; run_in_background?: unknown; wait?: unknown; timeout_ms?: unknown }
@@ -82,6 +95,8 @@ function noWait({ name, arguments: input }: { name: string; arguments: unknown }
     if (args.timeoutMs === undefined && args.run_in_background !== true && !routed()) return DEFAULT_WAIT
   }
   if (name === 'job_output' && args.wait === true && (typeof args.timeout_ms === 'number' ? args.timeout_ms > 5_000 : !routed())) return NO_WAIT
+  // A wait for a teammate asks the Team bundle for an answer this Session never receives: it ends by its timeout alone.
+  if (name === 'wait_agent') return NO_WAIT
   return undefined
 }
 
@@ -261,7 +276,16 @@ export class Sessions {
     for (const tool of host.tools(agent, ticket)) register(tool.name, tool.description, tool.schema, tool.execute)
     if (master) {
       binding.disposers.push(agent.ctx.tools.restrict({ allow: ['skill', 'bash', 'read', 'read_image', 'job_output', 'job_list', 'job_kill'] }),
-        agent.ctx.tools.guard(execution => noWait(execution, () => this.routed(agent))))
+        agent.ctx.tools.guard(execution => noWait(execution, () => this.routed(agent))),
+        // A tool a plugin registers in this Agent's own scope is exempt from `restrict`, so the Team tools are dropped from the
+        // schemas every request carries here instead: the main Session never calls them, and each costs its full schema each time.
+        // The bundle's prompt entries go with them, so no text names a tool the request no longer offers.
+        agent.ctx.on('system-prompt/assemble', async (_assembly, _context, next) => {
+          const assembled = await next()
+          const named = (entry: { name: string }) => !ROUTER_UNUSED_PROMPT.has(entry.name)
+          return { ...assembled, tools: assembled.tools.filter(tool => !ROUTER_UNUSED_TOOLS.has(tool.name)),
+            sections: assembled.sections.filter(named), contexts: assembled.contexts.filter(named) }
+        }))
     } else {
       // An Executor Session keeps the profile's work tools it has, which DSH requires to be known; its own tools are not masked.
       binding.disposers.push(...this.workOnly(agent, ticket!.id))

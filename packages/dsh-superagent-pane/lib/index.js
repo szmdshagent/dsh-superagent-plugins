@@ -1,7 +1,8 @@
+import { o as teamStatus } from "./guard-C6Yt-xRB.js";
 import { randomUUID } from "node:crypto";
+import { closeSync, existsSync, openSync, readFileSync, readSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { z } from "zod";
 import { key } from "dsh-superagent";
-import { closeSync, existsSync, openSync, readFileSync, readSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 /** 增量读缓存；按目录键。 */
 const cache = /* @__PURE__ */ new Map();
@@ -186,6 +187,18 @@ function stderrHint(dir) {
 		return;
 	}
 }
+/**
+* 没有 main 事件流时，用 team lanes 推导一个整体状态。
+*
+* 否则纯 team 运行（lead/ccwN 各自写 lanes/<lane>/log.jsonl）会被面板当成「未委托」整个藏起来。
+*/
+function teamState(team) {
+	if (!team.lanes.length) return team.plan.exists ? "thinking" : void 0;
+	if (team.lanes.some((lane) => lane.state === "running")) return "running";
+	if (team.lanes.some((lane) => lane.state === "failed")) return "error";
+	if (team.lanes.every((lane) => lane.state === "done")) return "done";
+	return "running";
+}
 /** 汇总一个工单目录的 CC 执行状态。 */
 function readCcStatus(dir) {
 	const empty = {
@@ -196,15 +209,23 @@ function readCcStatus(dir) {
 		alert: "none"
 	};
 	if (!dir) return empty;
+	const team = teamStatus(dir);
+	const derived = teamState(team);
+	const teamPresent = team.lanes.length > 0 || team.plan.exists;
 	const file = latestEventFile(dir);
 	if (!file) return {
 		...empty,
+		present: teamPresent,
+		state: derived ?? empty.state,
+		team,
 		interruptRequested: existsSync(interruptPath(dir))
 	};
 	const { events, mtime } = readTail(dir, file);
 	if (!events.length) return {
 		...empty,
 		present: true,
+		state: derived ?? empty.state,
+		team,
 		interruptRequested: existsSync(interruptPath(dir))
 	};
 	const described = describe(events);
@@ -240,6 +261,7 @@ function readCcStatus(dir) {
 		interruptRequested,
 		alert,
 		alertText,
+		team,
 		error: described.error ?? (state === "error" || alert === "critical" ? stderrHint(dir) : void 0)
 	};
 }
@@ -257,6 +279,9 @@ function probeExecutor(dir) {
 	if (file) try {
 		probe.atMs = statSync(file).mtimeMs;
 	} catch {}
+	const team = teamStatus(dir);
+	if (team.lanes.some((lane) => lane.state === "running")) probe.alive = true;
+	for (const lane of team.lanes) if (lane.atMs && (probe.atMs === void 0 || lane.atMs > probe.atMs)) probe.atMs = lane.atMs;
 	return probe;
 }
 /** 把时间戳（ISO 字符串或数字）解析成毫秒；解析不出来返回 undefined。 */
@@ -351,9 +376,16 @@ const SessionIdSchema = z.string().regex(/^[A-Za-z0-9_-]+$/);
 * 对话模式刻意走「影子线程」`<对话>~chat`：引擎的 gate 规定「线程有自己的工单时，一律消息归该工单」
 * （followup 分支先于准入表生效），所以只要还在原线程上，对话消息就会被排进运行中工单的队列、router 收不到。
 * 影子线程永不被工单订阅，router 任何时刻都能立刻接话；回复经 channel 地址仍回落到原对话显示。
+*
+* 派活模式**只在会话线程上的工单已卡死（zombie，永远接不了手）时**才走一条子线程（`<对话>~d<base36>`，
+* 由调用方通过 `options.thread` 指定）：死工单仍占着订阅，fanout 会把消息并进去，而 intake 又因为
+* followupOwners 非空永不排 Eval，这条消息就永远搁浅（2026-11-03 的 897f223d… 即此）。子线程上没有订阅者，
+* 消息会进 Eval 由主 Session 分诊（可 attach 也可新建工单）。健康/待命的工单不触发改投：它对运行中工单的
+* 正常跟进必须留在原线程，交给该工单的 worker 处理，否则会另起新工单、原工单永远收不到跟进。
+* 无论走哪条线程，`channel` 始终指回原会话，回复仍显示在原对话里。
 */
-function paneTrigger(conversation, text, sender = OWNER, mode = "dispatch") {
-	const thread = mode === "chat" ? `${conversation}~chat` : conversation;
+function paneTrigger(conversation, text, sender = OWNER, mode = "dispatch", options = {}) {
+	const thread = options.thread ?? (mode === "chat" ? `${conversation}~chat` : conversation);
 	return {
 		id: key("pane", thread, randomUUID()),
 		source: SOURCE,
@@ -634,19 +666,51 @@ function findTicket(ctx, ticketId) {
 		for (const ticket of tickets?.list?.() ?? []) if (ticket?.id === ticketId) return ticket;
 	} catch {}
 }
-/** 找该对话线程上挂着僵尸 Assignment 的工单；没有则返回 undefined。 */
-async function zombieOnThread(ctx, conversation) {
+/**
+* 会话线程上仍占着订阅、但已经卡死（zombie）的工单。
+*
+* 引擎 intake 会对线程上每个订阅工单 fanout，model.ts 的 followupOwners 又把「仍存活且非 context」的接收者
+* 当成裁决者，于是消息不进 Eval。健康工单的 worker 还能处理，消息应照常并进去；只有 zombie 工单是「占着
+* 订阅却永远接不了手」，必须把派活消息改走子线程，否则会被并进死工单、永久搁浅
+* （2026-11-03 的 897f223d… 即此：worker 读了不接，工单又一直没结束）。
+*/
+async function zombieTicketsOnThread(ctx, conversation) {
 	const threadKey = `${SOURCE}:${conversation}`;
+	const found = [];
 	try {
-		for (const ticket of ctx.orchestrator?.store?.tickets?.open?.() ?? []) {
-			if (!(Array.isArray(ticket?.threads) ? ticket.threads : []).some((entry) => entry?.key === threadKey)) continue;
+		const thread = ctx.orchestrator?.store?.threads?.get?.(threadKey);
+		const subscriptions = Array.isArray(thread?.subscriptions) ? thread.subscriptions : [];
+		const context = Array.isArray(thread?.context) ? thread.context : [];
+		for (const id of subscriptions) {
+			if (context.includes(id)) continue;
+			const ticket = ctx.orchestrator?.store?.tickets?.get?.(id);
+			if (!ticket || ticket.ended) continue;
 			const health = ticketHealth(ticket, Date.now(), await collectExecutorSignals(ctx, ticket));
-			if (health.health === "zombie") return {
-				ticketId: String(ticket.id),
-				detail: health.detail
-			};
+			if (health.health !== "zombie") continue;
+			found.push({
+				ticketId: String(id),
+				...health.detail ? { detail: health.detail } : {}
+			});
 		}
 	} catch {}
+	return found;
+}
+/**
+* 派活消息是否需要改投子线程：**只有会话线程上存在 zombie 工单时**才改投。
+* 健康/待命的工单仍按原样接管消息（它的 worker 会处理），不能被绕开成新工单。
+* 子线程键 `<对话>~d<base36 时间戳>`：与 chat 的影子线程共享「永不被工单订阅」的性质，但保留派活的 explicit
+* 语义，由主 Session 经 Eval 分诊。用毫秒时间戳转 base36 而不是 HHMMSS，避免同一秒内的第二条消息落进已经被
+* 新工单订阅的子线程、再次被吞。对话名 schema 不允许 `~`，所以不会与用户自己的对话冲突。
+*/
+async function divertDispatch(ctx, conversation) {
+	const zombies = await zombieTicketsOnThread(ctx, conversation);
+	if (!zombies.length) return void 0;
+	const thread = `${conversation}~d${Date.now().toString(36)}`;
+	const first = zombies[0];
+	return {
+		thread,
+		reason: `该对话的工单 ${first.ticketId} 已卡死（${first.detail ?? "无执行活动"}），消息改由路由器分诊，不会投进这个死工单`
+	};
 }
 /**
 * 面板路由。
@@ -671,19 +735,10 @@ function paneHandler(ctx) {
 					text: TextSchema,
 					mode: z.enum(["dispatch", "chat"]).default("dispatch")
 				}).parse(await readJson(req));
-				let conversation = body.conversation;
-				let rerouted;
-				if (body.mode === "dispatch") {
-					const zombie = await zombieOnThread(ctx, conversation);
-					if (zombie) {
-						const stamp = (/* @__PURE__ */ new Date()).toTimeString().slice(0, 5).replace(":", "");
-						conversation = `${body.conversation.replace(/[^A-Za-z0-9_-]/g, "")}-r${stamp}`;
-						rerouted = zombie.detail;
-						ctx.logger?.warn?.("dsh-superagent-pane: 线程 %s 挂着僵尸工单 %s，已改投新线程 %s", body.conversation, zombie.ticketId, conversation);
-					}
-				}
+				const conversation = body.conversation;
+				const diverted = body.mode === "dispatch" ? await divertDispatch(ctx, conversation) : void 0;
 				await wakeThreadSessions(ctx, conversation);
-				const trigger = paneTrigger(conversation, body.text, OWNER, body.mode);
+				const trigger = paneTrigger(conversation, body.text, OWNER, body.mode, diverted ? { thread: diverted.thread } : {});
 				appendLog(source, conversation, {
 					id: trigger.id,
 					direction: "in",
@@ -694,13 +749,9 @@ function paneHandler(ctx) {
 				const received = await source.receive(trigger);
 				sendJson(res, 200, {
 					triggerId: trigger.id,
-					thread: `${SOURCE}:${conversation}`,
+					thread: `${SOURCE}:${trigger.threads[0].id}`,
 					received,
-					...rerouted ? {
-						rerouted,
-						originalConversation: body.conversation,
-						conversation
-					} : {}
+					...diverted ? { diverted: diverted.reason } : {}
 				});
 				return;
 			}
@@ -711,6 +762,24 @@ function paneHandler(ctx) {
 					sessionId,
 					activity: await readActivity(ctx.sessionPersistence, sessionId)
 				});
+				return;
+			}
+			if (req.method === "GET" && url.pathname === "/orchestrator/api/pane/conversations") {
+				const conversations = [];
+				for (const key of source.state.keys("pane-log:")) {
+					const name = String(key).slice(9);
+					if (!/^[A-Za-z0-9_-]+$/.test(name)) continue;
+					const entries = source.state.get(logKey(name)) ?? [];
+					if (!entries.length) continue;
+					const last = entries[entries.length - 1];
+					conversations.push({
+						name,
+						count: entries.length,
+						lastAt: last.at
+					});
+				}
+				conversations.sort((a, b) => Date.parse(b.lastAt) - Date.parse(a.lastAt));
+				sendJson(res, 200, { conversations: conversations.slice(0, 50) });
 				return;
 			}
 			const logMatch = /^\/orchestrator\/api\/pane\/log\/([A-Za-z0-9_-]+)$/.exec(url.pathname);
@@ -810,6 +879,18 @@ function paneHandler(ctx) {
 }
 /** 自愈检查间隔；一次只是内存数组查找，代价可忽略。 */
 const UNARCHIVE_SWEEP_MS = 3e4;
+/** 搁浅消息自愈：检查间隔、工单「失去接手能力」多久内才重投、pane-log 最长回溯、每轮上限、每轮最多扫多少个对话。 */
+const STRANDED_SWEEP_MS = 3e4;
+/**
+* 重投窗口的基准是「占用它的工单失去接手能力的时间」（工单 ended.at，或僵尸工单的当前时间），
+* **不是消息发送时间**。旧实现按 `entry.at` 算窗口，导致「消息发出很久、但工单刚刚才结束/卡死」的消息
+* 永远进不了窗口——这正是 897f223d… 永久丢失的原因（发送于 16:32，工单次日 03:20 才结束）。
+*/
+const STRANDED_WINDOW_MS = 36e5;
+/** pane-log 条目的最长回溯：发送时间解析不出来、或早于这个年龄的条目不参与自愈。 */
+const STRANDED_MAX_AGE_MS = 6048e5;
+const STRANDED_MAX_PER_SWEEP = 3;
+const STRANDED_RECOVERED_TEXT = "这条消息之前被并进了运行中的工单但一直没被接手，已重新交给路由器分诊。";
 /** 需要保护的会话：主 Session + 所有活跃工单的 worker 会话（都被归档过就一定有东西停摆）。 */
 function protectedSessions(ctx) {
 	const ids = [];
@@ -847,7 +928,15 @@ async function wakeThreadSessions(ctx, conversation) {
 		const archived = registry?.archivedSessionIds ?? [];
 		if (!archived.length) return;
 		const threadKey = `${SOURCE}:${conversation}`;
+		const triggersRepo = ctx.orchestrator?.store?.triggers;
+		const triggerMatches = (ticket) => {
+			const triggerId = ticket?.origin?.triggerId;
+			if (!triggerId || typeof triggersRepo?.get !== "function") return false;
+			const trigger = triggersRepo.get(triggerId);
+			return (Array.isArray(trigger?.threads) ? trigger.threads : []).some((ref) => `${ref?.source}:${ref?.id}` === threadKey);
+		};
 		const followsThread = (ticket) => {
+			if (triggerMatches(ticket)) return true;
 			if ((Array.isArray(ticket?.follows) ? ticket.follows : []).some((entry) => entry?.thread === threadKey)) return true;
 			return (Array.isArray(ticket?.threads) ? ticket.threads : []).some((entry) => entry?.key === threadKey);
 		};
@@ -867,6 +956,129 @@ async function wakeThreadSessions(ctx, conversation) {
 		}
 	} catch {}
 }
+/**
+* 搁浅消息自愈：把「并进了工单、但工单已结束/卡死、worker 从未接手」的派活消息重新交给路由器。
+*
+* 触发条件仅为 disposition 中有 fanout、无 evalId/decisionId/requeued/acked，且 fanout 里所有工单都已结束或被
+* 判定为 zombie。只要还有一张工单存活且非 zombie，就跳过：它仍可能接手，提前重投会制造重复工单。
+* `reevaluate` 会把 trigger 标记 requeued，followupOwners 因此返回空，主 Session 的 accept 不会再被
+* workerDecides 挡住（core/part.ts）。每轮最多处理 3 条，任何单条失败都不影响其它条目。
+*
+* 窗口按「工单失去接手能力的时间」算：`latestLostAt` = 各 fanout 工单里最晚的那个时刻（已 ended 取
+* `ended.at`，僵尸工单取当前时间）。只有它落在最近 `STRANDED_WINDOW_MS` 内才重投——这样工单刚结束的消息
+* 能被救回，而重启时不会把几小时前甚至几天前的死消息一次性全部重投。消息本身的发送时间只用来做
+* `STRANDED_MAX_AGE_MS` 的兜底回溯上限。
+*/
+async function recoverStranded(ctx) {
+	const source = liveSource;
+	const store = ctx.orchestrator?.store;
+	const engine = ctx.orchestrator?.engine;
+	if (!source?.state?.keys || typeof store?.triggers?.get !== "function" || typeof store?.triggers?.disposition !== "function" || typeof engine?.reevaluate !== "function") return;
+	const tickets = store.tickets;
+	const now = Date.now();
+	const cutoff = now - STRANDED_WINDOW_MS;
+	const oldest = now - STRANDED_MAX_AGE_MS;
+	let handled = 0;
+	const keys = [...source.state.keys("pane-log:") ?? []].slice(-100);
+	for (const logKeyValue of keys) {
+		if (handled >= STRANDED_MAX_PER_SWEEP) break;
+		const entries = source.state.get(logKeyValue) ?? [];
+		for (let index = entries.length - 1; index >= 0 && handled < STRANDED_MAX_PER_SWEEP; index--) {
+			const entry = entries[index];
+			try {
+				if (entry.direction !== "in" || entry.mode !== "dispatch") continue;
+				const sentAt = entry.at ? Date.parse(entry.at) : NaN;
+				if (!Number.isFinite(sentAt) || sentAt < oldest) continue;
+				const trigger = store.triggers.get(entry.id);
+				if (!trigger) continue;
+				const disposition = store.triggers.disposition(entry.id);
+				if (!disposition || disposition.evalId || disposition.decisionId || disposition.requeued || disposition.acked?.length) continue;
+				const fanout = Array.isArray(disposition.fanout) ? disposition.fanout : [];
+				if (!fanout.length) continue;
+				const returned = (disposition.handbacks ?? []).map((item) => String(item?.ticketId ?? ""));
+				if (fanout.every((id) => returned.includes(id))) continue;
+				let viable = false;
+				let latestLostAt = Number.NEGATIVE_INFINITY;
+				for (const ticketId of fanout) {
+					const ticket = tickets?.get?.(ticketId);
+					if (!ticket) continue;
+					if (ticket.ended) {
+						const endedAt = Date.parse(String(ticket.ended.at ?? ""));
+						if (Number.isFinite(endedAt)) latestLostAt = Math.max(latestLostAt, endedAt);
+						continue;
+					}
+					if (ticketHealth(ticket, now, await collectExecutorSignals(ctx, ticket)).health !== "zombie") {
+						viable = true;
+						break;
+					}
+					latestLostAt = Math.max(latestLostAt, now);
+				}
+				if (viable) continue;
+				if (!(latestLostAt >= cutoff)) continue;
+				handled += 1;
+				if (engine.reevaluate(entry.id) !== true) continue;
+				const address = trigger.channel?.address?.conversation;
+				const conversation = typeof address === "string" && address ? address : logKeyValue.slice(9);
+				appendLog(source, conversation, {
+					id: `recovered:${entry.id}`,
+					direction: "out",
+					at: (/* @__PURE__ */ new Date()).toISOString(),
+					text: STRANDED_RECOVERED_TEXT,
+					kind: "recovered"
+				});
+				ctx.logger?.info?.("dsh-superagent-pane: 已重新入队搁浅消息 %s（对话 %s）", entry.id, conversation);
+			} catch (error) {
+				ctx.logger?.warn?.("dsh-superagent-pane: 搁浅消息检查失败 %s", String(error));
+			}
+		}
+	}
+}
+/**
+* 读 /proc/meminfo（可选 /proc/loadavg），算面板小部件要的内存指标。
+*
+* 口径与 mem-watch.py、云厂商监控一致：usage_pct = (MemTotal - MemAvailable) / MemTotal * 100。
+* 与 `free` 的 used 不同——`free` 扣掉了可回收的 SReclaimable，数值会偏低。
+* 只读、无副作用；任何读取失败由调用方兜成 500 JSON。
+*/
+function readSysMem() {
+	const fields = {};
+	for (const line of readFileSync("/proc/meminfo", "utf8").split("\n")) {
+		const at = line.indexOf(":");
+		if (at < 0) continue;
+		const value = Number.parseFloat(line.slice(at + 1).trim());
+		if (Number.isFinite(value)) fields[line.slice(0, at).trim()] = value;
+	}
+	const total = fields.MemTotal ?? 0;
+	const available = fields.MemAvailable ?? 0;
+	const swapTotal = fields.SwapTotal ?? 0;
+	const swapFree = fields.SwapFree ?? 0;
+	const round1 = (n) => Math.round(n * 10) / 10;
+	let load1 = null;
+	try {
+		const parsed = Number.parseFloat(readFileSync("/proc/loadavg", "utf8").trim().split(/\s+/)[0] ?? "");
+		if (Number.isFinite(parsed)) load1 = parsed;
+	} catch {}
+	return {
+		mem_total_mb: round1(total / 1024),
+		mem_available_mb: round1(available / 1024),
+		usage_pct: total > 0 ? round1((total - available) / total * 100) : 0,
+		swap_pct: swapTotal > 0 ? round1((swapTotal - swapFree) / swapTotal * 100) : null,
+		load1
+	};
+}
+/** GET /api/sys-mem —— 只读；失败也回 JSON，不把异常抛到宿主。 */
+const sysMemHandler = (req, res) => {
+	if (req.method !== "GET" && req.method !== "HEAD") {
+		res.setHeader("allow", "GET, HEAD");
+		sendJson(res, 405, { error: "Method not allowed" });
+		return;
+	}
+	try {
+		sendJson(res, 200, readSysMem());
+	} catch (error) {
+		sendJson(res, 500, { error: `无法读取 /proc/meminfo: ${String(error)}` });
+	}
+};
 function apply(ctx) {
 	ctx.effect(() => ctx.orchestrator.sources.register(paneKind), "pane: source kind");
 	ctx.effect(() => {
@@ -891,6 +1103,11 @@ function apply(ctx) {
 		path: "/orchestrator/api/pane",
 		handler: paneHandler(ctx)
 	}), "pane: dispatch route");
+	ctx.effect(() => ctx.webServer.register({
+		kind: "exact",
+		path: "/api/sys-mem",
+		handler: sysMemHandler
+	}), "pane: sys-mem route");
 	ctx.effect(() => {
 		let busy = false;
 		const sweep = () => {
@@ -909,5 +1126,23 @@ function apply(ctx) {
 			clearInterval(timer);
 		};
 	}, "pane: unarchive self-heal");
+	ctx.effect(() => {
+		let busy = false;
+		const sweep = () => {
+			if (busy) return;
+			busy = true;
+			recoverStranded(ctx).catch((error) => {
+				ctx.logger?.warn?.("dsh-superagent-pane: 搁浅消息自愈检查失败 %s", String(error));
+			}).finally(() => {
+				busy = false;
+			});
+		};
+		const boot = setTimeout(sweep, 0);
+		const timer = setInterval(sweep, STRANDED_SWEEP_MS);
+		return () => {
+			clearTimeout(boot);
+			clearInterval(timer);
+		};
+	}, "pane: stranded recovery");
 }
 export { apply, inject, name, paneTrigger };

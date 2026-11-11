@@ -11,12 +11,16 @@ export function ticketStage(ticket: Ticket): TicketStage {
   if (ticket.delivery) return { stage: 'person', action: 'delivery' }
   if (ticket.attention) return { stage: 'person', action: 'answer' }
   const assignment = latestAssignment(ticket)
-  const report = assignment?.report?.state
-  if (report === 'ready') return { stage: 'person', action: 'review' }
+  const report = assignment?.report
+  // 送达时间不早于最新 Report 的 Input 已唤醒 worker：该 Report 已过期，工单重新进入运行中，无论它写了什么。
+  // 已结束的 Assignment 不可能被唤醒。
+  if (assignment?.state === 'running' && report && assignment.deliveredAt && assignment.deliveredAt >= report.at)
+    return { stage: 'working' }
+  if (report?.state === 'ready') return { stage: 'person', action: 'review' }
   // A human follow-up after a blocked or failed report returns the ticket to the executor.
-  if ((report === 'blocked' || report === 'failed') && waitsForPerson(ticket)) return { stage: 'person', action: report }
+  if ((report?.state === 'blocked' || report?.state === 'failed') && waitsForPerson(ticket)) return { stage: 'person', action: report.state }
   if (!assignment || assignment.state === 'pending') return { stage: 'working', action: 'queued' }
-  if (report === 'waiting' || assignment.state === 'ended') return { stage: 'idle' }
+  if (report?.state === 'waiting' || assignment.state === 'ended') return { stage: 'idle' }
   return { stage: 'working' }
 }
 

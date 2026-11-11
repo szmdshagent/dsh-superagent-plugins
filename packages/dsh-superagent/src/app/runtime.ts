@@ -205,6 +205,8 @@ export class Runtime extends Service implements SourceHost {
       this.runtimeHealth.set({ ...health('paused', 'setupPending'), at: now() })
       return
     }
+    // 一次性清理悬空订阅：指向已不存在工单的 id 不再参与任何 fanout。
+    this.engine.cleanSubscriptions()
     this.sessions.install()
     this.executor.install()
     await this.sessions.ensure(this.masterId, this.machine.stateDir, 'dsh-superagent orchestrator', 'orchestrator')

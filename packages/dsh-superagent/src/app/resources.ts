@@ -1,6 +1,6 @@
 /** Serves paginated context resources to orchestrator_read so large bodies stay out of model prompts until requested. */
 import type { SessionId } from '@deepseek-ai/dsh-session'
-import { UserError, key, latestReport, reached, runningAssignment, threadKey, type Ticket, type Trigger } from '../core/index.ts'
+import { UserError, key, latestReport, liveTicket, reached, runningAssignment, threadKey, type Ticket, type Trigger } from '../core/index.ts'
 import { batchOf, inputMessage, triggerMessage, workerSessionId } from '../executor/dsh.ts'
 import { readGithub } from '../sources/github-read.ts'
 import { feishuReferences, feishuRead } from '../sources/feishu-read.ts'
@@ -26,6 +26,8 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
   { name: 'triggers', holds: 'trigger cards with where each went, newest first' },
   { name: 'threads', holds: 'subscribed threads, newest activity first, with their labels, tickets, current assessment and polling errors' },
   { name: 'thread/<key>', holds: 'one thread: its label and link, its tickets and latest decisions, and its triggers, newest first', executor: true },
+  { name: 'group/<id>', holds: 'one collaboration group: its ticket cards, each ticket\'s role, latest report, result card and the tickets it waits on', executor: true },
+  { name: 'results', holds: 'L1 ready result cards, newest first: ticket, conclusion, artifact paths, key numbers and read path' },
   { name: 'decisions', holds: 'decisions, newest first' },
   { name: 'decision/<id>', holds: 'one decision with its audit' },
   { name: 'ticket/<id>', holds: 'a ticket\'s card, the trigger, decision and threads it is tied to, its latest assignments with the start of each '
@@ -147,6 +149,41 @@ const ROUTES: readonly Route[] = [
     const decisions = store.decisions.byThread(thread.key).slice(-THREAD_DECISIONS).reverse().map(decisionCard)
     return { ...card, tickets, decisions, ...page }
   }],
+  ['group/', read => {
+    const { host, rest, ticketId } = read
+    const members = host.store.tickets.list().filter(ticket => ticket.collab?.group === rest)
+    const own = ticketId ? host.store.tickets.get(ticketId) : undefined
+    // Worker Sessions may read only their own collaboration group; the main Session reads any group.
+    if (!members.length || (ticketId && own?.collab?.group !== rest)) throw new Error('Unknown or inaccessible collaboration group')
+    const byId = new Map(members.map(ticket => [ticket.id, ticket]))
+    // A dependency is still waited on while it is open and its latest report is neither ready nor dropped.
+    const waiting = (ticket: Ticket) => (ticket.collab?.dependsOn ?? []).filter(id => {
+      const dependency = byId.get(id)
+      return !!dependency && liveTicket(dependency) && !['ready', 'dropped'].includes(latestReport(dependency)?.state ?? '')
+    })
+    const order = [...members].sort((a, b) => liveTicket(a) === liveTicket(b) ? a.createdAt.localeCompare(b.createdAt) : liveTicket(a) ? -1 : 1)
+    const waitingOn = [...new Set(members.flatMap(waiting))].sort()
+    // 自动组在组看板顶部给出组级置信度、信号与 2 h TTL；人工组保持原样。
+    const automated = members.every(ticket => ticket.collab?.auto)
+    const confidence = automated ? Math.min(...members.map(ticket => ticket.collab?.confidence ?? 0)) : undefined
+    const signals = [...new Set(members.flatMap(ticket => ticket.collab?.signals ?? []))].sort()
+    const expiresAt = automated ? members.flatMap(ticket => ticket.collab?.expiresAt ? [ticket.collab.expiresAt] : []).sort()[0] : undefined
+    return { group: rest, ...(automated ? { auto: true } : {}), ...(confidence !== undefined ? { confidence } : {}),
+      ...(signals.length ? { signals } : {}), ...(expiresAt ? { expires_at: expiresAt } : {}), tickets: order.map(ticket => {
+      const report = latestReport(ticket)
+      // role 可能在自动组里没有：省略而不是给 undefined，工具输出必须是无损 JSON。
+      return { ...ticketCard(ticket), ...(ticket.collab?.role ? { role: ticket.collab.role } : {}),
+        depends_on: ticket.collab?.dependsOn ?? [], waiting_on: waiting(ticket),
+        ...(ticket.result ? { result_card: ticket.result } : {}),
+        ...(report ? { report: { state: report.state, at: report.at, preview: preview(report.summary).slice(0, 120), chars: report.summary.length,
+          read: `ticket/${ticket.id}/result` } } : {}) }
+    }), ...(waitingOn.length ? { waiting_on: waitingOn } : {}) }
+  }],
+  ['results', read => {
+    const cards = main(read).store.tickets.list().flatMap(ticket => ticket.result ? [ticket.result] : [])
+      .sort((a, b) => b.at.localeCompare(a.at))
+    return list(read, (offset, count) => cards.slice(offset, offset + count))
+  }],
   ['decisions', read => list(read, (offset, count) => main(read).store.read.recentDecisions(offset, count).map(decisionCard))],
   ['decision/', read => {
     const decision = main(read).store.decisions.get(read.rest)
@@ -236,7 +273,14 @@ const ROUTES: readonly Route[] = [
     const { host, resource, rest, ticketId, signal } = read
     const [id, section, part, ...more] = rest.split('/')
     if (!id || more.length) throw new Error('Unknown context resource')
-    if (ticketId && ticketId !== id) throw new Error('Ticket does not belong to this worker')
+    // 同组工单可以互读卡片、结果和输入；跨组、未知工单与 transcript 仍拒绝：协作只共享结论，不共享过程。
+    if (ticketId && ticketId !== id) {
+      const own = host.store.tickets.get(ticketId), other = host.store.tickets.get(id)
+      if (!own?.collab?.group || own.collab.group !== other?.collab?.group) throw new Error('Ticket does not belong to this worker')
+      if (section !== undefined && section !== 'result' && section !== 'inputs') {
+        throw new Error('A worker reads only the card, result or inputs of another ticket in its group')
+      }
+    }
     const ticket = host.store.tickets.get(id)
     if (!ticket) throw new UserError('unknownTicket')
     if (section === undefined) {

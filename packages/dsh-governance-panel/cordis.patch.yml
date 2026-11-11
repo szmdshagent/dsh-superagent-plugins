@@ -1,0 +1,5 @@
+# 交接治理面板：独立插件，独立面板，不参与 superagent 的派活流程。
+# 放在本包内，官方升级 superagent 时整树覆盖也删不掉它。
+- insert:
+    - id: dsh-governance-panel
+      name: dsh-governance-panel

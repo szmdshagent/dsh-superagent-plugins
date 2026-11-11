@@ -1,0 +1,55 @@
+{
+  "name": "dsh-superagent-executor",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    "./package.json": "./package.json",
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./guard": {
+      "types": "./lib/guard.d.ts",
+      "default": "./lib/guard.js"
+    },
+    "./state": {
+      "types": "./lib/state.d.ts",
+      "default": "./lib/state.js"
+    }
+  },
+  "files": [
+    "lib"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "manifestVersion": 1
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0",
+    "dsh": ">=0.2.1-rc.3"
+  },
+  "scripts": {
+    "build": "tsdown",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "4.0.5-alpha.1"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.5-alpha.1",
+    "@types/node": "22.20.0",
+    "tsdown": "0.22.14",
+    "typescript": "6.0.3"
+  },
+  "license": "MIT",
+  "author": "szm",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/szmdshagent/dsh-superagent-plugins.git",
+    "directory": "packages/dsh-superagent-executor"
+  },
+  "homepage": "https://github.com/szmdshagent/dsh-superagent-plugins#readme"
+}

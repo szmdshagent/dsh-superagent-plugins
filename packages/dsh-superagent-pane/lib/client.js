@@ -23,6 +23,18 @@ window.__ModuleLoader__.load({
 			error: "#e53e3e",
 			stalled: "#dd6b20"
 		};
+		const LANE_TEXT = {
+			pending: "等待",
+			running: "执行中",
+			done: "完成",
+			failed: "失败"
+		};
+		const LANE_COLOR = {
+			pending: "#888",
+			running: "#38a169",
+			done: "#38a169",
+			failed: "#e53e3e"
+		};
 		/** 把毫秒压成「n 秒 / n 分钟」。 */
 		function formatAge(ms) {
 			if (ms === void 0) return "";
@@ -36,6 +48,7 @@ window.__ModuleLoader__.load({
 			const done = steps.filter((step) => step.done).length;
 			const alertColor = status.alert === "critical" ? "#e53e3e" : status.alert === "warn" ? "#dd6b20" : void 0;
 			const running = status.state === "running" || status.state === "thinking" || status.state === "stalled";
+			const teamLanes = status.team?.lanes ?? [];
 			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 				style: {
 					marginTop: 4,
@@ -99,6 +112,84 @@ window.__ModuleLoader__.load({
 									fontSize: 11
 								},
 								children: expanded ? "收起" : "展开"
+							})
+						]
+					}),
+					teamLanes.length > 0 && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+						style: {
+							display: "flex",
+							flexDirection: "column",
+							gap: 2
+						},
+						children: [
+							/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+								style: { opacity: .75 },
+								children: [
+									"Team ",
+									teamLanes.length,
+									" 路：完成 ",
+									teamLanes.filter((lane) => lane.state === "done").length,
+									teamLanes.some((lane) => lane.state === "failed") && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+										style: { color: "#e53e3e" },
+										children: ["，失败 ", teamLanes.filter((lane) => lane.state === "failed").length]
+									}),
+									teamLanes.some((lane) => lane.state === "running") && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+										style: { color: "#38a169" },
+										children: ["，执行中 ", teamLanes.filter((lane) => lane.state === "running").length]
+									})
+								]
+							}),
+							expanded && teamLanes.map((lane) => /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+								style: {
+									display: "flex",
+									gap: 5,
+									alignItems: "baseline",
+									flexWrap: "wrap"
+								},
+								children: [
+									/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+										style: {
+											color: LANE_COLOR[lane.state],
+											fontWeight: 600,
+											minWidth: 42
+										},
+										children: lane.lane
+									}),
+									/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+										style: { color: LANE_COLOR[lane.state] },
+										children: LANE_TEXT[lane.state]
+									}),
+									lane.task && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+										style: {
+											opacity: .7,
+											wordBreak: "break-all"
+										},
+										children: lane.task.slice(0, 100)
+									}),
+									lane.turns !== void 0 && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+										style: { opacity: .55 },
+										children: [lane.turns, " 轮"]
+									}),
+									lane.costUsd !== void 0 && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+										style: { opacity: .55 },
+										children: ["$", lane.costUsd.toFixed(2)]
+									}),
+									lane.handoff && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+										style: { opacity: .55 },
+										children: "已交接"
+									}),
+									lane.error && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+										style: {
+											color: "#e53e3e",
+											wordBreak: "break-all"
+										},
+										children: lane.error.slice(0, 100)
+									})
+								]
+							}, lane.lane)),
+							status.team?.plan?.error && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+								style: { color: "#dd6b20" },
+								children: ["team 计划解析失败：", status.team.plan.error]
 							})
 						]
 					}),

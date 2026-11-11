@@ -489,3 +489,41 @@ it('gives a worker the other messages of the request its ticket was accepted fro
   expect(page).toMatchObject({ batch: [{ trigger_id: other, read: `trigger/${other}` }] })
   expect(await h.runTool(`worker-${ticket.id}`, 'orchestrator_read', { resource: `trigger/${other}` })).toMatchObject({ trigger_id: other })
 })
+
+it('groups tickets through the main tool and lets a worker read its group and another ticket\'s card, result and inputs only', async () => {
+  const a = await h.acceptedTicket(feishu('1', '@bot 修一下回归'))
+  const b = await h.acceptedTicket(feishu('2', '@bot 再修一个'))
+  const c = await h.acceptedTicket(feishu('3', '@bot 第三个'))
+  const group = (ticketId: string, name: string, extra: Record<string, unknown> = {}) =>
+    h.runTool(h.runtime.masterId, 'orchestrator_ticket_collab', { ticket_id: ticketId, group: name, ...extra }) as
+      Promise<{ ticket: { ticket_id: string; collab: Record<string, unknown> } }>
+  expect((await group(b.ticket.id, 'g1', { role: 'reviewer' })).ticket).toMatchObject({ collab: { group: 'g1', role: 'reviewer' } })
+  // A dependency names a ticket that is already in the group: group both first, then set it.
+  expect((await group(a.ticket.id, 'g1', { role: 'writer', depends_on: [b.ticket.id] })).ticket).toMatchObject(
+    { ticket_id: a.ticket.id, collab: { group: 'g1', role: 'writer', depends_on: [b.ticket.id] } })
+  await group(c.ticket.id, 'g2')
+  const page = await read('group/g1') as { group: string; tickets: Record<string, unknown>[]; waiting_on: string[] }
+  expect(page.group).toBe('g1')
+  expect(page.tickets).toEqual(expect.arrayContaining([
+    expect.objectContaining({ ticket_id: a.ticket.id, collab: { group: 'g1', role: 'writer', depends_on: [b.ticket.id] }, waiting_on: [b.ticket.id] }),
+    expect.objectContaining({ ticket_id: b.ticket.id, collab: { group: 'g1', role: 'reviewer' } }),
+  ]))
+  expect(page.waiting_on).toEqual([b.ticket.id])
+  // A terminal report of one ticket reaches the other as a note with its result pointer.
+  await h.runTool(b.sessionId, 'orchestrator_report', { state: 'blocked', summary: 'Need the schema.' })
+  await h.runtime.idle()
+  expect(h.runtime.store.tickets.get(a.ticket.id)!.inputs).toEqual(expect.arrayContaining([
+    expect.objectContaining({ kind: 'note', from: b.ticket.id, text: expect.stringContaining(`ticket/${b.ticket.id}/result`) })]))
+  expect((await read('group/g1') as { tickets: Record<string, unknown>[] }).tickets).toEqual(expect.arrayContaining([
+    expect.objectContaining({ ticket_id: b.ticket.id, report: expect.objectContaining({ state: 'blocked', read: `ticket/${b.ticket.id}/result` }) })]))
+  // The worker reads its own group, and another ticket of it: card, result and inputs, never its transcript or assignment.
+  const worker = (resource: string) => h.runTool(a.sessionId, 'orchestrator_read', { resource })
+  expect(await worker('group/g1')).toMatchObject({ group: 'g1' })
+  await expect(worker('group/g2')).rejects.toThrow('Unknown or inaccessible collaboration group')
+  expect(await worker(`ticket/${b.ticket.id}`)).toMatchObject({ ticket_id: b.ticket.id, collab: { group: 'g1' } })
+  expect(await worker(`ticket/${b.ticket.id}/inputs`)).toMatchObject({ items: expect.any(Array) })
+  expect(await worker(`ticket/${b.ticket.id}/result`)).toMatchObject({ text: 'Need the schema.' })
+  await expect(worker(`ticket/${b.ticket.id}/transcript`)).rejects.toThrow('A worker reads only the card, result or inputs')
+  await expect(worker(`ticket/${b.ticket.id}/assignment`)).rejects.toThrow('A worker reads only the card, result or inputs')
+  await expect(worker(`ticket/${c.ticket.id}`)).rejects.toThrow('Ticket does not belong to this worker')
+})

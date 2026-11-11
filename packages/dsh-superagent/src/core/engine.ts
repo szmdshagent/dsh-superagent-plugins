@@ -1,7 +1,7 @@
 /** The domain Engine: the single entry point of the core, and the role interfaces its callers receive. */
 import { UserError } from './errors.ts'
 import { isoTime, liveTicket } from './model.ts'
-import type { ChannelRef, Decision, PolicyEffect, ThreadRef, Ticket, Trigger } from './model.ts'
+import type { ChannelRef, CollaborationInput, Decision, PolicyEffect, ThreadRef, Ticket, Trigger } from './model.ts'
 import type { Candidate, Repositories } from './ports.ts'
 import type { EngineOptions } from './part.ts'
 import { Assignments, type WorkerReport } from './assignments.ts'
@@ -76,6 +76,8 @@ export class Engine {
     const policy = this.options.policy()
     for (const thread of this.repo.threads.active()) if (thread.evaluating) this.repo.atomic(() => { this.evals.due(thread, policy) })
     if (policy.paused) return
+    // 自动组回收：全部结束、TTL、无关报告或 30 min 无交叉读取。人工组不自动解散。
+    this.repo.atomic(() => { this.tickets.dissolveDueCollab() })
     for (const ticket of this.repo.tickets.active()) {
       if (!liveTicket(ticket) && ticket.undelivered.length) this.repo.atomic(() => { this.tickets.wake(ticket.id) })
     }
@@ -125,6 +127,23 @@ export class Engine {
    * @throws UserError when the ticket is unknown.
    */
   requestStatus(ticketId: string): boolean { return this.repo.atomic(() => this.tickets.requestStatus(ticketId)) }
+  /**
+   * 把一张 open 工单加进协作组或改组：组内最多四张，可写组内角色与对同组其他工单的依赖，自依赖或成环则拒绝。
+   * 每次写入都是全量的：未给的 role 与 dependsOn 会被清除。组只是协作与看板事实，不授予权限，也不写实施计划。
+   * @throws UserError 工单未知或已结束、组名或角色不合法、组已满、依赖越界或成环。
+   */
+  collab(ticketId: string, change: CollaborationInput): Ticket { return this.repo.atomic(() => this.tickets.collab(ticketId, change)) }
+  /**
+   * 解散一张工单所在的协作组（人工覆盖手段，自动组同样适用）：清掉组内所有成员的组关系，
+   * 此后的终态报告不再互相广播。只改协作与看板事实，不动授权、assignment 或订阅。
+   * @returns 被移出组的工单 id；没有组时为空。
+   */
+  dissolveCollab(ticketId: string): string[] { return this.repo.atomic(() => this.tickets.dissolveCollab(ticketId)) }
+  /**
+   * 清理指向已不存在工单的悬空订阅，返回清掉的条数。启动时调用一次；每次 Trigger fanout 前 Intake 还会清理涉及的 Thread。
+   * 不删除已结束但仍有记录的订阅：人类追问仍可唤醒它们，机器人消息由 Intake 跳过。
+   */
+  cleanSubscriptions(): number { return this.repo.atomic(() => this.tickets.cleanSubscriptions()) }
   /**
    * Queue a message for the Channel its purpose names: an acknowledgement or an answer goes where the person's message was
    * written, attention where the message that raised the question was, else, like a result, to the conversation the ticket
@@ -260,7 +279,8 @@ export class Engine {
 /** What Sources ask and tell the Engine. */
 export type EngineForSources = Pick<Engine, 'receive' | 'bindThread' | 'threadClosed'>
 /** What the main Session asks of the Engine. */
-export type EngineForMainSession = Pick<Engine, 'candidate' | 'candidateDelivered' | 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note'>
+export type EngineForMainSession = Pick<Engine, 'candidate' | 'candidateDelivered' | 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note'
+  | 'collab' | 'dissolveCollab'>
 /** What people ask of the Engine, through the panel or the main Session. */
 export type EngineForPeople = Pick<Engine, 'stopTicket' | 'retryTicket' | 'reevaluate' | 'unsubscribe' | 'dismiss'>
 /** What Settings tells the Engine. */

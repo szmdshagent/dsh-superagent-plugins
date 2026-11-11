@@ -12,6 +12,8 @@
  * 覆盖目录，改在那里的守卫升级即丢。插件由 profile 以 `link:` 引用，升级不受影响。
  */
 import type { Context } from '@deepseek-ai/cordis'
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
+import { join } from 'node:path'
 
 /** cc-worker 的绝对路径；worker 调它时整条命令放行。 */
 const CC_WORKER = '/home/szm/.local/bin/cc-worker'
@@ -125,4 +127,239 @@ export function installWorkerGuard(ctx: Context): void {
   ctx.inject(['tools'], (scope: Context) => {
     scope.effect(() => scope.tools.guard(workerVerdict), 'pane: worker 硬限制')
   })
+}
+
+// ——— team/lane 只读视图（2026-11-11） ———
+//
+// cc-worker 的 team 子命令会写 `.cc-worker/team-plan.json`，并为每个 lane 建
+// `lanes/<lane>/{task.txt,result.json,log.jsonl,runs/,handoff.md}`。面板要能回答
+// 「哪几路在跑、哪几路完成/失败」，就不该只盯 main。这些函数只读文件，不触发任何执行。
+
+/** lane 名只允许安全字符；它来自目录名/计划，防止把奇怪目录当 lane。 */
+const LANE_NAME = /^[A-Za-z0-9_-]+$/
+/** team 计划内的并行 lane 命名规范：ccw1、ccw2…… */
+const TEAM_LANE = /^ccw([1-9][0-9]*)$/
+/** cc-worker 的并行上限；ccw5 以上不可能出现在 plan 的正常执行范围里。 */
+const MAX_TEAM_LANES = 4
+/** 有执行痕迹但超过这么久没有新动作、又没写 result.json，判为失败而不是仍在跑。 */
+const LANE_LIVE_MS = 10 * 60_000
+
+/** team 计划里的一条分工。 */
+export type TeamPlanEntry = { lane: string; task: string }
+
+/** `.cc-worker/team-plan.json` 的解析结果。 */
+export type TeamPlan = {
+  /** 计划文件绝对路径。 */
+  path: string
+  /** 文件是否存在。 */
+  exists: boolean
+  /** 合法条目（lane 为 ccw1..ccwN 且 task 非空）。 */
+  lanes: TeamPlanEntry[]
+  /** 不合规条目，面板据此提示统筹重新分工。 */
+  invalid: TeamPlanEntry[]
+  /** 读取/JSON 解析失败的原因。 */
+  error?: string
+}
+
+/** 一个 lane 的面板视图。 */
+export type TeamLane = {
+  lane: string
+  /** 分工描述：优先 task.txt，其次 team-plan.json。 */
+  task?: string
+  /** pending=已分工未开跑；running=有活信号；done/failed=有 result.json。 */
+  state: 'pending' | 'running' | 'done' | 'failed'
+  ok?: boolean
+  costUsd?: number
+  turns?: number
+  sessionId?: string
+  error?: string
+  /** 是否写了 handoff.md（交接完成）。 */
+  handoff: boolean
+  /** 最近一次执行活动时刻（毫秒），供面板/健康探测判断「多久没动作」。 */
+  atMs?: number
+}
+
+/** 工单的 team 状态：计划 + 每 lane 视图。 */
+export type TeamStatus = { plan: TeamPlan; lanes: TeamLane[] }
+
+/** `.cc-worker` 根目录。 */
+function ccRoot(dir: string): string {
+  return join(dir, '.cc-worker')
+}
+
+/** lane 的状态根：main 与旧版一致，其它 lane 各自一个子目录。 */
+export function laneDir(ticketDir: string, lane = 'main'): string {
+  return lane === 'main' ? ccRoot(ticketDir) : join(ccRoot(ticketDir), 'lanes', lane)
+}
+
+/** lane 名是否合法（与 cc-worker 的安全字符集一致）。 */
+export function isValidLaneName(lane: string): boolean {
+  return LANE_NAME.test(lane)
+}
+
+/** 读 team-plan.json；文件缺失、不是数组或条目不合规都如实报告，不猜测。 */
+export function readTeamPlan(ticketDir: string): TeamPlan {
+  const path = join(ccRoot(ticketDir), 'team-plan.json')
+  const plan: TeamPlan = { path, exists: existsSync(path), lanes: [], invalid: [] }
+  if (!plan.exists) return plan
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(readFileSync(path, 'utf-8'))
+  } catch (error) {
+    plan.error = `team-plan.json 不是合法 JSON：${error instanceof Error ? error.message : String(error)}`
+    return plan
+  }
+  if (!Array.isArray(parsed)) {
+    plan.error = 'team-plan.json 不是 JSON 数组'
+    return plan
+  }
+  for (const item of parsed) {
+    if (!item || typeof item !== 'object') continue
+    const raw = item as Record<string, unknown>
+    const lane = String(raw.lane ?? '').trim()
+    const task = String(raw.task ?? '').replace(/\s+/g, ' ').trim()
+    if (!lane) continue
+    const entry = { lane, task }
+    const match = TEAM_LANE.exec(lane)
+    if (match && Number(match[1]) <= MAX_TEAM_LANES && task) plan.lanes.push(entry)
+    else plan.invalid.push(entry)
+  }
+  return plan
+}
+
+/** 读 lane 的 result.json（cc-worker run 的 stdout）；不存在或解析失败返回 undefined。 */
+function readLaneResult(dir: string): { ok: boolean; costUsd?: number; turns?: number; sessionId?: string; error?: string } | undefined {
+  let text: string
+  try {
+    text = readFileSync(join(dir, 'result.json'), 'utf-8').trim()
+  } catch {
+    return undefined
+  }
+  if (!text) return undefined
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    const lines = text.split('\n')
+    for (let i = lines.length - 1; i >= 0 && parsed === undefined; i--) {
+      try { parsed = JSON.parse(lines[i]!) } catch { /* 继续往前找 */ }
+    }
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined
+  const raw = parsed as Record<string, unknown>
+  return {
+    ok: raw.ok === true,
+    costUsd: typeof raw.cost_usd === 'number' ? raw.cost_usd : undefined,
+    turns: typeof raw.num_turns === 'number' ? raw.num_turns : undefined,
+    sessionId: typeof raw.session_id === 'string' ? raw.session_id : undefined,
+    error: typeof raw.error === 'string' ? raw.error : undefined,
+  }
+}
+
+/** lane 目录里 claude.pid 指向的进程是否还活着。 */
+function laneAlive(dir: string): boolean {
+  let pid: number
+  try {
+    pid = Number(readFileSync(join(dir, 'claude.pid'), 'utf-8').trim())
+  } catch {
+    return false
+  }
+  if (!Number.isInteger(pid) || pid <= 1) return false
+  try {
+    return readFileSync(`/proc/${pid}/cmdline`, 'utf-8').includes('claude')
+  } catch {
+    return false
+  }
+}
+
+/** lane 最近一次执行活动时刻（毫秒）；task.txt 等“已分工”痕迹不算执行。 */
+function laneActivity(dir: string): number {
+  let newest = 0
+  const consider = (file: string) => {
+    try { newest = Math.max(newest, statSync(file).mtimeMs) } catch { /* 忽略 */ }
+  }
+  for (const name of ['log.jsonl', 'session_id', 'result.json', 'runs']) consider(join(dir, name))
+  return newest
+}
+
+/** 读一个 lane 的 task.txt。 */
+function laneTaskFile(dir: string): string | undefined {
+  try {
+    const text = readFileSync(join(dir, 'task.txt'), 'utf-8').trim()
+    return text || undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** 枚举 `.cc-worker/lanes/` 下的 lane 目录（含 lead），只认安全名。 */
+function laneDirs(ticketDir: string): string[] {
+  let entries: { name: string; isDirectory(): boolean }[] = []
+  try {
+    entries = readdirSync(join(ccRoot(ticketDir), 'lanes'), { withFileTypes: true }) as typeof entries
+  } catch {
+    return []
+  }
+  return entries.filter(entry => entry.isDirectory() && LANE_NAME.test(entry.name)).map(entry => entry.name).sort()
+}
+
+/** 汇总一个 lane 的存活/完成/失败。 */
+function laneView(ticketDir: string, lane: string, planTask: string | undefined, now: number): TeamLane {
+  const dir = laneDir(ticketDir, lane)
+  const result = readLaneResult(dir)
+  const task = laneTaskFile(dir) ?? planTask
+  const handoff = existsSync(join(dir, 'handoff.md'))
+  const activity = laneActivity(dir)
+  let sessionId: string | undefined
+  try { sessionId = readFileSync(join(dir, 'session_id'), 'utf-8').trim() || undefined } catch { /* 无会话 */ }
+
+  let state: TeamLane['state']
+  if (result) {
+    state = result.ok ? 'done' : 'failed'
+  } else if (laneAlive(dir)) {
+    state = 'running'
+  } else {
+    const started = activity > 0 || existsSync(join(dir, 'session_id')) || existsSync(join(dir, 'runs'))
+    state = started ? (now - activity <= LANE_LIVE_MS ? 'running' : 'failed') : 'pending'
+  }
+  return {
+    atMs: activity || undefined,
+    lane,
+    task,
+    state,
+    ok: result?.ok,
+    costUsd: result?.costUsd,
+    turns: result?.turns,
+    sessionId: result?.sessionId ?? sessionId,
+    error: result?.error,
+    handoff,
+  }
+}
+
+/**
+ * 读工单的 team 状态：team-plan.json + 每个 lane 的 task.txt/result.json。
+ *
+ * lane 顺序以计划为准（ccw1、ccw2…），计划之外的目录（如 lead、手工 lane）排在后面。
+ * 这样面板能直接按执行顺序展示存活/完成/失败，而不是靠目录名字典序。
+ */
+export function teamStatus(ticketDir: string, now = Date.now()): TeamStatus {
+  const plan = readTeamPlan(ticketDir)
+  const planTasks = new Map(plan.lanes.map(entry => [entry.lane, entry.task]))
+  const seen = new Set<string>()
+  const lanes: TeamLane[] = []
+  for (const entry of plan.lanes) {
+    if (seen.has(entry.lane)) continue
+    seen.add(entry.lane)
+    lanes.push(laneView(ticketDir, entry.lane, entry.task, now))
+  }
+  for (const lane of laneDirs(ticketDir)) {
+    if (seen.has(lane)) continue
+    lanes.push(laneView(ticketDir, lane, planTasks.get(lane), now))
+  }
+  return { plan, lanes }
+}
+
+/** 只要每个 lane 的视图（面板/测试常用）。 */
+export function listTeamLanes(ticketDir: string, now = Date.now()): TeamLane[] {
+  return teamStatus(ticketDir, now).lanes
 }

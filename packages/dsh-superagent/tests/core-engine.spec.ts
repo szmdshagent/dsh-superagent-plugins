@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
-import { Engine, MemoryRepositories, UserError, followupOwners, key, runningAssignment, ticketOutcome, ticketStage,
-  waitsForPerson } from '../src/core/index.ts'
+import { Engine, MemoryRepositories, UserError, followupOwners, key, matchResultCards, resultCard, runningAssignment, ticketOutcome,
+  ticketStage, waitsForPerson } from '../src/core/index.ts'
+import { readResource, type ResourceHost } from '../src/app/resources.ts'
 import type { Assessor, Assignment, Candidate, EngineOptions, Executor, OutboundMessage, Outcome, Policy, Ticket, Trigger } from '../src/core/index.ts'
 
 const member = { source: 'chat', id: 'alice' }
@@ -63,6 +64,13 @@ function harness(policyOverrides: Partial<Policy> = {}, { emit, prepareTicket }:
   const decide = (candidate: Candidate, outcome: Outcome) => engine.decide(candidate.triggers[0]!.id, { ...outcome, evalId: candidate.evalId })
   return { repo, engine, outbox, withdrawn, requests, assessor, executor, delivered, settle, pump, read, decide,
     setVersion: (value: string) => { version = value }, setPaused: (value: boolean) => { paused = value }, tick: (seconds: number) => { clock += seconds } }
+}
+/** 工具输出必须是无损 JSON：undefined 字段会让 JSON 往返丢键，这里列出所有 undefined 路径。 */
+function undefinedPaths(value: unknown, path = '$'): string[] {
+  if (value === undefined) return [path]
+  if (value === null || typeof value !== 'object') return []
+  if (Array.isArray(value)) return value.flatMap((item, index) => undefinedPaths(item, `${path}[${index}]`))
+  return Object.entries(value).flatMap(([property, item]) => undefinedPaths(item, `${path}.${property}`))
 }
 function accepted(h: ReturnType<typeof harness>, id = '1', thread = 't1') {
   h.engine.receive(trigger(id, { threads: [{ source: 'chat', id: thread }] })); h.pump()
@@ -284,6 +292,62 @@ describe('subscription fan-out', () => {
     expect(() => h.engine.markUnrelated(first, 'chat:t1', 'its own')).toThrow(new UserError('sourceThread'))
     h.engine.bindThread(first, { source: 'gh', id: 'pr-9' }, true)
     expect(() => h.engine.markUnrelated(first, 'gh:pr-9', 'its PR')).toThrow(new UserError('followedThread'))
+  })
+})
+describe('narrowed fan-out', () => {
+  /** Two live tickets on `chat:t1`: the first owns it, the second subscribes to it for its own work. */
+  function shared(h: ReturnType<typeof harness>) {
+    const owner = accepted(h).ticketId!
+    const other = accepted(h, '2', 't2').ticketId!
+    h.engine.bindThread(other, { source: 'chat', id: 't1' }, false)
+    h.settle()
+    return { owner, other }
+  }
+  it('leaves an ended ticket on a shared thread ended and delivers the message to the live ticket only', () => {
+    const h = harness()
+    const { owner, other } = shared(h)
+    h.engine.report(owner, { state: 'ready', summary: 'done' })
+    const launches = vi.mocked(h.executor.start).mock.calls.length
+    h.engine.receive(trigger('3', { actor: guest })); h.pump()
+    const ended = h.repo.tickets.get(owner)!
+    expect(ended).toMatchObject({ ended: expect.anything() })
+    expect(ended.assignments).toHaveLength(1)
+    expect(ended.inputs).toEqual([])
+    expect(h.repo.tickets.get(other)!.inputs).toEqual([expect.objectContaining({ kind: 'trigger', triggerId: '3' })])
+    expect(h.repo.triggers.disposition('3')).toMatchObject({ fanout: [other] })
+    // The ended ticket is neither resumed nor woken: no new assignment starts.
+    expect(h.executor.start).toHaveBeenCalledTimes(launches)
+  })
+  it('sends an addressed message on a thread two live tickets own to Eval, delivering it to neither', () => {
+    const h = harness()
+    const { owner, other } = shared(h)
+    const requests = h.requests.length, deliveries = vi.mocked(h.executor.deliver).mock.calls.length
+    h.engine.receive(trigger('3', { addressed: 'mention' })); h.pump()
+    expect(h.repo.triggers.disposition('3')).toMatchObject({ fanout: [] })
+    expect([h.repo.tickets.get(owner)!.inputs, h.repo.tickets.get(other)!.inputs]).toEqual([[], []])
+    expect(h.executor.deliver).toHaveBeenCalledTimes(deliveries)
+    // The main Session assesses it, seeing the Thread's tickets, and attaches it or accepts new work.
+    expect(h.requests).toHaveLength(requests + 1)
+    expect(h.requests.at(-1)!.triggers.map(item => item.id)).toEqual(['3'])
+    expect(h.requests.at(-1)!.tickets.map(ticket => ticket.id)).toEqual([owner, other])
+  })
+  it('still resumes an ended ticket that is its thread\'s only ticket', () => {
+    const h = harness()
+    const ticketId = accepted(h).ticketId!
+    h.engine.report(ticketId, { state: 'ready', summary: 'done' })
+    h.engine.receive(trigger('2', { actor: guest }))
+    const ticket = h.repo.tickets.get(ticketId)!
+    expect(ticket.ended).toBeUndefined()
+    expect(ticket.assignments).toHaveLength(2)
+  })
+  it('still resumes an ended ticket on a shared thread when the main Session attaches a message to it', () => {
+    const h = harness()
+    const { owner } = shared(h)
+    h.engine.report(owner, { state: 'ready', summary: 'done' })
+    h.engine.receive(trigger('3', { actor: guest, threads: [{ source: 'chat', id: 'elsewhere' }] }))
+    const resumed = h.engine.attach(owner, '3')
+    expect(resumed.ended).toBeUndefined()
+    expect(resumed.assignments).toHaveLength(2)
   })
 })
 describe('resume and stop', () => {
@@ -1617,5 +1681,368 @@ describe('ignores from the card', () => {
     // Accepting an inferred candidate still takes an assessment's matched rules.
     h.engine.receive(trigger('5', { actor: guest })); h.engine.reevaluate('5'); h.pump()
     expect(() => h.engine.decide('5', { kind: 'accept', title: 'Fix', scope: 'small', reason: 'chat' })).toThrow(new UserError('notExplicit'))
+  })
+})
+
+describe('collaboration groups', () => {
+  const group = (h: ReturnType<typeof harness>, ticketId: string, name: string, change: { role?: string; dependsOn?: string[] } = {}) =>
+    h.engine.collab(ticketId, { group: name, ...change })
+  it('groups at most four open tickets, counting a re-grouped ticket once', () => {
+    const h = harness()
+    const ids = ['1', '2', '3', '4'].map(id => accepted(h, id, `t${id}`).ticketId!)
+    ids.forEach((id, index) => group(h, id, 'g1', index ? { role: `role-${index}` } : {}))
+    expect(h.repo.tickets.get(ids[0]!)!.collab).toEqual({ group: 'g1' })
+    expect(h.repo.tickets.get(ids[1]!)!.collab).toEqual({ group: 'g1', role: 'role-1' })
+    const fifth = accepted(h, '5', 't5').ticketId!
+    expect(() => group(h, fifth, 'g1')).toThrow(new UserError('collabGroupFull'))
+    // Re-saving a ticket the group already holds changes its role and does not count it twice.
+    expect(group(h, ids[0]!, 'g1', { role: 'lead' })).toMatchObject({ collab: { group: 'g1', role: 'lead' } })
+  })
+  it('refuses a self-dependency, one outside the group and a cycle, and accepts another open group ticket', () => {
+    const h = harness()
+    const [a, b, c, outside] = ['1', '2', '3', '4'].map(id => accepted(h, id, `t${id}`).ticketId!)
+    for (const id of [a!, b!, c!]) group(h, id, 'g2')
+    expect(group(h, a!, 'g2', { dependsOn: [b!] })).toMatchObject({ collab: { dependsOn: [b!] } })
+    expect(() => group(h, b!, 'g2', { dependsOn: [a!] })).toThrow(new UserError('collabCycle'))
+    expect(() => group(h, c!, 'g2', { dependsOn: [c!] })).toThrow(new UserError('collabDependency'))
+    expect(() => group(h, c!, 'g2', { dependsOn: [outside!] })).toThrow(new UserError('collabDependency'))
+    // An ended ticket is no longer a dependency its group waits on.
+    h.engine.stopTicket(b!)
+    expect(() => group(h, c!, 'g2', { dependsOn: [b!] })).toThrow(new UserError('collabDependency'))
+  })
+  it('shares a terminal report with the group once per assignment and state, and notes an ended ticket without waking it', () => {
+    const h = harness()
+    const [a, b, c] = ['1', '2', '3'].map(id => accepted(h, id, `t${id}`).ticketId!)
+    for (const id of [a!, b!, c!]) group(h, id, 'g3')
+    const shared = (ticketId: string, from: string) => h.repo.tickets.get(ticketId)!.inputs
+      .flatMap(input => input.kind === 'note' && input.from === from ? [input] : [])
+    h.engine.report(a!, { state: 'blocked', summary: 'Need the API key.' })
+    h.engine.report(a!, { state: 'blocked', summary: 'Need the API key.' })
+    expect(shared(b!, a!)).toHaveLength(1)
+    expect(shared(b!, a!)[0]!.text).toContain(`ticket/${a}/result`)
+    expect(shared(c!, a!)).toHaveLength(1)
+    // A progress report is not shared.
+    h.engine.report(b!, { state: 'progress', summary: 'Still working.' })
+    expect(shared(a!, b!)).toHaveLength(0)
+    // An ended ticket takes the note but starts no assignment.
+    h.engine.stopTicket(c!)
+    const assignments = h.repo.tickets.get(c!)!.assignments.length
+    h.engine.report(b!, { state: 'ready', summary: 'Done.' })
+    expect(h.repo.tickets.get(c!)!.ended).toBeDefined()
+    expect(h.repo.tickets.get(c!)!.assignments).toHaveLength(assignments)
+    expect(shared(c!, b!)).toHaveLength(1)
+  })
+  it('broadcasts only ready, blocked and failed, never progress, waiting or dropped', () => {
+    const h = harness()
+    const [a, b] = ['1', '2'].map(id => accepted(h, id, `t${id}`).ticketId!)
+    for (const id of [a!, b!]) group(h, id, 'g4')
+    const shared = (ticketId: string, from: string) => h.repo.tickets.get(ticketId)!.inputs
+      .flatMap(input => input.kind === 'note' && input.from === from ? [input] : [])
+    h.engine.report(a!, { state: 'progress', summary: 'Still working.' })
+    h.engine.report(a!, { state: 'waiting', summary: 'Waiting for CI.' })
+    h.engine.report(a!, { state: 'failed', summary: 'The tests failed.' })
+    expect(shared(b!, a!)).toHaveLength(1)
+    expect(shared(b!, a!)[0]!.text).toContain('reported failed')
+    // 同一 assignment 的同一状态只广播一次。
+    h.engine.report(a!, { state: 'failed', summary: 'The tests failed again.' })
+    expect(shared(b!, a!)).toHaveLength(1)
+    // dropped 是空转，不是可复用结果：不同步给同组。
+    h.engine.report(a!, { state: 'dropped', summary: 'Not my ticket.' })
+    expect(shared(b!, a!)).toHaveLength(1)
+    // ready 仍然广播。
+    h.engine.report(b!, { state: 'ready', summary: 'Done.' })
+    expect(shared(a!, b!)).toHaveLength(1)
+  })
+  it('leaves tickets outside any group unchanged', () => {
+    const h = harness()
+    const a = accepted(h).ticketId!, b = accepted(h, '2', 't2').ticketId!
+    h.engine.report(a, { state: 'ready', summary: 'done' })
+    expect(h.repo.tickets.get(a)!.collab).toBeUndefined()
+    expect(h.repo.tickets.get(b)!.inputs).toEqual([])
+    expect(h.repo.tickets.get(b)!.assignments).toHaveLength(1)
+  })
+})
+
+describe('automatic collaboration groups', () => {
+  /** 接受一张带明确标题/范围的工单，返回 id；默认线程按 id 区分。 */
+  function accept(h: ReturnType<typeof harness>, id: string, title: string, scope = 'small', thread = `auto-${id}`): string {
+    h.engine.receive(trigger(id, { threads: [{ source: 'chat', id: thread }], text: `message ${id}` }))
+    h.pump()
+    const decision = h.decide(h.requests.at(-1)!, { kind: 'accept', title, scope, reason: 'requested' })
+    h.settle()
+    return decision.ticketId!
+  }
+  const repo = (h: ReturnType<typeof harness>, id: string, title: string) =>
+    accept(h, id, title, 'See https://github.com/acme/widget for context')
+  const members = (h: ReturnType<typeof harness>, id: string) => h.repo.tickets.get(id)!
+
+  it('groups two new tickets that share a write domain, with no manual tool call', () => {
+    const h = harness()
+    const a = repo(h, '1', 'Update the widget core')
+    const b = repo(h, '2', 'Improve the widget documentation')
+    const [ta, tb] = [members(h, a), members(h, b)]
+    expect(ta.collab).toMatchObject({ auto: true, group: expect.stringMatching(/^auto-/), confidence: expect.any(Number) })
+    expect(tb.collab?.group).toBe(ta.collab?.group)
+    expect(tb.collab?.confidence).toBeGreaterThanOrEqual(0.30)
+    expect(tb.collab?.signals).toEqual(expect.arrayContaining(['domain']))
+    expect(tb.collab?.writeScopes).toEqual([])
+    expect(tb.collab?.expiresAt).toBe(ta.collab?.expiresAt)
+  })
+
+  it('does not group A/C when they share only generic README.md and package.json names', () => {
+    const h = harness()
+    // A 与 C 是不同仓库的只读任务：标题相似、时间相同，但唯一共同词是通用文件名。
+    const a = accept(h, '1', '部署验证只读任务：读 README 要点与 package.json 核对', '只读 README.md 与 package.json。', 'auto-a')
+    const c = accept(h, '2', '部署验证只读任务：读 pane 的 package.json', '只读 package.json，给出 3 条依赖要点。', 'auto-c')
+    expect(members(h, a).collab).toBeUndefined()
+    expect(members(h, c).collab).toBeUndefined()
+  })
+
+  it('serves a group resource as lossless JSON', async () => {
+    const h = harness()
+    const a = repo(h, '1', 'Update the widget core')
+    repo(h, '2', 'Improve the widget documentation')
+    const groupId = members(h, a).collab!.group
+    // group 路由只读 store.tickets，其余宿主字段在测试里不需要。
+    const host = { store: { tickets: h.repo.tickets } } as unknown as ResourceHost
+    const page = await readResource(host, `group/${groupId}`, 0, undefined) as { tickets: Record<string, unknown>[] }
+    expect(undefinedPaths(page)).toEqual([])
+    expect(JSON.parse(JSON.stringify(page))).toStrictEqual(page)
+    // 自动组没有人工 role；字段应省略而不是带 undefined。
+    expect(Object.keys(page.tickets[0]!)).not.toContain('role')
+  })
+
+  it('groups an explicit dependency and records dependsOn on the downstream ticket', () => {
+    const h = harness()
+    const a = accept(h, '1', 'Update the widget parser', 'small')
+    const b = accept(h, '2', 'Follow up on Update the widget parser', 'small')
+    expect(members(h, a).collab?.group).toBeDefined()
+    expect(members(h, b).collab).toMatchObject({ group: members(h, a).collab?.group, auto: true, dependsOn: [a] })
+  })
+
+  it('vetoes a shared write file even when the write domain matches', () => {
+    const h = harness()
+    const a = accept(h, '1', 'Fix src/core/tickets.ts report', 'Edit src/core/tickets.ts.')
+    const b = accept(h, '2', 'Refine src/core/tickets.ts output', 'Change src/core/tickets.ts.')
+    expect(members(h, a).collab).toBeUndefined()
+    expect(members(h, b).collab).toBeUndefined()
+  })
+
+  it('caps an automatic group at three tickets and keeps one ticket in one group', () => {
+    const h = harness()
+    const ids = [repo(h, '1', 'Update the widget core'), repo(h, '2', 'Improve the widget documentation'),
+      repo(h, '3', 'Document the widget API'), repo(h, '4', 'Test the widget parser')]
+    const groups = ids.map(id => members(h, id).collab?.group)
+    expect(groups[0]).toBeDefined()
+    expect(groups[1]).toBe(groups[0])
+    expect(groups[2]).toBe(groups[0])
+    // 第四张同域工单不能把自动组撑到四张，也不会另拉一个新组。
+    expect(groups[3]).toBeUndefined()
+    expect(ids.filter(id => members(h, id).collab?.group === groups[0])).toHaveLength(3)
+  })
+
+  it('injects the group id into the first assignment without adding a note or another wake', () => {
+    const h = harness({}, { prepareTicket: ticket => ({ ...ticket, execution: { name: `n-${ticket.id.slice(0, 4)}`,
+      directory: `/ws/${ticket.id.slice(0, 4)}`, assignment: 'Do the work.' } }) })
+    const a = repo(h, '1', 'Update the widget core')
+    const starts = vi.mocked(h.executor.start).mock.calls.length
+    const b = repo(h, '2', 'Improve the widget documentation')
+    const group = members(h, a).collab!.group
+    expect(members(h, b).collab?.group).toBe(group)
+    expect(members(h, b).execution!.assignment).toContain(`Collaboration group: ${group}`)
+    expect(members(h, b).execution!.assignment).toContain('Read group/')
+    expect(members(h, b).inputs).toEqual([])
+    expect(vi.mocked(h.executor.start).mock.calls.length - starts).toBe(1)
+  })
+
+  it('dissolves a group when every member ended, and stays dissolved', () => {
+    const h = harness()
+    const a = repo(h, '1', 'Update the widget core')
+    const b = repo(h, '2', 'Improve the widget documentation')
+    h.engine.report(a, { state: 'ready', summary: 'Done.' })
+    h.engine.report(b, { state: 'ready', summary: 'Done too.' })
+    expect(members(h, a).ended).toBeDefined()
+    expect(members(h, b).ended).toBeDefined()
+    h.engine.evaluateDue()
+    expect(members(h, a).collab).toBeUndefined()
+    expect(members(h, b).collab).toBeUndefined()
+    h.engine.evaluateDue()
+    expect(members(h, a).collab).toBeUndefined()
+  })
+
+  it('dissolves a group after the 2 h TTL', () => {
+    const h = harness()
+    const a = repo(h, '1', 'Update the widget core')
+    const b = repo(h, '2', 'Improve the widget documentation')
+    h.tick(2 * 3600 + 1)
+    h.engine.evaluateDue()
+    expect(members(h, a).collab).toBeUndefined()
+    expect(members(h, b).collab).toBeUndefined()
+  })
+
+  it('keeps a group briefly after a delivered cross-read, then dissolves it after 30 min without one', () => {
+    const h = harness()
+    const a = repo(h, '1', 'Update the widget core')
+    const b = repo(h, '2', 'Improve the widget documentation')
+    h.engine.report(a, { state: 'blocked', summary: 'Need the API key.' })
+    h.settle()
+    expect(members(h, b).inputs.filter(input => input.kind === 'note' && input.from === a)).toHaveLength(1)
+    h.tick(10 * 60)
+    h.engine.evaluateDue()
+    expect(members(h, b).collab).toBeDefined()
+    h.tick(25 * 60)
+    h.engine.evaluateDue()
+    expect(members(h, b).collab).toBeUndefined()
+  })
+
+  it('dissolves when a member reports that the group is unrelated', () => {
+    const h = harness()
+    const a = repo(h, '1', 'Update the widget core')
+    const b = repo(h, '2', 'Improve the widget documentation')
+    h.engine.report(a, { state: 'dropped', summary: 'This work is unrelated to the group.' })
+    h.engine.evaluateDue()
+    expect(members(h, a).collab).toBeUndefined()
+    expect(members(h, b).collab).toBeUndefined()
+  })
+
+  it('leaves a lone ticket outside any group unchanged', () => {
+    const h = harness({}, { prepareTicket: ticket => ({ ...ticket, execution: { name: 'solo', directory: '/ws/solo',
+      assignment: 'Do the work.' } }) })
+    const a = accept(h, '1', 'Write a poem about the weather')
+    expect(members(h, a).collab).toBeUndefined()
+    expect(members(h, a).execution!.assignment).toBe('Do the work.')
+    expect(members(h, a).inputs).toEqual([])
+    expect(members(h, a).assignments).toHaveLength(1)
+  })
+
+  it('can be dissolved by the main Session and then shares no more reports', () => {
+    const h = harness()
+    const a = repo(h, '1', 'Update the widget core')
+    const b = repo(h, '2', 'Improve the widget documentation')
+    expect(members(h, b).collab?.group).toBe(members(h, a).collab?.group)
+    expect(h.engine.dissolveCollab(a)).toEqual(expect.arrayContaining([a, b]))
+    expect(members(h, a).collab).toBeUndefined()
+    expect(members(h, b).collab).toBeUndefined()
+    h.engine.report(a, { state: 'ready', summary: 'Done.' })
+    expect(members(h, b).inputs.filter(input => input.kind === 'note' && input.from === a)).toEqual([])
+  })
+
+  it('does not merge a manual group into an automatic one', () => {
+    const h = harness()
+    const a = repo(h, '1', 'Update the widget core')
+    h.engine.collab(a, { group: 'manual', role: 'lead' })
+    const b = repo(h, '2', 'Improve the widget documentation')
+    expect(members(h, a).collab).toEqual({ group: 'manual', role: 'lead' })
+    expect(members(h, b).collab).toBeUndefined()
+    // 人工组不参与自动回收，也不会被自动组队改写。
+    h.engine.evaluateDue()
+    expect(members(h, a).collab).toEqual({ group: 'manual', role: 'lead' })
+  })
+})
+
+describe('subscription cleanup', () => {
+  it('drops subscriptions of missing tickets, keeps an executor-ended ticket resumable by a person only, and clears a stopped ticket', () => {
+    const h = harness()
+    const a = accepted(h).ticketId!
+    const thread = h.repo.threads.get('chat:t1')!
+    thread.subscriptions.push('ghost')
+    h.repo.threads.save(thread)
+    // 启动时与 fanout 前都会调用；这里直接验证清理函数。
+    expect(h.engine.cleanSubscriptions()).toBe(1)
+    expect(h.repo.threads.get('chat:t1')!.subscriptions).toEqual([a])
+    // Executor 结束的单保留订阅，人类追问可以唤醒它。
+    h.engine.report(a, { state: 'dropped', summary: 'Nothing to do.' })
+    expect(h.repo.threads.get('chat:t1')!.subscriptions).toContain(a)
+    const assignments = h.repo.tickets.get(a)!.assignments.length
+    // 机器人消息不唤醒已结束单，也不产生无意义 fanout。
+    h.engine.receive(trigger('2', { actor: { source: 'chat', id: 'bot' }, human: false }))
+    expect(h.repo.tickets.get(a)!.assignments).toHaveLength(assignments)
+    expect(h.repo.tickets.get(a)!.ended).toBeDefined()
+    // 人类追问仍按现有语义唤醒同一 thread 上的已结束单。
+    h.engine.receive(trigger('3'))
+    expect(h.repo.tickets.get(a)!.ended).toBeUndefined()
+    expect(h.repo.tickets.get(a)!.assignments).toHaveLength(assignments + 1)
+    // 人 stop 撤回 Mandate 后订阅保留（thread 历史仍能列出这张单），但消息不会再唤醒它。
+    h.engine.stopTicket(a)
+    expect(h.repo.threads.get('chat:t1')!.subscriptions).toContain(a)
+    h.engine.receive(trigger('4'))
+    expect(h.repo.tickets.get(a)!.ended).toBeDefined()
+    expect(h.repo.tickets.get(a)!.assignments).toHaveLength(assignments + 1)
+  })
+})
+
+describe('L1 result cards', () => {
+  const prepared = () => harness({}, { prepareTicket: ticket => ({ ...ticket,
+    execution: { name: 'result-card', directory: '/ws/result-card', assignment: 'Do the work.' } }) })
+  /** 接受一条消息并返回新工单 id。 */
+  function accept(h: ReturnType<typeof harness>, id: string, thread: string, text: string): string {
+    h.engine.receive(trigger(id, { threads: [{ source: 'chat', id: thread }], text }))
+    h.pump()
+    const decision = h.decide(h.requests.at(-1)!, { kind: 'accept', title: `Fix ${text}`, scope: 'small', reason: 'requested' })
+    h.settle()
+    return decision.ticketId!
+  }
+  it('builds a bounded card from the ready report without any model call', () => {
+    const card = resultCard({ id: 't1', title: 'Fix ticket rendering' },
+      { summary: 'Updated src/client/ticket.tsx and tests/core-engine.spec.ts; reduced dropped assignments by 42%.\nMore detail follows.',
+        at: '2026-11-07T00:00:00.000Z' })
+    expect(card.conclusion).toBe('Updated src/client/ticket.tsx and tests/core-engine.spec.ts; reduced dropped assignments by 42%.')
+    expect(card.artifacts).toEqual(['src/client/ticket.tsx', 'tests/core-engine.spec.ts'])
+    expect(card.numbers).toContain('42%')
+    expect(card.keys).toEqual(expect.arrayContaining(['src/client/ticket.tsx', 'ticket.tsx']))
+    expect(JSON.stringify(card).length).toBeLessThan(2_000)
+  })
+  it('injects one same-domain card into the first assignment, and none when nothing matches', () => {
+    const h = prepared()
+    const a = accept(h, '1', 't1', 'Change src/core/tickets.ts and report the result.')
+    h.engine.report(a, { state: 'ready', summary: 'Updated src/core/tickets.ts; reduced note noise by 80%.' })
+    expect(h.repo.tickets.get(a)!.result?.artifacts).toContain('src/core/tickets.ts')
+    const starts = vi.mocked(h.executor.start).mock.calls.length
+    const b = accept(h, '2', 't2', 'Follow up on src/core/tickets.ts and reuse the earlier result.')
+    const notes = h.repo.tickets.get(b)!.inputs.filter(input => input.kind === 'note')
+    expect(notes).toHaveLength(1)
+    expect(notes[0]!.text).toContain(a)
+    expect(notes[0]!.text).toContain(`ticket/${a}/result`)
+    expect(h.repo.tickets.get(b)!.execution!.assignment).toContain('Result cards from ready same-domain tickets')
+    // 卡片随首次 launch 发出，不额外增加一次 assignment/唤醒。
+    expect(vi.mocked(h.executor.start).mock.calls.length - starts).toBe(1)
+    // 无同域键时零回归：没有 note，assignment 原样。
+    const c = accept(h, '3', 't3', 'Write an unrelated poem about the weather.')
+    expect(h.repo.tickets.get(c)!.inputs.filter(input => input.kind === 'note')).toHaveLength(0)
+    expect(h.repo.tickets.get(c)!.execution!.assignment).toBe('Do the work.')
+  })
+  it('does not inject a card that only shares generic file basenames', () => {
+    const h = prepared()
+    // A 与 C 只共享 README.md / package.json 这类通用名，结果卡不能注入 C。
+    const a = accept(h, '1', 't1', 'Read README.md and package.json.')
+    h.engine.report(a, { state: 'ready', summary: 'README.md has 3 points; package.json lists 3 dependencies.' })
+    expect(h.repo.tickets.get(a)!.result?.keys).toEqual([])
+    const c = accept(h, '2', 't2', 'Read package.json and report 3 dependencies.')
+    expect(h.repo.tickets.get(c)!.inputs.filter(input => input.kind === 'note')).toHaveLength(0)
+    expect(h.repo.tickets.get(c)!.execution!.assignment).toBe('Do the work.')
+  })
+  it('matches a shared module directory, an explicit ticket reference, but not a shared repo alone', () => {
+    const id = '8c621e632193db0f76ee0951cc96990e'
+    const card = resultCard({ id, title: 'Update tickets' },
+      { summary: 'Updated src/core/tickets.ts; reduced note noise by 80%.', at: '2026-11-07T00:00:00.000Z' })
+    const tickets = [{ id, result: card }]
+    // 同目录（src/core）即可复用，即使文件不同。
+    expect(matchResultCards(tickets, 'Inspect src/core/parser.ts.')).toHaveLength(1)
+    // 显式引用工单 id 时，即使没有路径也注入。
+    expect(matchResultCards(tickets, `Follow up on ticket ${id} and reuse its conclusion.`)).toHaveLength(1)
+    // 只有同一个 GitHub repo、没有同目录/模块时不够。
+    const repoCard = resultCard({ id: 'aaaa1111bbbb2222cccc3333dddd4444', title: 'Widget notes' },
+      { summary: 'See https://github.com/acme/widget for context.', at: '2026-11-07T00:00:00.000Z' })
+    expect(repoCard.keys).toEqual(expect.arrayContaining(['repo:acme/widget']))
+    expect(matchResultCards([{ id: 'aaaa1111bbbb2222cccc3333dddd4444', result: repoCard }],
+      'Same repo https://github.com/acme/widget but no module path.')).toHaveLength(0)
+  })
+  it('matches only artifact/module keys and caps injection at three cards', () => {
+    const cards = ['1', '2', '3', '4'].map(id => resultCard({ id: `t${id}`, title: `Fix ${id}` },
+      { summary: `Updated src/core/tickets.ts in run ${id}.`, at: `2026-11-07T00:00:0${id}.000Z` }))
+    const tickets = cards.map((card, index) => ({ id: `t${index + 1}`, result: card }))
+    expect(matchResultCards(tickets, 'Please inspect src/core/tickets.ts.')).toHaveLength(3)
+    expect(matchResultCards(tickets, 'Please inspect src/other/module.ts.')).toHaveLength(0)
+    expect(matchResultCards(tickets, 'No paths here.')).toHaveLength(0)
   })
 })

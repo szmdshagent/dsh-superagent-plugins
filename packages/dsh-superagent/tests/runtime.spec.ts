@@ -1216,18 +1216,13 @@ it('keeps the receipt of a message withdrawn while it went out, so its id is not
   expect([runtime.store.receipts.get('raced'), runtime.effects.pending('reply')]).toEqual([expect.objectContaining({ text: 'Done', status: 'sent' }), false])
 })
 
-it('resumes several ended tickets on one thread from one message without the launch waiting on itself', async () => {
+it('resumes several ended tickets, each on a thread of its own, without the launch waiting on itself', async () => {
   const first = await acceptedTicket()
-  const other = feishu('30', '@bot 顺手把这里也改了', { root_id: undefined })
-  await receive(other)
-  await route({ kind: 'attach', ticket_id: first.ticket.id, trigger_id: other.id })
-  // A request on the first ticket's thread becomes a second ticket there once the first's worker hands it back.
-  const another = feishu('31', '@bot 另一件事', { root_id: 'om_1' })
-  await receive(another)
-  await runTool(first.sessionId, 'orchestrator_trigger_handback', { trigger_id: another.id, reason: 'Another change.' })
-  const second = await acceptedTicket(another)
+  // A thread per ticket, since a ticket on a shared thread is not resumed by a person's message any more.
+  const second = await acceptedTicket(feishu('30', '@bot 另一件事', { root_id: undefined }))
   for (const ticket of [first, second]) await runTool(ticket.sessionId, 'orchestrator_report', { state: 'dropped', summary: 'nothing to do' })
   await receive(feishu('32', '还有问题', { mentions: [], root_id: 'om_1', sender_id: 'ou_guest' }))
+  await receive(feishu('33', '这边也有问题', { mentions: [], root_id: 'om_30', sender_id: 'ou_guest' }))
   await vi.waitFor(() => expect([first, second].map(ticket => runtime.store.tickets.get(ticket.ticket.id)!.ended)).toEqual([undefined, undefined]), { timeout: 3000 })
   await vi.waitFor(() => expect([first, second].map(ticket => runtime.store.tickets.get(ticket.ticket.id)!.assignments.at(-1)!.state)).toEqual(['running', 'running']), { timeout: 3000 })
 })
@@ -1514,6 +1509,9 @@ it('refuses the main Session a bash command that runs sleep and a long job wait,
   expect(main({ name: 'job_output', arguments: { job_id: 'j', wait: true, timeout_ms: 30_000 } })).toMatch(/^Reports/)
   expect(main({ name: 'job_output', arguments: { job_id: 'j', wait: true, timeout_ms: 5_000 } })).toBeUndefined()
   expect(main({ name: 'job_output', arguments: { job_id: 'j' } })).toBeUndefined()
+  // A wait for a teammate ends only by its own timeout, so the main Session never gets an answer that way.
+  expect(main({ name: 'wait_agent', arguments: { timeout_ms: 60_000 } })).toMatch(/^Reports/)
+  expect(main({ name: 'wait_agent', arguments: {} })).toMatch(/^Reports/)
   // A main Session created before runs under standard, whose shell waits 60 seconds by default and whose job waits last 30:
   // a command without a timeout runs in the background or names one, and a job wait names one.
   ;(agents.get(runtime.masterId) as unknown as { session: { header: { agentPreset: string } } }).session.header = { agentPreset: 'standard' }
@@ -1564,6 +1562,41 @@ it('refuses an ended ticket\'s worker its tools, and restricts the main Session 
   // A worker keeps only the profile's work tools: none that ask a person, change the profile, schedule or start work outside
   // the worker slots, reach other Sessions or edit documents, whenever they were registered.
   expect(restricts.get(sessionId)).toEqual([{ allow: ['read', 'read_image', 'grep', 'bash', 'job_output', 'job_list', 'job_kill', 'web_search', 'skill'] }])
+})
+
+it('drops the Team tools a bundle registered in the main Session\'s own scope from its tool schemas, and keeps a worker\'s', async () => {
+  const main = (agents.get(runtime.masterId)! as unknown as { ctx: Context }).ctx
+  type Entry = { name: string; text: string }
+  type Assembly = { sections: Entry[]; contexts: Entry[]; variables: Record<string, never>
+    tools: { name: string; description: string; parameters: Record<string, unknown> }[] }
+  const assemble = (ctx: Context) => {
+    const policy = 'Agent Teams is available in this session. Use the target returned by spawn_teammate or list_agents for wait_agent and team_task_list.'
+    const identity = 'You are the Team Lead named "lead".\nUse list_agents({}) to find your teammates.\nTo message another teammate, use send_message({ target: "x", message: "..." }).'
+    const assembly: Assembly = {
+      sections: [{ name: 'dsh-superagent-policy', text: 'The orchestrator decides candidates.' }, { name: 'team:policy', text: policy }],
+      contexts: [{ name: 'cwd', text: 'Current working directory: "/w".' }, { name: 'team:identity', text: identity }],
+      variables: {},
+      tools: ['bash', 'orchestrator_route', 'spawn_teammate', 'team_task_update', 'wait_agent', 'send_message'].map(name => ({ name, description: name, parameters: {} })),
+    }
+    return ctx.waterfall('system-prompt/assemble', assembly, {}, () => Promise.resolve(assembly)) as Promise<Assembly>
+  }
+  const router = await assemble(main)
+  expect(router.tools.map(tool => tool.name)).toEqual(['bash', 'orchestrator_route'])
+  // No prompt text names a Team tool either: the schema-less tool and the text describing it go together.
+  expect(router.sections.map(section => section.name)).toEqual(['dsh-superagent-policy'])
+  expect(router.contexts.map(context => context.name)).toEqual(['cwd'])
+  const rendered = [...router.sections, ...router.contexts].map(entry => entry.text).join('\n')
+  for (const name of ['spawn_teammate', 'team_task_create', 'team_task_get', 'team_task_list', 'team_task_update', 'wait_agent',
+    'send_message', 'list_agents', 'interrupt_agent'])
+    expect(rendered, name).not.toContain(name)
+  expect(rendered).not.toContain('Agent Teams')
+  // A worker keeps them: only the main Session's own assembly is filtered.
+  const { sessionId } = await acceptedTicket()
+  const worker = (agents.get(sessionId)! as unknown as { ctx: Context }).ctx
+  const kept = await assemble(worker)
+  expect(kept.tools).toHaveLength(6)
+  expect(kept.sections.map(section => section.name)).toEqual(['dsh-superagent-policy', 'team:policy'])
+  expect(kept.contexts.map(context => context.name)).toEqual(['cwd', 'team:identity'])
 })
 
 it('gives an explicit ticket\'s worker a prompt without the limits of an inferred Mandate', async () => {

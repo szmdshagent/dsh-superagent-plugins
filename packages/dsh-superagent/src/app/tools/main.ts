@@ -19,7 +19,8 @@ const RoutingNoteSchema = z.string().trim()
   .describe(`Optional routing background or explicit human constraint, at most ${NOTE_WORDS} words. Never add implementation instructions or replace the original source.`)
 export interface MainToolsHost {
   readonly context: Context
-  readonly engine: Pick<EngineForMainSession, 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note'> & EngineForPeople
+  readonly engine: Pick<EngineForMainSession, 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note' | 'collab' | 'dissolveCollab'>
+    & EngineForPeople
   readonly store: Pick<Store, 'tickets' | 'triggers' | 'threads' | 'atomic' | 'replyStatus' | 'settings'>
   readonly prompts: Pick<Prompts, 'preview' | 'save'>
   readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery' | 'modelRetry'>
@@ -171,6 +172,31 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
       execute: async args => {
         const reason = host.engine.requestStatus(args.ticket_id) ? 'Asked the worker for a status report' : 'The worker is not waiting; nothing was sent'
         return routed(host, { reason, ticketId: args.ticket_id })
+      },
+    }),
+    tool({
+      name: 'orchestrator_ticket_collab',
+      description: 'Put an open ticket in a collaboration group of at most 4 tickets, with an optional role and dependencies on other tickets in the same group, so each ticket\'s ready, blocked or failed report reaches the others as a note (progress, waiting and dropped never do) and the group resource shows their state. This groups tickets only: it writes no implementation plan and grants no authority.',
+      schema: z.object({
+        ticket_id: z.string(),
+        group: z.string().describe('Group name of 1-64 characters, without spaces or slashes.'),
+        role: z.string().nullish().describe('Optional short role in the group, one line of at most 40 characters; omitted or null clears it.'),
+        depends_on: z.array(z.string()).nullish().describe('Up to 3 ticket ids of open tickets already in the same group whose results this ticket waits on; omitted or null clears them.'),
+      }).strict(),
+      execute: async args => {
+        host.engine.collab(args.ticket_id, { group: args.group, ...args.role !== undefined && args.role !== null ? { role: args.role } : {},
+          ...args.depends_on !== undefined && args.depends_on !== null ? { dependsOn: args.depends_on } : {} })
+        return routed(host, { reason: 'Collaboration group saved', ticketId: args.ticket_id })
+      },
+    }),
+    tool({
+      name: 'orchestrator_ticket_collab_dissolve',
+      description: 'Dissolve the collaboration group of a ticket, automatic or manual, so its tickets no longer share terminal reports; use it when a group is unrelated, noisy or finished. It changes no assignment or authority.',
+      schema: z.object({ ticket_id: z.string() }).strict(),
+      execute: async args => {
+        const members = host.engine.dissolveCollab(args.ticket_id)
+        return routed(host, { reason: members.length ? `Collaboration group dissolved (${members.length} tickets)` : 'No collaboration group to dissolve',
+          ticketId: args.ticket_id })
       },
     }),
     tool({

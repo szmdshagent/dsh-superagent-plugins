@@ -8,6 +8,24 @@
 
 export type CcStep = { step: number; tool?: string; detail?: string; done: boolean }
 
+/** team 计划里的一路 lane（服务端由 ccvis/guard 读文件生成）。 */
+export type TeamLaneView = {
+  lane: string
+  task?: string
+  state: 'pending' | 'running' | 'done' | 'failed'
+  ok?: boolean
+  costUsd?: number
+  turns?: number
+  error?: string
+  handoff?: boolean
+}
+
+/** team 视图：计划是否存在、有没有不合规分工、每路 lane 的状态。 */
+export type TeamView = {
+  plan?: { exists: boolean; error?: string }
+  lanes: TeamLaneView[]
+}
+
 export type CcStatus = {
   present: boolean
   state: 'none' | 'running' | 'thinking' | 'done' | 'error' | 'stalled'
@@ -21,6 +39,8 @@ export type CcStatus = {
   alert: 'none' | 'warn' | 'critical'
   alertText?: string
   error?: string
+  /** team 协作机制（cc-worker 2026-11-11）：并行 lane 的存活/完成/失败。 */
+  team?: TeamView
 }
 
 const STATE_TEXT: Record<CcStatus['state'], string> = {
@@ -39,6 +59,20 @@ const STATE_COLOR: Record<CcStatus['state'], string> = {
   done: '#38a169',
   error: '#e53e3e',
   stalled: '#dd6b20',
+}
+
+const LANE_TEXT: Record<TeamLaneView['state'], string> = {
+  pending: '等待',
+  running: '执行中',
+  done: '完成',
+  failed: '失败',
+}
+
+const LANE_COLOR: Record<TeamLaneView['state'], string> = {
+  pending: '#888',
+  running: '#38a169',
+  done: '#38a169',
+  failed: '#e53e3e',
 }
 
 /** 把毫秒压成「n 秒 / n 分钟」。 */
@@ -64,6 +98,7 @@ export function CcPanel({ status, expanded, onToggle, onInterrupt, onClear, busy
   const done = steps.filter(step => step.done).length
   const alertColor = status.alert === 'critical' ? '#e53e3e' : status.alert === 'warn' ? '#dd6b20' : undefined
   const running = status.state === 'running' || status.state === 'thinking' || status.state === 'stalled'
+  const teamLanes = status.team?.lanes ?? []
   return <div style={{ marginTop: 4, borderTop: '1px dashed var(--dt-border, #333)', paddingTop: 5, fontSize: 11,
     display: 'flex', flexDirection: 'column', gap: 4 }}>
     <div style={{ display: 'flex', gap: 5, alignItems: 'baseline', flexWrap: 'wrap' }}>
@@ -76,6 +111,29 @@ export function CcPanel({ status, expanded, onToggle, onInterrupt, onClear, busy
         {expanded ? '收起' : '展开'}
       </button>
     </div>
+    {teamLanes.length > 0 && <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+      <div style={{ opacity: 0.75 }}>
+        Team {teamLanes.length} 路：完成 {teamLanes.filter(lane => lane.state === 'done').length}
+        {teamLanes.some(lane => lane.state === 'failed') && <span style={{ color: '#e53e3e' }}>
+          ，失败 {teamLanes.filter(lane => lane.state === 'failed').length}
+        </span>}
+        {teamLanes.some(lane => lane.state === 'running') && <span style={{ color: '#38a169' }}>
+          ，执行中 {teamLanes.filter(lane => lane.state === 'running').length}
+        </span>}
+      </div>
+      {expanded && teamLanes.map(lane => (
+        <div key={lane.lane} style={{ display: 'flex', gap: 5, alignItems: 'baseline', flexWrap: 'wrap' }}>
+          <span style={{ color: LANE_COLOR[lane.state], fontWeight: 600, minWidth: 42 }}>{lane.lane}</span>
+          <span style={{ color: LANE_COLOR[lane.state] }}>{LANE_TEXT[lane.state]}</span>
+          {lane.task && <span style={{ opacity: 0.7, wordBreak: 'break-all' }}>{lane.task.slice(0, 100)}</span>}
+          {lane.turns !== undefined && <span style={{ opacity: 0.55 }}>{lane.turns} 轮</span>}
+          {lane.costUsd !== undefined && <span style={{ opacity: 0.55 }}>${lane.costUsd.toFixed(2)}</span>}
+          {lane.handoff && <span style={{ opacity: 0.55 }}>已交接</span>}
+          {lane.error && <span style={{ color: '#e53e3e', wordBreak: 'break-all' }}>{lane.error.slice(0, 100)}</span>}
+        </div>
+      ))}
+      {status.team?.plan?.error && <div style={{ color: '#dd6b20' }}>team 计划解析失败：{status.team.plan.error}</div>}
+    </div>}
     {status.current && running && <div style={{ opacity: 0.85, fontFamily: 'monospace', wordBreak: 'break-all' }}>
       {status.current.tool}{status.current.detail ? `：${status.current.detail.slice(0, 120)}` : ''}
     </div>}

@@ -7,6 +7,7 @@
  */
 import type { Context } from '@deepseek-ai/cordis'
 import { randomUUID } from 'node:crypto'
+import { readFileSync } from 'node:fs'
 import { z } from 'zod'
 import { key, type Trigger } from 'dsh-superagent'
 import { readCcStatus, requestInterrupt, clearInterrupt, probeExecutor } from './ccvis.ts'
@@ -24,8 +25,20 @@ declare module '@deepseek-ai/cordis' {
       readonly sources: { register(kind: unknown): () => void }
       /** 主 Session 的会话 id（Runtime 公开字段），自愈用。 */
       readonly masterId?: string
-      /** 宿主 Store 的工单集合（Runtime 公开字段），自愈时取活跃工单的 worker 会话。 */
-      readonly store?: { readonly tickets?: { open?: () => readonly { sessionId?: string }[] } }
+      /** 引擎（Runtime 公开字段）；搁浅消息自愈用 `reevaluate` 重新入队。 */
+      readonly engine?: { reevaluate(triggerId: string): boolean }
+      /** 宿主 Store（Runtime 公开字段），自愈与分流判断用。 */
+      readonly store?: {
+        readonly tickets?: {
+          open?: () => readonly { id?: string; sessionId?: string; ended?: unknown }[]
+          get?(id: string): any
+        }
+        readonly threads?: { get?(key: string): any }
+        readonly triggers?: {
+          get?(id: string): any
+          disposition?(id: string): any
+        }
+      }
       context(kind: { kind: string; health: readonly string[] }): {
         receive(trigger: Trigger): string | Promise<string>
         report(entry: string, health: { state: string; detail: string }): void
@@ -33,6 +46,7 @@ declare module '@deepseek-ai/cordis' {
         state: {
           get<V>(key: any): V | undefined
           set<V>(key: any, value: V | undefined): void
+          keys(prefix: string): string[]
         }
       }
     }
@@ -83,9 +97,17 @@ const SessionIdSchema = z.string().regex(/^[A-Za-z0-9_-]+$/)
  * 对话模式刻意走「影子线程」`<对话>~chat`：引擎的 gate 规定「线程有自己的工单时，一律消息归该工单」
  * （followup 分支先于准入表生效），所以只要还在原线程上，对话消息就会被排进运行中工单的队列、router 收不到。
  * 影子线程永不被工单订阅，router 任何时刻都能立刻接话；回复经 channel 地址仍回落到原对话显示。
+ *
+ * 派活模式**只在会话线程上的工单已卡死（zombie，永远接不了手）时**才走一条子线程（`<对话>~d<base36>`，
+ * 由调用方通过 `options.thread` 指定）：死工单仍占着订阅，fanout 会把消息并进去，而 intake 又因为
+ * followupOwners 非空永不排 Eval，这条消息就永远搁浅（2026-11-03 的 897f223d… 即此）。子线程上没有订阅者，
+ * 消息会进 Eval 由主 Session 分诊（可 attach 也可新建工单）。健康/待命的工单不触发改投：它对运行中工单的
+ * 正常跟进必须留在原线程，交给该工单的 worker 处理，否则会另起新工单、原工单永远收不到跟进。
+ * 无论走哪条线程，`channel` 始终指回原会话，回复仍显示在原对话里。
  */
-export function paneTrigger(conversation: string, text: string, sender: string = OWNER, mode: 'dispatch' | 'chat' = 'dispatch'): Trigger {
-  const thread = mode === 'chat' ? `${conversation}~chat` : conversation
+export function paneTrigger(conversation: string, text: string, sender: string = OWNER, mode: 'dispatch' | 'chat' = 'dispatch',
+  options: { thread?: string } = {}): Trigger {
+  const thread = options.thread ?? (mode === 'chat' ? `${conversation}~chat` : conversation)
   return {
     id: key('pane', thread, randomUUID()),
     source: SOURCE,
@@ -329,18 +351,47 @@ function findTicket(ctx: any, ticketId: string): any {
   return undefined
 }
 
-/** 找该对话线程上挂着僵尸 Assignment 的工单；没有则返回 undefined。 */
-async function zombieOnThread(ctx: any, conversation: string): Promise<{ ticketId: string; detail?: string } | undefined> {
+/**
+ * 会话线程上仍占着订阅、但已经卡死（zombie）的工单。
+ *
+ * 引擎 intake 会对线程上每个订阅工单 fanout，model.ts 的 followupOwners 又把「仍存活且非 context」的接收者
+ * 当成裁决者，于是消息不进 Eval。健康工单的 worker 还能处理，消息应照常并进去；只有 zombie 工单是「占着
+ * 订阅却永远接不了手」，必须把派活消息改走子线程，否则会被并进死工单、永久搁浅
+ * （2026-11-03 的 897f223d… 即此：worker 读了不接，工单又一直没结束）。
+ */
+async function zombieTicketsOnThread(ctx: any, conversation: string): Promise<{ ticketId: string; detail?: string }[]> {
   const threadKey = `${SOURCE}:${conversation}`
+  const found: { ticketId: string; detail?: string }[] = []
   try {
-    for (const ticket of ctx.orchestrator?.store?.tickets?.open?.() ?? []) {
-      const threads: any[] = Array.isArray(ticket?.threads) ? ticket.threads : []
-      if (!threads.some(entry => entry?.key === threadKey)) continue
+    const thread = ctx.orchestrator?.store?.threads?.get?.(threadKey)
+    const subscriptions: string[] = Array.isArray(thread?.subscriptions) ? thread.subscriptions : []
+    const context: string[] = Array.isArray(thread?.context) ? thread.context : []
+    for (const id of subscriptions) {
+      if (context.includes(id)) continue
+      const ticket = ctx.orchestrator?.store?.tickets?.get?.(id)
+      if (!ticket || ticket.ended) continue
       const health = ticketHealth(ticket, Date.now(), await collectExecutorSignals(ctx, ticket))
-      if (health.health === 'zombie') return { ticketId: String(ticket.id), detail: health.detail }
+      if (health.health !== 'zombie') continue
+      found.push({ ticketId: String(id), ...health.detail ? { detail: health.detail } : {} })
     }
-  } catch { /* 宿主内部变动：当作没有僵尸，按原路投递 */ }
-  return undefined
+  } catch { /* 宿主内部变动：按没有僵尸处理，保持原线程投递 */ }
+  return found
+}
+
+/**
+ * 派活消息是否需要改投子线程：**只有会话线程上存在 zombie 工单时**才改投。
+ * 健康/待命的工单仍按原样接管消息（它的 worker 会处理），不能被绕开成新工单。
+ * 子线程键 `<对话>~d<base36 时间戳>`：与 chat 的影子线程共享「永不被工单订阅」的性质，但保留派活的 explicit
+ * 语义，由主 Session 经 Eval 分诊。用毫秒时间戳转 base36 而不是 HHMMSS，避免同一秒内的第二条消息落进已经被
+ * 新工单订阅的子线程、再次被吞。对话名 schema 不允许 `~`，所以不会与用户自己的对话冲突。
+ */
+async function divertDispatch(ctx: any, conversation: string): Promise<{ thread: string; reason: string } | undefined> {
+  const zombies = await zombieTicketsOnThread(ctx, conversation)
+  if (!zombies.length) return undefined
+  const thread = `${conversation}~d${Date.now().toString(36)}`
+  const first = zombies[0]!
+  const reason = `该对话的工单 ${first.ticketId} 已卡死（${first.detail ?? '无执行活动'}），消息改由路由器分诊，不会投进这个死工单`
+  return { thread, reason }
 }
 
 /**
@@ -360,28 +411,20 @@ function paneHandler(ctx: any) {
       if (req.method === 'POST' && url.pathname === '/orchestrator/api/pane/message') {
         const body = z.object({ conversation: ConversationSchema, text: TextSchema,
           mode: z.enum(['dispatch', 'chat']).default('dispatch') }).parse(await readJson(req))
-        // 防陷：该对话的线程上若挂着僵尸 Assignment，消息投进去会永远出不来。
-        // 这时自动改投到一个新线程，让它成为独立工单，并把原因如实告诉调用方。
-        let conversation = body.conversation
-        let rerouted: string | undefined
-        if (body.mode === 'dispatch') {
-          const zombie = await zombieOnThread(ctx, conversation)
-          if (zombie) {
-            const stamp = new Date().toTimeString().slice(0, 5).replace(':', '')
-            conversation = `${body.conversation.replace(/[^A-Za-z0-9_-]/g, '')}-r${stamp}`
-            rerouted = zombie.detail
-            ;(ctx as any).logger?.warn?.('dsh-superagent-pane: 线程 %s 挂着僵尸工单 %s，已改投新线程 %s',
-              body.conversation, zombie.ticketId, conversation)
-          }
-        }
+        // 防陷：该对话线程上的工单若已卡死（zombie），它仍占着订阅却永远接不了手，派活消息会被并进去、
+        // 永久搁浅。这时改投一条派活子线程 `<对话>~d<base36>`：那里没有订阅者，消息走 Eval 由主 Session
+        // 分诊；回复仍回落到原对话。健康工单不改投——跟进本就该交给它的 worker，绕开只会另起新工单。
+        const conversation = body.conversation
+        const diverted = body.mode === 'dispatch' ? await divertDispatch(ctx, conversation) : undefined
         // 投递前先手解档：跟进可能唤醒已结束的工单，而它的 worker 会话可能已被收尾归档
         // （被归档的会话跑不了回合，投递只会秒 blocked、消息丢失）。详见 wakeThreadSessions。
         await wakeThreadSessions(ctx, conversation)
-        const trigger = paneTrigger(conversation, body.text, OWNER, body.mode)
+        const trigger = paneTrigger(conversation, body.text, OWNER, body.mode,
+          diverted ? { thread: diverted.thread } : {})
         appendLog(source, conversation, { id: trigger.id, direction: 'in', at: trigger.at, text: trigger.text, mode: body.mode })
         const received = await source.receive(trigger)
-        sendJson(res, 200, { triggerId: trigger.id, thread: `${SOURCE}:${conversation}`, received,
-          ...(rerouted ? { rerouted, originalConversation: body.conversation, conversation } : {}) })
+        sendJson(res, 200, { triggerId: trigger.id, thread: `${SOURCE}:${trigger.threads[0]!.id}`, received,
+          ...(diverted ? { diverted: diverted.reason } : {}) })
         return
       }
       // GET /orchestrator/api/pane/activity/<会话 id> —— worker 当前在做什么。
@@ -390,6 +433,22 @@ function paneHandler(ctx: any) {
         const sessionId = SessionIdSchema.parse(activityMatch[1])
         const activity = await readActivity(ctx.sessionPersistence, sessionId)
         sendJson(res, 200, { sessionId, activity })
+        return
+      }
+      // GET /orchestrator/api/pane/conversations —— 面板下拉切换用的对话清单：
+      // 本插件记录过的对话（KV 前缀 `pane-log:`），按最后一条消息时间倒序，最多 50 条。
+      if (req.method === 'GET' && url.pathname === '/orchestrator/api/pane/conversations') {
+        const conversations: { name: string; count: number; lastAt: string }[] = []
+        for (const key of source.state.keys('pane-log:')) {
+          const name = String(key).slice('pane-log:'.length)
+          if (!/^[A-Za-z0-9_-]+$/.test(name)) continue
+          const entries: LogEntry[] = source.state.get(logKey(name)) ?? []
+          if (!entries.length) continue
+          const last = entries[entries.length - 1]!
+          conversations.push({ name, count: entries.length, lastAt: last.at })
+        }
+        conversations.sort((a, b) => Date.parse(b.lastAt) - Date.parse(a.lastAt))
+        sendJson(res, 200, { conversations: conversations.slice(0, 50) })
         return
       }
       // GET /orchestrator/api/pane/log/<对话> —— 面板渲染用的对话流。
@@ -463,6 +522,20 @@ function paneHandler(ctx: any) {
 /** 自愈检查间隔；一次只是内存数组查找，代价可忽略。 */
 const UNARCHIVE_SWEEP_MS = 30_000
 
+/** 搁浅消息自愈：检查间隔、工单「失去接手能力」多久内才重投、pane-log 最长回溯、每轮上限、每轮最多扫多少个对话。 */
+const STRANDED_SWEEP_MS = 30_000
+/**
+ * 重投窗口的基准是「占用它的工单失去接手能力的时间」（工单 ended.at，或僵尸工单的当前时间），
+ * **不是消息发送时间**。旧实现按 `entry.at` 算窗口，导致「消息发出很久、但工单刚刚才结束/卡死」的消息
+ * 永远进不了窗口——这正是 897f223d… 永久丢失的原因（发送于 16:32，工单次日 03:20 才结束）。
+ */
+const STRANDED_WINDOW_MS = 60 * 60_000
+/** pane-log 条目的最长回溯：发送时间解析不出来、或早于这个年龄的条目不参与自愈。 */
+const STRANDED_MAX_AGE_MS = 7 * 24 * 60 * 60_000
+const STRANDED_MAX_PER_SWEEP = 3
+const STRANDED_LOG_SCAN = 100
+const STRANDED_RECOVERED_TEXT = '这条消息之前被并进了运行中的工单但一直没被接手，已重新交给路由器分诊。'
+
 /** 需要保护的会话：主 Session + 所有活跃工单的 worker 会话（都被归档过就一定有东西停摆）。 */
 function protectedSessions(ctx: any): string[] {
   const ids: string[] = []
@@ -506,7 +579,21 @@ async function wakeThreadSessions(ctx: any, conversation: string): Promise<void>
     const archived: readonly string[] = registry?.archivedSessionIds ?? []
     if (!archived.length) return
     const threadKey = `${SOURCE}:${conversation}`
+    // 工单与线程的关联按可靠性分三路匹配：
+    // 1) origin.triggerId 指向的 Trigger 的 threads（intake 归线程的真正依据；ThreadRef[]
+    //    拼成 `${source}:${id}` 即线程键）——主路；
+    // 2) ticket.follows[].thread（Source 让工单跟随的线程，如 PR 的生命周期；pane 工单一般为空）；
+    // 3) ticket.threads[].key（仅视图层有这个形状，宿主 store 里没有；防御式兼容）。
+    const triggersRepo = ctx.orchestrator?.store?.triggers
+    const triggerMatches = (ticket: any): boolean => {
+      const triggerId = ticket?.origin?.triggerId
+      if (!triggerId || typeof triggersRepo?.get !== 'function') return false
+      const trigger = triggersRepo.get(triggerId)
+      const refs: any[] = Array.isArray(trigger?.threads) ? trigger.threads : []
+      return refs.some(ref => `${ref?.source}:${ref?.id}` === threadKey)
+    }
     const followsThread = (ticket: any): boolean => {
+      if (triggerMatches(ticket)) return true
       const follows: any[] = Array.isArray(ticket?.follows) ? ticket.follows : []
       if (follows.some(entry => entry?.thread === threadKey)) return true
       const threads: any[] = Array.isArray(ticket?.threads) ? ticket.threads : []
@@ -529,6 +616,141 @@ async function wakeThreadSessions(ctx: any, conversation: string): Promise<void>
   } catch { /* 解档失败不阻断投递；若回合仍被归档门禁拒掉，自愈扫描与日志可见 */ }
 }
 
+/**
+ * 搁浅消息自愈：把「并进了工单、但工单已结束/卡死、worker 从未接手」的派活消息重新交给路由器。
+ *
+ * 触发条件仅为 disposition 中有 fanout、无 evalId/decisionId/requeued/acked，且 fanout 里所有工单都已结束或被
+ * 判定为 zombie。只要还有一张工单存活且非 zombie，就跳过：它仍可能接手，提前重投会制造重复工单。
+ * `reevaluate` 会把 trigger 标记 requeued，followupOwners 因此返回空，主 Session 的 accept 不会再被
+ * workerDecides 挡住（core/part.ts）。每轮最多处理 3 条，任何单条失败都不影响其它条目。
+ *
+ * 窗口按「工单失去接手能力的时间」算：`latestLostAt` = 各 fanout 工单里最晚的那个时刻（已 ended 取
+ * `ended.at`，僵尸工单取当前时间）。只有它落在最近 `STRANDED_WINDOW_MS` 内才重投——这样工单刚结束的消息
+ * 能被救回，而重启时不会把几小时前甚至几天前的死消息一次性全部重投。消息本身的发送时间只用来做
+ * `STRANDED_MAX_AGE_MS` 的兜底回溯上限。
+ */
+async function recoverStranded(ctx: any): Promise<void> {
+  const source = liveSource
+  const store = ctx.orchestrator?.store
+  const engine = ctx.orchestrator?.engine
+  if (!source?.state?.keys || typeof store?.triggers?.get !== 'function'
+    || typeof store?.triggers?.disposition !== 'function' || typeof engine?.reevaluate !== 'function') return
+  const tickets = store.tickets
+  const now = Date.now()
+  const cutoff = now - STRANDED_WINDOW_MS
+  const oldest = now - STRANDED_MAX_AGE_MS
+  let handled = 0
+  const keys: string[] = [...(source.state.keys('pane-log:') ?? [])].slice(-STRANDED_LOG_SCAN)
+  for (const logKeyValue of keys) {
+    if (handled >= STRANDED_MAX_PER_SWEEP) break
+    const entries: LogEntry[] = source.state.get(logKeyValue) ?? []
+    for (let index = entries.length - 1; index >= 0 && handled < STRANDED_MAX_PER_SWEEP; index--) {
+      const entry = entries[index]!
+      try {
+        if (entry.direction !== 'in' || entry.mode !== 'dispatch') continue
+        // 消息自身的发送时间只做兜底回溯上限（太老的 pane-log 条目连 disposition 都不必读）。
+        const sentAt = entry.at ? Date.parse(entry.at) : Number.NaN
+        if (!Number.isFinite(sentAt) || sentAt < oldest) continue
+        const trigger = store.triggers.get(entry.id)
+        if (!trigger) continue
+        const disposition = store.triggers.disposition(entry.id)
+        if (!disposition || disposition.evalId || disposition.decisionId || disposition.requeued || disposition.acked?.length) continue
+        const fanout: string[] = Array.isArray(disposition.fanout) ? disposition.fanout : []
+        if (!fanout.length) continue
+        // 每个接收工单都已明确交回：handback 时引擎已把它排进 Eval，别再重复入队。
+        const returned: string[] = (disposition.handbacks ?? []).map((item: any) => String(item?.ticketId ?? ''))
+        if (fanout.every(id => returned.includes(id))) continue
+        // 只要有一张工单仍存活且不是 zombie，就留给它接手；全部已结束/卡死才算永久搁浅。
+        // 同时记录「最晚失去接手能力的时刻」：已结束取 ended.at，僵尸工单按当前时间（它此刻仍接不了手）。
+        let viable = false
+        let latestLostAt = Number.NEGATIVE_INFINITY
+        for (const ticketId of fanout) {
+          const ticket = tickets?.get?.(ticketId)
+          if (!ticket) continue
+          if (ticket.ended) {
+            const endedAt = Date.parse(String(ticket.ended.at ?? ''))
+            if (Number.isFinite(endedAt)) latestLostAt = Math.max(latestLostAt, endedAt)
+            continue
+          }
+          const health = ticketHealth(ticket, now, await collectExecutorSignals(ctx, ticket))
+          if (health.health !== 'zombie') { viable = true; break }
+          latestLostAt = Math.max(latestLostAt, now)
+        }
+        if (viable) continue
+        // 窗口基准是「工单变得接不了手的时间」，不是消息发送时间（见 STRANDED_WINDOW_MS 注释）：
+        // 工单刚结束/刚卡死就重投；几小时前就已成定局的，等下次再说，避免重启时批量重投陈年消息。
+        if (!(latestLostAt >= cutoff)) continue
+        handled += 1
+        if (engine.reevaluate(entry.id) !== true) continue
+        // 提示写回用户看得见的原对话：分流消息在 `~d` 子线程里，但 trigger.channel 始终指回原会话。
+        const address = trigger.channel?.address?.conversation
+        const conversation = typeof address === 'string' && address ? address : logKeyValue.slice('pane-log:'.length)
+        appendLog(source, conversation, {
+          id: `recovered:${entry.id}`, direction: 'out', at: new Date().toISOString(),
+          text: STRANDED_RECOVERED_TEXT, kind: 'recovered',
+        })
+        ;(ctx as any).logger?.info?.('dsh-superagent-pane: 已重新入队搁浅消息 %s（对话 %s）', entry.id, conversation)
+      } catch (error) {
+        ;(ctx as any).logger?.warn?.('dsh-superagent-pane: 搁浅消息检查失败 %s', String(error))
+      }
+    }
+  }
+}
+
+/**
+ * 读 /proc/meminfo（可选 /proc/loadavg），算面板小部件要的内存指标。
+ *
+ * 口径与 mem-watch.py、云厂商监控一致：usage_pct = (MemTotal - MemAvailable) / MemTotal * 100。
+ * 与 `free` 的 used 不同——`free` 扣掉了可回收的 SReclaimable，数值会偏低。
+ * 只读、无副作用；任何读取失败由调用方兜成 500 JSON。
+ */
+function readSysMem(): {
+  mem_total_mb: number
+  mem_available_mb: number
+  usage_pct: number
+  swap_pct: number | null
+  load1: number | null
+} {
+  const fields: Record<string, number> = {}
+  for (const line of readFileSync('/proc/meminfo', 'utf8').split('\n')) {
+    const at = line.indexOf(':')
+    if (at < 0) continue
+    const value = Number.parseFloat(line.slice(at + 1).trim())
+    if (Number.isFinite(value)) fields[line.slice(0, at).trim()] = value
+  }
+  const total = fields.MemTotal ?? 0
+  const available = fields.MemAvailable ?? 0
+  const swapTotal = fields.SwapTotal ?? 0
+  const swapFree = fields.SwapFree ?? 0
+  const round1 = (n: number) => Math.round(n * 10) / 10
+  let load1: number | null = null
+  try {
+    const parsed = Number.parseFloat(readFileSync('/proc/loadavg', 'utf8').trim().split(/\s+/)[0] ?? '')
+    if (Number.isFinite(parsed)) load1 = parsed
+  } catch { /* loadavg 读不到不影响内存指标 */ }
+  return {
+    mem_total_mb: round1(total / 1024),
+    mem_available_mb: round1(available / 1024),
+    usage_pct: total > 0 ? round1(((total - available) / total) * 100) : 0,
+    swap_pct: swapTotal > 0 ? round1(((swapTotal - swapFree) / swapTotal) * 100) : null,
+    load1,
+  }
+}
+
+/** GET /api/sys-mem —— 只读；失败也回 JSON，不把异常抛到宿主。 */
+const sysMemHandler = (req: any, res: any): void => {
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    res.setHeader('allow', 'GET, HEAD')
+    sendJson(res, 405, { error: 'Method not allowed' })
+    return
+  }
+  try {
+    sendJson(res, 200, readSysMem())
+  } catch (error) {
+    sendJson(res, 500, { error: `无法读取 /proc/meminfo: ${String(error)}` })
+  }
+}
+
 export function apply(ctx: Context): void {
   // 先注册 kind：sources.register() 会重新认领 `pane` 健康项并重置为 `starting`，所以下面的上报必须排在后面，
   // 否则会被覆盖。
@@ -548,6 +770,14 @@ export function apply(ctx: Context): void {
     path: '/orchestrator/api/pane',
     handler: paneHandler(ctx),
   }), 'pane: dispatch route')
+  // 面板小部件用的只读系统指标（内存/swap/load）。做 exact 路由：WebServer 先查精确表再走前缀，
+  // 所以能抢在 client-connection 的 `/api` 前缀（RPC 网关、对无 cookie 请求回 401）之前命中。
+  // 鉴权沿用页面 cookie：网关未登录时根本不会走到这里；这里不额外校验自定义头，便于同源 fetch 直接取。
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: '/api/sys-mem',
+    handler: sysMemHandler,
+  }), 'pane: sys-mem route')
   // 自愈：启动时扫一次，之后每 30 秒一次；被归档的 orchestrator/worker 会话自动恢复。
   ctx.effect(() => {
     let busy = false
@@ -562,4 +792,18 @@ export function apply(ctx: Context): void {
     const timer = setInterval(sweep, UNARCHIVE_SWEEP_MS)
     return () => { clearTimeout(boot); clearInterval(timer) }
   }, 'pane: unarchive self-heal')
+  // 搁浅消息自愈：启动后先扫一次，之后每 30 秒一次；只处理最近一小时内的派活消息，每轮最多 3 条。
+  ctx.effect(() => {
+    let busy = false
+    const sweep = () => {
+      if (busy) return
+      busy = true
+      void recoverStranded(ctx).catch(error => {
+        ;(ctx as any).logger?.warn?.('dsh-superagent-pane: 搁浅消息自愈检查失败 %s', String(error))
+      }).finally(() => { busy = false })
+    }
+    const boot = setTimeout(sweep, 0)
+    const timer = setInterval(sweep, STRANDED_SWEEP_MS)
+    return () => { clearTimeout(boot); clearInterval(timer) }
+  }, 'pane: stranded recovery')
 }

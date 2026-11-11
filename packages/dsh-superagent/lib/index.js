@@ -23,6 +23,11 @@ const USER_ERRORS = {
 	unknownPromptRevision: ["missing", "Unknown prompt revision {revision}"],
 	unknownPromptPart: ["refused", "Unknown built-in prompt part {part}"],
 	ticketEnded: ["refused", "Ticket has ended"],
+	collabGroupInvalid: ["refused", "A collaboration group needs a name of 1-64 characters without spaces or slashes"],
+	collabRoleInvalid: ["refused", "A collaboration role must be a single line of at most 40 characters"],
+	collabGroupFull: ["refused", "A collaboration group holds at most 4 tickets"],
+	collabDependency: ["refused", "A dependency must name another open ticket in the same collaboration group"],
+	collabCycle: ["refused", "Those dependencies would close a cycle in the collaboration group"],
 	assignmentEnded: ["refused", "Assignment has ended; a newer assignment owns this ticket"],
 	evalFinished: ["refused", "Eval {eval} has finished or a later eval replaced it; decide the trigger's current eval"],
 	notAdmissible: ["refused", "Trigger is not admissible: {reason}"],
@@ -186,6 +191,369 @@ var EnginePart = class {
 	}
 };
 //#endregion
+//#region src/core/results.ts
+/** 每张卡的展示字符上限，按中文约 1 token/字符留出余量，保证卡片本身不超过 300 token。 */
+const CONCLUSION_CHARS = 140;
+const TITLE_CHARS = 80;
+const ARTIFACTS = 4;
+const NUMBERS = 4;
+const ARTIFACT_CHARS = 80;
+const KEY_CHARS = 120;
+/** 结果卡注入时最多带 3 张，避免把新工单的首次上下文撑大。 */
+const RESULT_CARDS = 3;
+/** 生成索引时最多保留的键数；键只用于确定性匹配，不进入投递文本。 */
+const KEYS = 16;
+/** 像仓库内文件路径的片段，必须带扩展名，避免把普通句子里的斜杠词当成产物。 */
+const PATH = /(?:\.{0,2}\/)?(?:[A-Za-z0-9_@.+-]+\/)+[A-Za-z0-9_@.+-]+\.[A-Za-z0-9]{1,10}\b/g;
+/** 不带目录的产物文件名。 */
+const FILE = /\b[A-Za-z0-9_@.-]+\.(?:ts|tsx|js|jsx|mjs|cjs|json|md|py|rs|go|java|kt|kts|rb|yaml|yml|toml|css|scss|html|sql|csv|txt|sh|zip|log|svg|png|jpe?g)\b/gi;
+/** GitHub URL 中的仓库键 `owner/repo`。 */
+const REPO = /(?:https?:\/\/)?(?:[\w-]+\.)?github\.com\/([\w.-]+)\/([\w.-]+)/gi;
+const NUMBER = /(?<![\w.])[-+]?\d[\d,]*(?:\.\d+)?\s?(?:%|ms|s|m|h|kb|mb|gb|k|m|x)?/gi;
+/** 这些路径是编排器资源名，不是仓库产物。 */
+const RESOURCE_PREFIXES = [
+	"ticket/",
+	"trigger/",
+	"decision/",
+	"thread/",
+	"group/",
+	"settings/",
+	"prompts/",
+	"event/",
+	"task/",
+	"observation/"
+];
+/** 这些目录或文件名过于常见，只保留完整路径键，不用裸文件名匹配。 */
+const GENERIC = /* @__PURE__ */ new Set([
+	"src",
+	"lib",
+	"app",
+	"test",
+	"tests",
+	"core",
+	"dist",
+	"build",
+	"node_modules",
+	"index",
+	"readme",
+	"license",
+	"package",
+	"package-lock",
+	"pnpm-lock",
+	"tsconfig",
+	"jsconfig",
+	"vitest.config",
+	"tsdown.config"
+]);
+/** 通用产物文件名：只出现在裸文件名位置时不足以证明两张工单同域（README.md、package.json、index.ts 等）。 */
+const GENERIC_FILES = /* @__PURE__ */ new Set([
+	"package.json",
+	"package-lock.json",
+	"pnpm-lock.yaml",
+	"yarn.lock",
+	"bun.lockb",
+	"readme.md",
+	"readme.txt",
+	"readme",
+	"license",
+	"license.md",
+	"changelog.md",
+	"contributing.md",
+	"tsconfig.json",
+	"jsconfig.json",
+	"vitest.config.ts",
+	"tsdown.config.ts",
+	"index.ts",
+	"index.tsx",
+	"index.js",
+	"index.jsx",
+	"index.mjs",
+	"index.cjs",
+	"dockerfile",
+	"makefile",
+	".gitignore",
+	".npmrc",
+	".editorconfig"
+]);
+/** GitHub repo 键的前缀：注入结果卡时 repo 级相同不够，还要同目录/模块或显式引用。 */
+const REPO_KEY = "repo:";
+const collapse = (text) => text.replace(/\s+/g, " ").trim();
+const unique$1 = (values) => [...new Set(values.filter(Boolean))];
+/** 归一化一条路径，去掉引号包裹、开头的 `./` 和结尾标点。 */
+function normalizePath(value) {
+	return value.replace(/^["'`(<[]+|[)"'`>\],.;:]+$/g, "").replace(/^\.\//, "").replace(/\\/g, "/").replace(/[),;:]+$/, "");
+}
+/** 从文本里截取仓库路径和裸文件名；跳过 URL、资源名和 node_modules。 */
+function artifactPaths(text) {
+	const matches = [...text.matchAll(PATH)];
+	const ranges = matches.map((match) => [match.index, match.index + match[0].length]);
+	const found = matches.map((match) => normalizePath(match[0]));
+	for (const match of text.matchAll(FILE)) {
+		const start = match.index, end = start + match[0].length;
+		if (ranges.some(([from, to]) => start >= from && end <= to)) continue;
+		found.push(normalizePath(match[0]));
+	}
+	return unique$1(found.filter((path) => path.length >= 5 && path.length <= 200 && !path.includes("://") && !path.startsWith("github.com/") && !path.includes("..") && !path.startsWith("#") && !path.includes("node_modules") && !RESOURCE_PREFIXES.some((prefix) => path.startsWith(prefix)))).slice(0, ARTIFACTS);
+}
+/** 裸文件名是否是通用产物名；带目录的路径不算通用，仍能证明某个具体文件。 */
+function isGenericPath(path) {
+	const normalizedPath = normalizePath(path);
+	if (normalizedPath.includes("/")) return false;
+	const base = normalizedPath.toLowerCase();
+	const stem = base.replace(/\.[^.]+$/, "");
+	return GENERIC_FILES.has(base) || GENERIC.has(base) || GENERIC.has(stem);
+}
+/** 路径带来的模块键：完整路径、裸文件名（非通用名）和目录；通用裸文件名不产生任何键。 */
+function artifactKeys(path) {
+	if (isGenericPath(path)) return [];
+	const keys = [path];
+	const slash = path.lastIndexOf("/");
+	const base = slash < 0 ? path : path.slice(slash + 1);
+	const stem = base.replace(/\.[^.]+$/, "").toLowerCase();
+	if (slash > 0 && !GENERIC.has(stem) && !isGenericPath(base)) keys.push(base);
+	if (slash > 0) {
+		const directory = path.slice(0, slash);
+		const last = directory.split("/").at(-1).toLowerCase();
+		if (directory.length >= 4 && (directory.includes("/") || !GENERIC.has(last))) keys.push(directory);
+	}
+	return keys;
+}
+/** 目录/完整文件路径键；`repo:` 前缀的仓库键不算模块级证据。 */
+const isModuleKey = (key) => !key.startsWith("repo:") && key.includes("/");
+/**
+* 从一段文本提取匹配键：GitHub repo、产物完整路径、非通用文件名和模块目录。
+* 只用确定性词法，不做相似度、不调 LLM；宁可少匹配，避免把无关工单的结论注入新单。
+*/
+function domainKeys(text) {
+	const keys = artifactPaths(text).flatMap(artifactKeys);
+	for (const match of text.matchAll(REPO)) {
+		const [owner, repo] = [match[1], match[2]];
+		keys.push(`${REPO_KEY}${owner}/${repo}`);
+		if (repo.length >= 4 && !GENERIC.has(repo.toLowerCase())) keys.push(repo);
+	}
+	return unique$1(keys.map((key) => key.toLowerCase()).filter((key) => key.length >= 4 && key.length <= KEY_CHARS)).slice(0, KEYS);
+}
+/** 一句话结论：第一行、去掉列表符号，截到第一个句末标点或字符上限。 */
+function conclusion(summary) {
+	const line = summary.split(/\r?\n/).map((part) => part.replace(/^[\s>*#-]+/, "").trim()).find(Boolean) ?? "";
+	const sentence = line.match(/^.*?(?:[。！？!?]|\.(?=\s|$))/)?.[0] ?? line;
+	return collapse(sentence).slice(0, CONCLUSION_CHARS);
+}
+/** 关键数字：从报告中提取去重后的百分比、计数和时间，最多 4 个。 */
+function numbers(summary) {
+	return unique$1([...summary.matchAll(NUMBER)].map((match) => collapse(match[0]))).slice(0, NUMBERS);
+}
+/**
+* 从一张 ready 报告生成结果卡。只截取报告文本与其中出现的产物路径，不读会话、不调用模型；
+* `keys` 是同一份文本的确定性索引键，供 `matchResultCards` 使用。
+*/
+function resultCard(ticket, report) {
+	const artifacts = artifactPaths(report.summary);
+	return {
+		ticketId: ticket.id,
+		title: collapse(ticket.title).slice(0, TITLE_CHARS),
+		conclusion: conclusion(report.summary),
+		artifacts: artifacts.map((path) => path.slice(0, ARTIFACT_CHARS)),
+		numbers: numbers(report.summary),
+		at: report.at,
+		keys: domainKeys(report.summary)
+	};
+}
+/** 查询里是否显式引用了这张卡片的工单 id（完整 id 或其 8 位前缀）。 */
+function referencesCard(query, ticketId) {
+	const text = query.toLowerCase(), id = ticketId.toLowerCase();
+	return id.length >= 8 && (text.includes(id) || text.includes(id.slice(0, 8)));
+}
+/**
+* 命中同域结果卡：必须共享模块级键（带目录的完整路径或目录），或查询显式引用了该工单 id。
+* 通用裸文件名（package.json、README.md、index.ts 等）与仅同 repo 的 GitHub 键都不足以注入。
+*/
+function matchResultCards(tickets, query, limit = 3) {
+	const wanted = new Set(domainKeys(query));
+	return tickets.flatMap((ticket) => {
+		if (!ticket.result) return [];
+		return ticket.result.keys.some((key) => isModuleKey(key) && wanted.has(key)) || referencesCard(query, ticket.id) ? [ticket.result] : [];
+	}).sort((a, b) => b.at.localeCompare(a.at)).slice(0, limit);
+}
+/** 把结果卡排成一条 note：结论、产物、关键数字和只读入口；不包含完整报告。 */
+function resultCardNote(cards) {
+	return `Result cards from ready same-domain tickets (context only; read the linked ticket before reusing):\n${cards.map((card) => {
+		const parts = [`- ${card.ticketId} (${card.at.slice(0, 16)}): ${card.title}`];
+		if (card.conclusion) parts.push(`  ${card.conclusion}`);
+		if (card.artifacts.length) parts.push(`  paths: ${card.artifacts.join(", ")}`);
+		if (card.numbers.length) parts.push(`  numbers: ${card.numbers.join(", ")}`);
+		parts.push(`  read: ticket/${card.ticketId}/result`);
+		return parts.join("\n");
+	}).join("\n")}`;
+}
+/** 自动组存活时间；到期后由 Engine 的时钟回收。 */
+const AUTO_GROUP_TTL_MS = 72e5;
+/** 写域 Jaccard 达到该值才计 0.40 分（报告里 ≥0.25 得到 6 组）。 */
+const DOMAIN_MIN = .25;
+/** 自动成组阈值；0.15–0.30 是留给灰度 LLM 的区间，默认不动作。 */
+const SCORE_THRESHOLD = .3;
+/** 灰度带下界：当前只记录信号、不成组。 */
+const GRAY_LOW = .15;
+/** 标题完全相似时占 0.10；相似度从 0 线性升到该值。 */
+const TITLE_FULL = .1;
+/** 标题短于该长度（去掉标点后的字符数）视为无信息，不计标题信号。 */
+const TITLE_MIN_CHARS = 6;
+/** 时间邻近按 30 min 半衰。 */
+const TIME_HALF_LIFE_MS = 18e5;
+/** 消费动词：下游文本出现上游产物且带这些词，才算依赖。 */
+const CONSUMES = /(检查|确认|基于|汇总|写入|复用|用[^。\n]{0,8}结果|inspect|verify|confirm|based on|reuse|summari[sz]e|write|check)/i;
+/** 成员报告里明确说与组无关的自述；协议没有专门的字段，用报告文本作保守启发。 */
+const UNRELATED = /无关|不属于|unrelated|not related|different (?:work|task)/i;
+const unique = (values) => [...new Set(values.filter(Boolean))];
+const normalized = (text) => text.toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
+const words = (text) => {
+	const value = normalized(text);
+	if (value.length < 2) return /* @__PURE__ */ new Set();
+	return new Set(Array.from({ length: value.length - 1 }, (_, index) => value.slice(index, index + 2)));
+};
+function jaccard(a, b) {
+	if (!a.size || !b.size) return 0;
+	let shared = 0;
+	for (const value of a) if (b.has(value)) shared++;
+	return shared / (a.size + b.size - shared);
+}
+const intersects = (a, b) => {
+	const set = new Set(b);
+	return a.some((value) => set.has(value));
+};
+/**
+* 从一张工单构造自动组队视图。`threads` 由调用方从 origin triggers 解析后传入，
+* 保证模块本身不依赖仓储；报告只取最新一次 ready 报告，用于依赖识别。
+*/
+function collabView(ticket, threads) {
+	const plan = [
+		ticket.title,
+		ticket.mandate.scope,
+		ticket.execution?.assignment ?? ""
+	].join("\n");
+	const report = latestReport(ticket);
+	const summary = ticket.result ? report?.summary ?? "" : "";
+	return {
+		id: ticket.id,
+		title: ticket.title,
+		text: plan,
+		writeScopes: unique(artifactPaths(plan).filter((path) => !isGenericPath(path))).slice(0, 16),
+		domain: domainKeys(`${plan}\n${summary}`),
+		resultArtifacts: unique(ticket.result?.artifacts ?? []).slice(0, 16),
+		threads: unique([...threads]),
+		updatedAt: ticket.updatedAt
+	};
+}
+/** 显式引用：工单 id、id 前缀，或足够长的标题。 */
+function references(view, other) {
+	const text = view.text.toLowerCase();
+	if (text.includes(other.id.toLowerCase()) || text.includes(other.id.toLowerCase().slice(0, 8))) return true;
+	const title = normalized(other.title);
+	return title.length >= TITLE_MIN_CHARS && normalized(view.text).includes(title);
+}
+/** 产物依赖：下游文本提到上游 ready 报告的产物，并带有消费动词。 */
+function consumes(view) {
+	return CONSUMES.test(view.text);
+}
+/** 上游产物里能证明依赖的具体路径；通用裸文件名（package.json、README.md 等）不算。 */
+const reusableArtifacts = (other) => other.resultArtifacts.filter((path) => !isGenericPath(path));
+function dependency(view, other) {
+	if (references(view, other)) return "explicit";
+	const text = view.text.toLowerCase();
+	return reusableArtifacts(other).some((path) => text.includes(path.toLowerCase())) && consumes(view) ? "artifact" : void 0;
+}
+/** 候选相关性预筛：同 thread、有共同写域键、显式引用或提到上游的具体产物。 */
+function related(view, other) {
+	return intersects(view.threads, other.threads) || intersects(view.domain, other.domain) || references(view, other) || reusableArtifacts(other).some((path) => view.text.toLowerCase().includes(path.toLowerCase()));
+}
+const round = (value) => Math.round(value * 1e3) / 1e3;
+/**
+* 对两张工单打分。写域冲突是否决项；但真实的依赖引用（显式引用或产物 + 消费动词）
+* 优先于冲突，因为下游是读上游结果，不一定写同一文件，`dependsOn` 会记录等待关系。
+*/
+function assessPair(view, other, now) {
+	const dep = dependency(view, other);
+	const domain = jaccard(new Set(view.domain), new Set(other.domain));
+	const title = normalized(view.title).length >= TITLE_MIN_CHARS && normalized(other.title).length >= TITLE_MIN_CHARS ? jaccard(words(view.title), words(other.title)) : 0;
+	const age = Date.parse(now) - Date.parse(other.updatedAt);
+	const time = Number.isFinite(age) && age >= 0 ? .1 * .5 ** (age / TIME_HALF_LIFE_MS) : 0;
+	const sharedThread = intersects(view.threads, other.threads);
+	const conflict = intersects(view.writeScopes, other.writeScopes) && !dep;
+	const strong = !!dep || domain >= DOMAIN_MIN;
+	const signals = [];
+	if (domain >= DOMAIN_MIN) signals.push("domain");
+	if (dep) signals.push("dependency");
+	if (sharedThread) signals.push("thread");
+	if (title > 0) signals.push("title");
+	if (time > 0) signals.push("time");
+	const score = round((domain >= DOMAIN_MIN ? .4 : 0) + (dep ? .3 : 0) + (sharedThread ? .1 : 0) + .1 * Math.min(1, title / TITLE_FULL) + time);
+	return {
+		score,
+		band: conflict ? "conflict" : strong && score >= SCORE_THRESHOLD ? "group" : score >= GRAY_LOW ? "gray" : "none",
+		signals,
+		domain,
+		title,
+		...dep ? { dependency: dep } : {}
+	};
+}
+/** 只在最近 30 min 内有活动的 open 工单进入候选。 */
+function recent(view, now) {
+	const age = Date.parse(now) - Date.parse(view.updatedAt);
+	return Number.isFinite(age) && age >= 0 && age <= 18e5;
+}
+/**
+* 为一组与 `view` 相关的候选生成计划：
+* 1. 优先加入已有的自动组，要求与组内**所有人**都达到成组阈值（完全连接），且组未满三张；
+* 2. 否则与一张无组的相关工单新建自动组；
+* 3. 人工组永不参与自动合并；灰度带只返回分数，不成组。
+* 选择是确定性的：分数高者优先，同分按 id 排序。
+*/
+function planAutoGroup(view, candidates, now) {
+	const eligible = candidates.filter((candidate) => recent(candidate.view, now) && related(view, candidate.view) && (!candidate.group || candidate.group.auto));
+	const joins = /* @__PURE__ */ new Map();
+	for (const candidate of eligible) {
+		const group = candidate.group;
+		if (!group?.auto || group.members.length >= 3) continue;
+		const pairs = group.members.map((member) => assessPair(view, member, now));
+		if (pairs.some((pair) => pair.band !== "group")) continue;
+		const weakest = Math.min(...pairs.map((pair) => pair.score));
+		const current = joins.get(group.id);
+		const groupMembers = [...group.members];
+		if (!current || weakest > Math.min(...current.pairs.map((pair) => pair.score))) joins.set(group.id, {
+			group,
+			members: groupMembers,
+			pairs
+		});
+	}
+	const join = [...joins.values()].sort((a, b) => Math.min(...b.pairs.map((pair) => pair.score)) - Math.min(...a.pairs.map((pair) => pair.score)) || a.group.id.localeCompare(b.group.id)).at(0);
+	if (join) {
+		const dependsOn = join.members.filter((member) => assessPair(view, member, now).dependency).map((member) => member.id);
+		return {
+			group: join.group.id,
+			members: [...join.members.map((member) => member.id), view.id],
+			expiresAt: join.group.expiresAt ?? new Date(Date.parse(now) + 72e5).toISOString(),
+			confidence: round(Math.min(...join.pairs.map((pair) => pair.score))),
+			signals: unique(join.pairs.flatMap((pair) => pair.signals)),
+			dependsOn,
+			created: false
+		};
+	}
+	const partner = eligible.filter((candidate) => !candidate.group).map((candidate) => ({
+		candidate,
+		pair: assessPair(view, candidate.view, now)
+	})).filter((item) => item.pair.band === "group").sort((a, b) => b.pair.score - a.pair.score || a.candidate.view.id.localeCompare(b.candidate.view.id))[0];
+	if (!partner) return void 0;
+	return {
+		group: `auto-${key("collab-auto", partner.candidate.view.id).slice(0, 12)}`,
+		members: [partner.candidate.view.id, view.id],
+		expiresAt: new Date(Date.parse(now) + AUTO_GROUP_TTL_MS).toISOString(),
+		confidence: partner.pair.score,
+		signals: partner.pair.signals,
+		dependsOn: partner.pair.dependency ? [partner.candidate.view.id] : [],
+		created: true
+	};
+}
+//#endregion
 //#region src/core/stage.ts
 /** Ticket stage classification and retry eligibility (docs/003). */
 /** Classifies a ticket's stage; the rules follow the table in docs/003 in order, where the first matching row wins. */
@@ -200,20 +568,21 @@ function ticketStage(ticket) {
 		action: "answer"
 	};
 	const assignment = latestAssignment(ticket);
-	const report = assignment?.report?.state;
-	if (report === "ready") return {
+	const report = assignment?.report;
+	if (assignment?.state === "running" && report && assignment.deliveredAt && assignment.deliveredAt >= report.at) return { stage: "working" };
+	if (report?.state === "ready") return {
 		stage: "person",
 		action: "review"
 	};
-	if ((report === "blocked" || report === "failed") && waitsForPerson(ticket)) return {
+	if ((report?.state === "blocked" || report?.state === "failed") && waitsForPerson(ticket)) return {
 		stage: "person",
-		action: report
+		action: report.state
 	};
 	if (!assignment || assignment.state === "pending") return {
 		stage: "working",
 		action: "queued"
 	};
-	if (report === "waiting" || assignment.state === "ended") return { stage: "idle" };
+	if (report?.state === "waiting" || assignment.state === "ended") return { stage: "idle" };
 	return { stage: "working" };
 }
 /** True when an open ticket is stalled on a blocked/failed report without a newer human follow-up, or has a failed input delivery. */
@@ -232,6 +601,14 @@ const automatic = (input) => input?.kind === "note" || input?.kind === "trigger"
 */
 const readBefore = (input, until) => input.readAt === void 0 ? (input.deliveredAt && input.deliveredAt > input.at ? input.deliveredAt : input.at) <= until : !!input.readAt && input.readAt < until;
 const STATUS_REQUEST = "Report the current ticket status with orchestrator_report. This is a status-only request: do not resume implementation or perform external actions.";
+/** 协作组上限：联系人手一屏能看完，也限制并发放大的成本。 */
+const GROUP_LIMIT = 4;
+/** 会广播给同组的报告终态；progress、waiting 和 dropped 不广播（dropped 是空转，不是可复用结果）。 */
+const SHARED_REPORTS = /* @__PURE__ */ new Set([
+	"ready",
+	"blocked",
+	"failed"
+]);
 /**
 * Manages each ticket's lifecycle: creates the ticket for an accept decision with its Mandate, Subscriptions, and first
 * Assignment, binds and attaches Threads, adds Inputs, resumes, retries, restarts, and ends tickets, and drops Subscriptions.
@@ -274,6 +651,30 @@ var Tickets = class extends EnginePart {
 			if (channel && !ticket.channels.some((item) => sameChannel(item, channel))) ticket.channels.push(channel);
 		}
 		ticket = this.options.prepareTicket?.(ticket, outcome) ?? ticket;
+		const query = [
+			ticket.title,
+			mandate.scope,
+			...triggerIds.flatMap((triggerId) => {
+				const trigger = this.repo.triggers.get(triggerId);
+				return trigger ? [trigger.text, trigger.url ?? ""] : [];
+			})
+		].join("\n").slice(0, 4e3);
+		const cards = matchResultCards(this.repo.tickets.list(), query);
+		if (cards.length) {
+			const at = this.now();
+			const text = resultCardNote(cards);
+			ticket.inputs.push({
+				id: key("input", id, "result-cards", ...cards.map((card) => card.ticketId)),
+				kind: "note",
+				text,
+				at
+			});
+			if (ticket.execution) ticket.execution = {
+				...ticket.execution,
+				assignment: ticket.execution.assignment ? `${ticket.execution.assignment}\n\n${text}` : text
+			};
+		}
+		this.autoCollab(ticket, at);
 		const assignment = this.newAssignment(ticket);
 		this.repo.tickets.save(ticket);
 		for (const triggerId of triggerIds) for (const ref of this.repo.triggers.get(triggerId)?.threads ?? []) this.subscribe(id, ref);
@@ -305,6 +706,190 @@ var Tickets = class extends EnginePart {
 		ticket.updatedAt = this.now();
 		this.repo.tickets.save(ticket);
 		return ticket;
+	}
+	/**
+	* 给一张 open 工单加组或改组，全量写入组内角色与依赖：未给的 role 与 dependsOn 会被清除。
+	* 一组最多四张工单；依赖只能指向同组的其他 open 工单，不能自依赖或成环。组关系只是路由与看板事实，不改授权、不建批次。
+	* @throws UserError 工单未知或已结束、组名或角色不合法、组已满、依赖越界或成环。
+	*/
+	collab(ticketId, change) {
+		const ticket = this.require(ticketId);
+		if (!liveTicket(ticket)) throw new UserError("ticketEnded");
+		const group = change.group.trim();
+		if (!group || group.length > 64 || /[\s/]/.test(group)) throw new UserError("collabGroupInvalid");
+		const role = change.role?.trim() || void 0;
+		if (role && (role.length > 40 || /[\r\n]/.test(role))) throw new UserError("collabRoleInvalid");
+		const dependsOn = [...new Set(change.dependsOn ?? [])];
+		if (dependsOn.length > 3) throw new UserError("collabDependency");
+		const members = this.repo.tickets.list().filter((item) => item.collab?.group === group && item.id !== ticketId);
+		if (members.length >= GROUP_LIMIT) throw new UserError("collabGroupFull");
+		const dependencies = dependsOn.filter((id) => id !== ticketId && this.repo.tickets.get(id)?.collab?.group === group && liveTicket(this.repo.tickets.get(id)));
+		if (dependencies.length !== dependsOn.length) throw new UserError("collabDependency");
+		const edges = new Map(members.map((item) => [item.id, item.collab?.dependsOn ?? []]));
+		edges.set(ticketId, dependencies);
+		const seen = /* @__PURE__ */ new Set();
+		const stack = [...dependencies];
+		while (stack.length) {
+			const id = stack.pop();
+			if (id === ticketId) throw new UserError("collabCycle");
+			if (seen.has(id)) continue;
+			seen.add(id);
+			stack.push(...edges.get(id) ?? []);
+		}
+		ticket.collab = {
+			group,
+			...role ? { role } : {},
+			...dependencies.length ? { dependsOn: dependencies } : {}
+		};
+		ticket.updatedAt = this.now();
+		this.repo.tickets.save(ticket);
+		return this.require(ticketId);
+	}
+	/**
+	* 建单时的自动组队：取最近活动的 open 工单，用 `collab-auto` 的确定性规则决定加入已有自动组
+	* 或与一张相关工单新建组。只改 `collab` 与首次 assignment 文本，不新增 note、不唤醒任何工单；
+	* 人工组（没有 `auto` 标记）不参与自动合并。由 `create` 在同一个事务里调用。
+	*/
+	autoCollab(ticket, at) {
+		if (this.options.collabAuto === false || ticket.collab) return;
+		const view = collabView(ticket, this.ticketThreads(ticket));
+		const plan = planAutoGroup(view, this.repo.tickets.open().filter((candidate) => candidate.id !== ticket.id).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).slice(0, 20).flatMap((candidate) => {
+			const candidateView = collabView(candidate, this.ticketThreads(candidate));
+			const group = this.candidateGroup(candidate, candidateView);
+			return [{
+				view: candidateView,
+				...group ? { group } : {}
+			}];
+		}), at);
+		if (!plan) return;
+		ticket.collab = {
+			group: plan.group,
+			auto: true,
+			confidence: plan.confidence,
+			signals: plan.signals,
+			writeScopes: view.writeScopes,
+			expiresAt: plan.expiresAt,
+			...plan.dependsOn.length ? { dependsOn: plan.dependsOn } : {}
+		};
+		if (ticket.execution) {
+			const line = `Collaboration group: ${plan.group}. Read group/${plan.group} first; group notes are terminal results only.`;
+			ticket.execution = {
+				...ticket.execution,
+				assignment: ticket.execution.assignment ? `${ticket.execution.assignment}\n\n${line}` : line
+			};
+		}
+		if (!plan.created) return;
+		for (const id of plan.members) {
+			if (id === ticket.id) continue;
+			const member = this.repo.tickets.get(id);
+			if (!member) continue;
+			member.collab = {
+				group: plan.group,
+				auto: true,
+				confidence: plan.confidence,
+				signals: plan.signals,
+				writeScopes: collabView(member, this.ticketThreads(member)).writeScopes,
+				expiresAt: plan.expiresAt
+			};
+			this.repo.tickets.save(member);
+		}
+	}
+	/** 一张工单的 Thread key，取自它的 origin triggers 与它跟随的 Thread。 */
+	ticketThreads(ticket) {
+		return [...new Set(ticket.origin.triggerIds.flatMap((id) => this.repo.triggers.get(id)?.threads ?? []).map(threadKey).concat((ticket.follows ?? []).map((follow) => follow.thread)))];
+	}
+	/**
+	* 候选工单所在的自动组视图；人工组或混合组返回 undefined，自动组队就不会把新单塞进人工组。
+	*/
+	candidateGroup(ticket, view) {
+		const name = ticket.collab?.group;
+		if (!name) return void 0;
+		const members = this.repo.tickets.list().filter((item) => item.collab?.group === name);
+		if (!ticket.collab?.auto || members.some((item) => !item.collab?.auto)) return {
+			id: name,
+			auto: false,
+			members: []
+		};
+		const expiresAt = members.flatMap((item) => item.collab?.expiresAt ? [item.collab.expiresAt] : []).sort()[0];
+		return {
+			id: name,
+			auto: true,
+			...expiresAt ? { expiresAt } : {},
+			members: members.map((item) => item.id === ticket.id ? view : collabView(item, this.ticketThreads(item)))
+		};
+	}
+	/**
+	* 解散一张工单所在的协作组（人工工具的覆盖手段）：清掉所有成员的 `collab`，因此不再广播终态。
+	* @returns 被移出组的工单 id；没有组时为空。
+	*/
+	dissolveCollab(ticketId) {
+		const name = this.repo.tickets.get(ticketId)?.collab?.group;
+		if (!name) return [];
+		const members = this.repo.tickets.list().filter((item) => item.collab?.group === name);
+		for (const member of members) {
+			delete member.collab;
+			this.repo.tickets.save(member);
+		}
+		return members.map((member) => member.id);
+	}
+	/**
+	* 时钟触发的自动组回收：全部成员结束、成员少于两张、2 h TTL 到期、成员报告与组无关，
+	* 或 30 min 内没有任何组内 note 被投递（近似“无交叉读取”）时解散。返回解散的组数。
+	*/
+	dissolveDueCollab() {
+		const groups = /* @__PURE__ */ new Map();
+		for (const ticket of this.repo.tickets.list()) {
+			const name = ticket.collab?.group;
+			if (name) groups.set(name, [...groups.get(name) ?? [], ticket]);
+		}
+		let dissolved = 0;
+		for (const [, members] of groups) {
+			if (members.some((member) => !member.collab?.auto)) continue;
+			if (!this.collabDissolvable(members)) continue;
+			for (const member of members) {
+				delete member.collab;
+				this.repo.tickets.save(member);
+			}
+			dissolved++;
+		}
+		return dissolved;
+	}
+	/** 一个自动组是否已满足解散条件；规则见 `dissolveDueCollab`。 */
+	collabDissolvable(members) {
+		if (members.length < 2) return true;
+		if (members.every((member) => !liveTicket(member))) return true;
+		const expiry = members.flatMap((member) => member.collab?.expiresAt ? [Date.parse(member.collab.expiresAt)] : []).filter(Number.isFinite).sort((a, b) => a - b)[0];
+		if (expiry !== void 0 && expiry <= Date.parse(this.now())) return true;
+		if (members.some((member) => {
+			const report = latestReport(member);
+			return report?.state === "dropped" && UNRELATED.test(report.summary);
+		})) return true;
+		return this.noCrossRead(members);
+	}
+	/**
+	* 30 min 内没有交叉读取。note 没有 readAt，这里用两个确定性近似：
+	* 组内 note 仍在本单 `undelivered` 里就是没投递；投递过则取该单最新 assignment 的 `deliveredAt`。
+	*/
+	noCrossRead(members) {
+		const live = members.filter(liveTicket);
+		if (!live.length) return true;
+		const now = Date.parse(this.now());
+		const notes = live.flatMap((member) => member.inputs.flatMap((input) => input.kind === "note" && input.from && input.from !== member.id ? [{
+			member,
+			input
+		}] : []));
+		let last = NaN;
+		if (!notes.length) {
+			const expiry = members.flatMap((member) => member.collab?.expiresAt ? [Date.parse(member.collab.expiresAt)] : []).filter(Number.isFinite).sort((a, b) => a - b)[0];
+			last = expiry === void 0 ? NaN : expiry - AUTO_GROUP_TTL_MS;
+		} else {
+			const delivered = notes.filter(({ member, input }) => !member.undelivered.includes(input.id));
+			last = delivered.length ? Math.max(...delivered.flatMap(({ member }) => {
+				const at = Date.parse(latestAssignment(member)?.deliveredAt ?? "");
+				return Number.isFinite(at) ? [at] : [];
+			})) : Math.max(...notes.map(({ input }) => Date.parse(input.at)).filter(Number.isFinite));
+		}
+		return Number.isFinite(last) && now - last >= 18e5;
 	}
 	/**
 	* Record that a Thread open tickets follow closed, and end each one done with its Threads (see `followsDone`), unless its
@@ -458,6 +1043,25 @@ var Tickets = class extends EnginePart {
 				effect
 			});
 		}
+	}
+	/**
+	* 清理指向已不存在工单的悬空订阅，以及它们残留的 context 标记；返回清掉的订阅数。
+	* 已结束但记录仍在的工单保留订阅：同 Thread 上的人类追问仍可唤醒它（见 `wake`），
+	* 系统/机器人消息由 `Intake.receive` 跳过，不产生无效 fanout。
+	*/
+	cleanSubscriptions(threadKeys) {
+		let removed = 0;
+		const threads = threadKeys?.length ? threadKeys.flatMap((key) => this.repo.threads.get(key) ?? []) : this.repo.threads.list();
+		for (const thread of threads) {
+			const kept = thread.subscriptions.filter((id) => this.repo.tickets.get(id));
+			const context = thread.context?.filter((id) => kept.includes(id));
+			if (!(kept.length !== thread.subscriptions.length || (context?.length ?? 0) !== (thread.context?.length ?? 0))) continue;
+			removed += thread.subscriptions.length - kept.length;
+			thread.subscriptions = kept;
+			if (context) thread.context = context;
+			this.repo.threads.save(thread);
+		}
+		return removed;
 	}
 	/**
 	* Drop a Thread's Subscriptions, every ticket's or only `ticketId`'s, and say so; false when none dropped. A ticket that
@@ -704,6 +1308,29 @@ var Tickets = class extends EnginePart {
 		return this.require(ticketId);
 	}
 	/**
+	* 把一张工单的终态报告（ready/blocked/failed）广播给同组其他工单：每条 note 记录来源工单和结果指针，
+	* 按 assignmentId+state 幂等。progress/waiting/dropped 不广播——dropped 表示没有可复用结果，广播它只会制造空转噪声。
+	* 活着的工单照常收到并投递；已结束的工单只落输入，addInput 不会唤醒它。
+	*/
+	shareReport(ticketId, assignmentId, state) {
+		if (!SHARED_REPORTS.has(state)) return;
+		const source = this.repo.tickets.get(ticketId);
+		const group = source?.collab?.group;
+		if (!source || !group) return;
+		const at = this.now();
+		for (const member of this.repo.tickets.list()) {
+			if (member.id === ticketId || member.collab?.group !== group) continue;
+			const text = `Group ${group}: ticket ${ticketId} reported ${state}. Result: ticket/${ticketId}/result.`;
+			this.addInput(member, {
+				id: key("input", member.id, "collab", ticketId, assignmentId, state),
+				kind: "note",
+				text,
+				at,
+				from: ticketId
+			});
+		}
+	}
+	/**
 	* Subscribe an open ticket to a Thread its Executor found related, for context: see `Thread.context`.
 	* @returns false when the ticket follows the Thread already.
 	* @throws UserError when the ticket is unknown or has ended.
@@ -860,11 +1487,13 @@ var Assignments = class extends EnginePart {
 			summary: report.summary,
 			at
 		};
+		if (report.state === "ready") ticket.result = resultCard(ticket, assignment.report);
 		ticket.updatedAt = at;
 		if (report.answers && !ticket.answers?.includes(report.answers)) ticket.answers = [...ticket.answers ?? [], report.answers];
 		if (report.answers) this.takeUp(ticketId, report.answers);
 		if (report.state === "blocked" || report.state === "failed") ticket.undelivered = ticket.undelivered.filter((id) => !automatic(ticket.inputs.find((input) => input.id === id)));
 		this.repo.tickets.save(ticket);
+		this.tickets.shareReport(ticketId, assignment.id, report.state);
 		const ready = !ticket.follows?.length ? "completed" : this.tickets.followsDone(ticket)?.outcome;
 		const outcome = report.state === "dropped" ? this.tickets.followsDone(ticket)?.outcome ?? "dropped" : report.state === "ready" ? ready : void 0;
 		if (outcome) this.tickets.end(ticketId, "executor", outcome, at);
@@ -1405,7 +2034,8 @@ var Evals = class extends EnginePart {
 /**
 * Ingests incoming triggers from Sources, deduplicating and filtering them against SourceScope before recording thread correlations.
 * Fans listened triggers out to subscribed tickets via Tickets and queues for Eval, on its primary thread, every trigger no
-* ticket's worker decides (see `followupOwners`).
+* ticket's worker decides (see `followupOwners`). An addressed message on a Thread several live tickets share, and an ended
+* ticket on a Thread another ticket subscribes to, reach no ticket (see `receive`).
 * Engine delegates trigger reception to this part.
 */
 var Intake = class extends EnginePart {
@@ -1434,16 +2064,26 @@ var Intake = class extends EnginePart {
 		}
 		this.repo.triggers.save(trigger);
 		const keys = trigger.threads.map(threadKey);
+		this.tickets.cleanSubscriptions(keys);
+		const ambiguous = trigger.human && trigger.addressed !== void 0 && trigger.threads.some((ref) => {
+			const thread = this.thread(ref);
+			return thread.subscriptions.filter((id) => {
+				const ticket = this.repo.tickets.get(id);
+				return !!ticket && liveTicket(ticket) && !thread.context?.includes(id);
+			}).length > 1;
+		});
 		const reached = /* @__PURE__ */ new Map();
 		for (const ref of trigger.threads) {
 			const thread = this.thread(ref);
 			if (!thread.lastAt || trigger.at > thread.lastAt) thread.lastAt = trigger.at;
 			thread.correlated = [.../* @__PURE__ */ new Set([...thread.correlated, ...keys.filter((other) => other !== thread.key)])];
-			for (const ticketId of thread.subscriptions) {
+			for (const ticketId of ambiguous ? [] : thread.subscriptions) {
 				const ticket = this.repo.tickets.get(ticketId);
+				if (!ticket) continue;
 				const followed = !!thread.context?.includes(ticketId);
-				const resumes = trigger.human && ticket?.ended?.by !== "human" && !followed;
-				if (!ticket || !liveTicket(ticket) && !resumes) continue;
+				const sole = thread.subscriptions.every((id) => id === ticketId || thread.context?.includes(id) || !this.repo.tickets.get(id));
+				const resumes = trigger.human && ticket.ended?.by !== "human" && !followed && sole;
+				if (!liveTicket(ticket) && !resumes) continue;
 				reached.set(ticketId, {
 					ticket,
 					context: followed && (reached.get(ticketId)?.context ?? true)
@@ -1643,6 +2283,9 @@ var Engine = class {
 			this.evals.due(thread, policy);
 		});
 		if (policy.paused) return;
+		this.repo.atomic(() => {
+			this.tickets.dissolveDueCollab();
+		});
 		for (const ticket of this.repo.tickets.active()) if (!liveTicket(ticket) && ticket.undelivered.length) this.repo.atomic(() => {
 			this.tickets.wake(ticket.id);
 		});
@@ -1692,6 +2335,29 @@ var Engine = class {
 	*/
 	requestStatus(ticketId) {
 		return this.repo.atomic(() => this.tickets.requestStatus(ticketId));
+	}
+	/**
+	* 把一张 open 工单加进协作组或改组：组内最多四张，可写组内角色与对同组其他工单的依赖，自依赖或成环则拒绝。
+	* 每次写入都是全量的：未给的 role 与 dependsOn 会被清除。组只是协作与看板事实，不授予权限，也不写实施计划。
+	* @throws UserError 工单未知或已结束、组名或角色不合法、组已满、依赖越界或成环。
+	*/
+	collab(ticketId, change) {
+		return this.repo.atomic(() => this.tickets.collab(ticketId, change));
+	}
+	/**
+	* 解散一张工单所在的协作组（人工覆盖手段，自动组同样适用）：清掉组内所有成员的组关系，
+	* 此后的终态报告不再互相广播。只改协作与看板事实，不动授权、assignment 或订阅。
+	* @returns 被移出组的工单 id；没有组时为空。
+	*/
+	dissolveCollab(ticketId) {
+		return this.repo.atomic(() => this.tickets.dissolveCollab(ticketId));
+	}
+	/**
+	* 清理指向已不存在工单的悬空订阅，返回清掉的条数。启动时调用一次；每次 Trigger fanout 前 Intake 还会清理涉及的 Thread。
+	* 不删除已结束但仍有记录的订阅：人类追问仍可唤醒它们，机器人消息由 Intake 跳过。
+	*/
+	cleanSubscriptions() {
+		return this.repo.atomic(() => this.tickets.cleanSubscriptions());
 	}
 	/**
 	* Queue a message for the Channel its purpose names: an acknowledgement or an answer goes where the person's message was
@@ -2913,6 +3579,16 @@ function ticketCard(ticket) {
 		title: ticket.title,
 		state: cardState(ticket),
 		strength: ticket.mandate.strength,
+		...ticket.collab ? { collab: {
+			group: ticket.collab.group,
+			...ticket.collab.role ? { role: ticket.collab.role } : {},
+			...ticket.collab.dependsOn?.length ? { depends_on: ticket.collab.dependsOn } : {},
+			...ticket.collab.auto ? { auto: true } : {},
+			...ticket.collab.confidence !== void 0 ? { confidence: ticket.collab.confidence } : {},
+			...ticket.collab.signals?.length ? { signals: ticket.collab.signals } : {},
+			...ticket.collab.writeScopes?.length ? { write_scopes: ticket.collab.writeScopes } : {},
+			...ticket.collab.expiresAt ? { expires_at: ticket.collab.expiresAt } : {}
+		} } : {},
 		...pullOf(ticket) ? { pr_number: pullOf(ticket) } : {},
 		...ended ? { ended } : {},
 		...attention ? { attention: {
@@ -2979,6 +3655,7 @@ function ticketDetails(ticket, threads, batch, worker = false) {
 		directory: ticket.execution?.directory,
 		scope: ticket.mandate.scope,
 		requested_by: ticket.mandate.actor.id,
+		...ticket.result ? { result_card: ticket.result } : {},
 		assignments: newestPage(ticket.assignments, 0, 3, (item) => assignmentLine(ticket, item), `ticket/${ticket.id}/assignments`),
 		inputs: newestPage(ticket.inputs, 0, 10, (input) => inputLine(ticket, input, worker), `ticket/${ticket.id}/inputs`),
 		assignment: `ticket/${ticket.id}/assignment`,
@@ -4201,6 +4878,15 @@ const RESOURCES = [
 		executor: true
 	},
 	{
+		name: "group/<id>",
+		holds: "one collaboration group: its ticket cards, each ticket's role, latest report, result card and the tickets it waits on",
+		executor: true
+	},
+	{
+		name: "results",
+		holds: "L1 ready result cards, newest first: ticket, conclusion, artifact paths, key numbers and read path"
+	},
+	{
 		name: "decisions",
 		holds: "decisions, newest first"
 	},
@@ -4388,6 +5074,52 @@ const ROUTES = [
 			...page
 		};
 	}],
+	["group/", (read) => {
+		const { host, rest, ticketId } = read;
+		const members = host.store.tickets.list().filter((ticket) => ticket.collab?.group === rest);
+		const own = ticketId ? host.store.tickets.get(ticketId) : void 0;
+		if (!members.length || ticketId && own?.collab?.group !== rest) throw new Error("Unknown or inaccessible collaboration group");
+		const byId = new Map(members.map((ticket) => [ticket.id, ticket]));
+		const waiting = (ticket) => (ticket.collab?.dependsOn ?? []).filter((id) => {
+			const dependency = byId.get(id);
+			return !!dependency && liveTicket(dependency) && !["ready", "dropped"].includes(latestReport(dependency)?.state ?? "");
+		});
+		const order = [...members].sort((a, b) => liveTicket(a) === liveTicket(b) ? a.createdAt.localeCompare(b.createdAt) : liveTicket(a) ? -1 : 1);
+		const waitingOn = [...new Set(members.flatMap(waiting))].sort();
+		const automated = members.every((ticket) => ticket.collab?.auto);
+		const confidence = automated ? Math.min(...members.map((ticket) => ticket.collab?.confidence ?? 0)) : void 0;
+		const signals = [...new Set(members.flatMap((ticket) => ticket.collab?.signals ?? []))].sort();
+		const expiresAt = automated ? members.flatMap((ticket) => ticket.collab?.expiresAt ? [ticket.collab.expiresAt] : []).sort()[0] : void 0;
+		return {
+			group: rest,
+			...automated ? { auto: true } : {},
+			...confidence !== void 0 ? { confidence } : {},
+			...signals.length ? { signals } : {},
+			...expiresAt ? { expires_at: expiresAt } : {},
+			tickets: order.map((ticket) => {
+				const report = latestReport(ticket);
+				return {
+					...ticketCard(ticket),
+					...ticket.collab?.role ? { role: ticket.collab.role } : {},
+					depends_on: ticket.collab?.dependsOn ?? [],
+					waiting_on: waiting(ticket),
+					...ticket.result ? { result_card: ticket.result } : {},
+					...report ? { report: {
+						state: report.state,
+						at: report.at,
+						preview: preview$1(report.summary).slice(0, 120),
+						chars: report.summary.length,
+						read: `ticket/${ticket.id}/result`
+					} } : {}
+				};
+			}),
+			...waitingOn.length ? { waiting_on: waitingOn } : {}
+		};
+	}],
+	["results", (read) => {
+		const cards = main(read).store.tickets.list().flatMap((ticket) => ticket.result ? [ticket.result] : []).sort((a, b) => b.at.localeCompare(a.at));
+		return list(read, (offset, count) => cards.slice(offset, offset + count));
+	}],
 	["decisions", (read) => list(read, (offset, count) => main(read).store.read.recentDecisions(offset, count).map(decisionCard))],
 	["decision/", (read) => {
 		const decision = main(read).store.decisions.get(read.rest);
@@ -4515,7 +5247,11 @@ const ROUTES = [
 		const { host, resource, rest, ticketId, signal } = read;
 		const [id, section, part, ...more] = rest.split("/");
 		if (!id || more.length) throw new Error("Unknown context resource");
-		if (ticketId && ticketId !== id) throw new Error("Ticket does not belong to this worker");
+		if (ticketId && ticketId !== id) {
+			const own = host.store.tickets.get(ticketId), other = host.store.tickets.get(id);
+			if (!own?.collab?.group || own.collab.group !== other?.collab?.group) throw new Error("Ticket does not belong to this worker");
+			if (section !== void 0 && section !== "result" && section !== "inputs") throw new Error("A worker reads only the card, result or inputs of another ticket in its group");
+		}
 		const ticket = host.store.tickets.get(id);
 		if (!ticket) throw new UserError("unknownTicket");
 		if (section === void 0) {
@@ -9210,13 +9946,35 @@ const WORK_TOOLS = [
 const NO_WAIT = "Reports, follow_up notices, new candidates and a background job's end with its output arrive by themselves as messages; end the turn instead of waiting for them.";
 /** What a main Session under `standard` is told when its command would wait the shell's default. */
 const DEFAULT_WAIT = "This shell waits up to 60 seconds by default: pass timeoutMs of at most 30000, or run_in_background, as a waiting step holds back new candidates.";
+/**
+* Tools the main Session never calls but a Team bundle registers into every Agent scope it sees: it routes, assesses and
+* replies, and delegates all work to tickets, so their schemas only cost bytes in every request.
+*/
+const ROUTER_UNUSED_TOOLS = /* @__PURE__ */ new Set([
+	"spawn_teammate",
+	"team_task_create",
+	"team_task_get",
+	"team_task_list",
+	"team_task_update",
+	"wait_agent",
+	"send_message",
+	"list_agents",
+	"interrupt_agent"
+]);
+/**
+* The prompt entries the same Team bundle registers beside those tools: its policy section and the identity context naming
+* `list_agents` and `send_message`. A complete prompt drops the section, but a context is rendered into every request's
+* runtime snapshot whatever sections exist, so both are dropped here too, leaving no text about a tool the schemas omit.
+*/
+const ROUTER_UNUSED_PROMPT = /* @__PURE__ */ new Set(["team:policy", "team:identity"]);
 /** `sleep` at a command position: the start, after ; & | ( { ! ` or a newline, or after a keyword or a command that runs it. */
 const SLEEP = /(?:^|[;&|({!`\n]|\b(?:do|then|else|elif|if|while|until|time|exec|nohup|command|env)\s)\s*(?:\S*\/)?sleep\b/;
 /**
-* The main Session's guard: it refuses a bash command that runs sleep or asks to hold the step longer than 30 seconds, and a
-* job wait longer than 5 seconds. Under `standard`, as a main Session created before the router preset runs, the shell holds
-* a command 60 seconds and a job wait lasts 30 seconds by default, so a command needs a timeout or the background, and a
-* job wait its timeout; the router preset ends both after 5 seconds.
+* The main Session's guard: it refuses a bash command that runs sleep or asks to hold the step longer than 30 seconds, a
+* job wait longer than 5 seconds, and a `wait_agent` wait of any length, whose answer never arrives before its timeout.
+* Under `standard`, as a main Session created before the router preset runs, the shell holds a command 60 seconds and a job
+* wait lasts 30 seconds by default, so a command needs a timeout or the background, and a job wait its timeout; the router
+* preset ends both after 5 seconds.
 */
 function noWait({ name, arguments: input }, routed) {
 	const args = input ?? {};
@@ -9225,6 +9983,7 @@ function noWait({ name, arguments: input }, routed) {
 		if (args.timeoutMs === void 0 && args.run_in_background !== true && !routed()) return DEFAULT_WAIT;
 	}
 	if (name === "job_output" && args.wait === true && (typeof args.timeout_ms === "number" ? args.timeout_ms > 5e3 : !routed())) return NO_WAIT;
+	if (name === "wait_agent") return NO_WAIT;
 }
 /**
 * Creates and decorates orchestrator and worker DSH `Agent` sessions with role models, system prompt sections from `Prompts`, runtime skills, and restricted tool sets.
@@ -9462,7 +10221,16 @@ var Sessions = class {
 			"job_output",
 			"job_list",
 			"job_kill"
-		] }), agent.ctx.tools.guard((execution) => noWait(execution, () => this.routed(agent))));
+		] }), agent.ctx.tools.guard((execution) => noWait(execution, () => this.routed(agent))), agent.ctx.on("system-prompt/assemble", async (_assembly, _context, next) => {
+			const assembled = await next();
+			const named = (entry) => !ROUTER_UNUSED_PROMPT.has(entry.name);
+			return {
+				...assembled,
+				tools: assembled.tools.filter((tool) => !ROUTER_UNUSED_TOOLS.has(tool.name)),
+				sections: assembled.sections.filter(named),
+				contexts: assembled.contexts.filter(named)
+			};
+		}));
 		else binding.disposers.push(...this.workOnly(agent, ticket.id));
 	}
 	/**
@@ -9848,6 +10616,39 @@ function mainTools(host, agent) {
 			execute: async (args) => {
 				return routed(host, {
 					reason: host.engine.requestStatus(args.ticket_id) ? "Asked the worker for a status report" : "The worker is not waiting; nothing was sent",
+					ticketId: args.ticket_id
+				});
+			}
+		}),
+		tool({
+			name: "orchestrator_ticket_collab",
+			description: "Put an open ticket in a collaboration group of at most 4 tickets, with an optional role and dependencies on other tickets in the same group, so each ticket's ready, blocked or failed report reaches the others as a note (progress, waiting and dropped never do) and the group resource shows their state. This groups tickets only: it writes no implementation plan and grants no authority.",
+			schema: z.object({
+				ticket_id: z.string(),
+				group: z.string().describe("Group name of 1-64 characters, without spaces or slashes."),
+				role: z.string().nullish().describe("Optional short role in the group, one line of at most 40 characters; omitted or null clears it."),
+				depends_on: z.array(z.string()).nullish().describe("Up to 3 ticket ids of open tickets already in the same group whose results this ticket waits on; omitted or null clears them.")
+			}).strict(),
+			execute: async (args) => {
+				host.engine.collab(args.ticket_id, {
+					group: args.group,
+					...args.role !== void 0 && args.role !== null ? { role: args.role } : {},
+					...args.depends_on !== void 0 && args.depends_on !== null ? { dependsOn: args.depends_on } : {}
+				});
+				return routed(host, {
+					reason: "Collaboration group saved",
+					ticketId: args.ticket_id
+				});
+			}
+		}),
+		tool({
+			name: "orchestrator_ticket_collab_dissolve",
+			description: "Dissolve the collaboration group of a ticket, automatic or manual, so its tickets no longer share terminal reports; use it when a group is unrelated, noisy or finished. It changes no assignment or authority.",
+			schema: z.object({ ticket_id: z.string() }).strict(),
+			execute: async (args) => {
+				const members = host.engine.dissolveCollab(args.ticket_id);
+				return routed(host, {
+					reason: members.length ? `Collaboration group dissolved (${members.length} tickets)` : "No collaboration group to dissolve",
 					ticketId: args.ticket_id
 				});
 			}
@@ -10491,6 +11292,7 @@ var Runtime = class extends Service {
 			});
 			return;
 		}
+		this.engine.cleanSubscriptions();
 		this.sessions.install();
 		this.executor.install();
 		await this.sessions.ensure(this.masterId, this.machine.stateDir, "dsh-superagent orchestrator", "orchestrator");
@@ -10613,4 +11415,4 @@ async function apply(ctx, config) {
 	ctx.logger.info(runtime.configured() ? "dsh-superagent ready; the Superagent sidebar entry opens the management panel" : `dsh-superagent is waiting for setup: ${runtime.setupProblem?.detail ?? ""}`);
 }
 //#endregion
-export { Config, Engine, MemoryRepositories, REASONS, USER_ERRORS, UserError, apply, canRetry, followupOwners, inject, isoTime, key, latestAssignment, latestReport, liveTicket, name, reached, readUntil, reasonText, runningAssignment, said, settled, threadKey, ticketOutcome, ticketStage, waitsForPerson };
+export { Config, Engine, MemoryRepositories, REASONS, RESULT_CARDS, USER_ERRORS, UserError, apply, artifactPaths, canRetry, domainKeys, followupOwners, inject, isoTime, key, latestAssignment, latestReport, liveTicket, matchResultCards, name, reached, readUntil, reasonText, resultCard, resultCardNote, runningAssignment, said, settled, threadKey, ticketOutcome, ticketStage, waitsForPerson };

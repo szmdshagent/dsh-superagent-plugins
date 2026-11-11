@@ -13,6 +13,10 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { installWorkerGuard } from './guard.ts'
 
+// team/lane 只读视图随 guard 一起导出：面板与测试都从这里取，避免依赖未公开的内部模块。
+export { laneDir, isValidLaneName, readTeamPlan, teamStatus, listTeamLanes } from './guard.ts'
+export type { TeamPlan, TeamPlanEntry, TeamLane, TeamStatus } from './guard.ts'
+
 export const name = 'dsh-superagent-pane-guard'
 export const inject = ['tools']
 

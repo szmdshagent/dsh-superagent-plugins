@@ -27,6 +27,13 @@ export function ticketCard(ticket: Ticket) {
   const ended = ticket.ended && { at: ticket.ended.at, by: ticket.ended.by, reason: ticket.ended.reason ?? ticket.ended.outcome }
   const { attention } = ticket
   return { ticket_id: ticket.id, title: ticket.title, state: cardState(ticket), strength: ticket.mandate.strength,
+    ...(ticket.collab ? { collab: { group: ticket.collab.group, ...(ticket.collab.role ? { role: ticket.collab.role } : {}),
+      ...(ticket.collab.dependsOn?.length ? { depends_on: ticket.collab.dependsOn } : {}),
+      ...(ticket.collab.auto ? { auto: true } : {}),
+      ...(ticket.collab.confidence !== undefined ? { confidence: ticket.collab.confidence } : {}),
+      ...(ticket.collab.signals?.length ? { signals: ticket.collab.signals } : {}),
+      ...(ticket.collab.writeScopes?.length ? { write_scopes: ticket.collab.writeScopes } : {}),
+      ...(ticket.collab.expiresAt ? { expires_at: ticket.collab.expiresAt } : {}) } } : {}),
     ...(pullOf(ticket) ? { pr_number: pullOf(ticket) } : {}), ...(ended ? { ended } : {}),
     ...(attention ? { attention: { question: attention.question, ...attention.triggerId ? { trigger_id: attention.triggerId } : {} } } : {}),
     preview: preview(latestReport(ticket)?.summary ?? ''), read: `ticket/${ticket.id}` }
@@ -62,7 +69,7 @@ export function ticketDetails(ticket: Ticket, threads: TicketThread[], batch: re
   const { preview: _preview, ...card } = ticketCard(ticket)
   return { ...card, trigger_id: ticket.origin.triggerId, ...batch.length ? { batch: batch.map(batchLine) } : {},
     ...worker ? {} : { decision_id: ticket.decisionId }, threads, directory: ticket.execution?.directory,
-    scope: ticket.mandate.scope, requested_by: ticket.mandate.actor.id,
+    scope: ticket.mandate.scope, requested_by: ticket.mandate.actor.id, ...(ticket.result ? { result_card: ticket.result } : {}),
     assignments: newestPage(ticket.assignments, 0, ASSIGNMENTS, item => assignmentLine(ticket, item), `ticket/${ticket.id}/assignments`),
     inputs: newestPage(ticket.inputs, 0, INPUTS, input => inputLine(ticket, input, worker), `ticket/${ticket.id}/inputs`),
     assignment: `ticket/${ticket.id}/assignment`, result: `ticket/${ticket.id}/result`, transcript: `ticket/${ticket.id}/transcript` }
