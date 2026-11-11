@@ -21,6 +21,18 @@
           "en": "Dispatch",
           "zh": "派活"
         }
+      },
+      "execution": {
+        "title": {
+          "en": "Execution",
+          "zh": "执行"
+        }
+      },
+      "governance": {
+        "title": {
+          "en": "Governance",
+          "zh": "治理"
+        }
       }
     }
   },
@@ -59,7 +71,7 @@
           "source": {
             "type": "git",
             "url": "https://github.com/szmdshagent/dsh-superagent-plugins",
-            "commit": "ddd0b4e5f6cf4f1e5df90c2091b7431dc71a7644",
+            "commit": "b630f43baac4396396c9ec383271c8a80a25a4d1",
             "path": "packages/dsh-superagent"
           },
           "engines": {
@@ -100,8 +112,94 @@
           "source": {
             "type": "git",
             "url": "https://github.com/szmdshagent/dsh-superagent-plugins",
-            "commit": "ddd0b4e5f6cf4f1e5df90c2091b7431dc71a7644",
+            "commit": "b630f43baac4396396c9ec383271c8a80a25a4d1",
             "path": "packages/dsh-superagent-pane"
+          },
+          "engines": {
+            "dsh": ">=0.2.1-rc.3"
+          }
+        }
+      ]
+    },
+    {
+      "name": "dsh-superagent-executor",
+      "title": {
+        "en": "dsh-superagent-executor",
+        "zh": "dsh-superagent 执行层"
+      },
+      "description": {
+        "en": "Execution layer for dsh-superagent workers: validates cc-worker arguments (turns, lane, team nesting), enforces a per-ticket cost breaker, and aggregates run state per lane. Ships a read-only cc-worker snapshot.",
+        "zh": "dsh-superagent worker 的执行层：校验 cc-worker 参数（轮数上限、lane、team 嵌套），按工单执行成本熔断，并按 lane 聚合运行状态；附 cc-worker 只读快照。"
+      },
+      "author": "szm",
+      "homepage": "https://github.com/szmdshagent/dsh-superagent-plugins#readme",
+      "repository": {
+        "url": "https://github.com/szmdshagent/dsh-superagent-plugins",
+        "directory": "packages/dsh-superagent-executor"
+      },
+      "metadata": {
+        "category": "execution",
+        "keywords": [
+          "executor",
+          "cc-worker",
+          "lane",
+          "team",
+          "budget",
+          "执行"
+        ]
+      },
+      "versions": [
+        {
+          "version": "0.1.0",
+          "publishTimestamp": 1794412351,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/szmdshagent/dsh-superagent-plugins",
+            "commit": "b630f43baac4396396c9ec383271c8a80a25a4d1",
+            "path": "packages/dsh-superagent-executor"
+          },
+          "engines": {
+            "dsh": ">=0.2.1-rc.3"
+          }
+        }
+      ]
+    },
+    {
+      "name": "dsh-governance-panel",
+      "title": {
+        "en": "Governance Panel",
+        "zh": "治理面板"
+      },
+      "description": {
+        "en": "Standalone governance panel for dsh-superagent: reads .cc-worker traces only and aggregates cost, context, handoff, budget, executor and liveness per lane and team.",
+        "zh": "dsh-superagent 的独立治理面板：只读 .cc-worker 痕迹，按 team/lane 聚合成本、上下文、交接、预算、执行器与活性。"
+      },
+      "author": "szm",
+      "homepage": "https://github.com/szmdshagent/dsh-superagent-plugins#readme",
+      "repository": {
+        "url": "https://github.com/szmdshagent/dsh-superagent-plugins",
+        "directory": "packages/dsh-governance-panel"
+      },
+      "metadata": {
+        "category": "governance",
+        "keywords": [
+          "governance",
+          "panel",
+          "team",
+          "lane",
+          "成本",
+          "治理"
+        ]
+      },
+      "versions": [
+        {
+          "version": "0.1.0",
+          "publishTimestamp": 1794412351,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/szmdshagent/dsh-superagent-plugins",
+            "commit": "b630f43baac4396396c9ec383271c8a80a25a4d1",
+            "path": "packages/dsh-governance-panel"
           },
           "engines": {
             "dsh": ">=0.2.1-rc.3"
