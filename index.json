@@ -71,7 +71,7 @@
           "source": {
             "type": "git",
             "url": "https://github.com/szmdshagent/dsh-superagent-plugins",
-            "commit": "b630f43baac4396396c9ec383271c8a80a25a4d1",
+            "commit": "7802ded9aa4fa5b563ecc1cd32d04f89cdeb9d83",
             "path": "packages/dsh-superagent"
           },
           "engines": {
@@ -112,7 +112,7 @@
           "source": {
             "type": "git",
             "url": "https://github.com/szmdshagent/dsh-superagent-plugins",
-            "commit": "b630f43baac4396396c9ec383271c8a80a25a4d1",
+            "commit": "7802ded9aa4fa5b563ecc1cd32d04f89cdeb9d83",
             "path": "packages/dsh-superagent-pane"
           },
           "engines": {
@@ -155,7 +155,7 @@
           "source": {
             "type": "git",
             "url": "https://github.com/szmdshagent/dsh-superagent-plugins",
-            "commit": "b630f43baac4396396c9ec383271c8a80a25a4d1",
+            "commit": "7802ded9aa4fa5b563ecc1cd32d04f89cdeb9d83",
             "path": "packages/dsh-superagent-executor"
           },
           "engines": {
@@ -198,7 +198,7 @@
           "source": {
             "type": "git",
             "url": "https://github.com/szmdshagent/dsh-superagent-plugins",
-            "commit": "b630f43baac4396396c9ec383271c8a80a25a4d1",
+            "commit": "7802ded9aa4fa5b563ecc1cd32d04f89cdeb9d83",
             "path": "packages/dsh-governance-panel"
           },
           "engines": {
