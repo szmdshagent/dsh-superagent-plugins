@@ -89,9 +89,12 @@ declare const inject: string[];
  * 构造面板里一条消息的 Trigger。
  *
  * 两种模式对齐引擎语义：
- * - `dispatch`（默认）：`addressed: 'mention'` → 已允许发送者的消息是 explicit，直接建单/追加给工单，权限完整。
- * - `chat`：不带 addressed → 消息按准入表成为 inferred 候选，交给主 Session（router）分诊：它能直接答疑，
- *   或按规则接下小活；不需要工单的问题不会再变成工单。
+ * - `assign`（派活，默认）：`addressed: 'mention'` → 已允许发送者的消息是 explicit。**新建工单还是跟进已有工单，
+ *   由路由器按内容自己判断**（2026-11-11 合并：原来拆成「路由器分配」「worker 续做」两档，太麻烦，
+ *   改由路由器一次决定）。正文不再附加「必须新建」或「必须 attach」的约束，只说明这张卡片的性质。
+ * - `chat`（只对话）：**也带 addressed 走 explicit**，附「只回答、不建单」约束。
+ *   以前用 inferred 让路由器分诊，但 `eval.mode=auto` 下路由器一旦匹配到规则就会 accept 建单，
+ *   于是「对话」其实也会派活；改成 explicit + 正文约束后，建单与否完全由消息里的约束决定。
  *
  * 对话模式刻意走「影子线程」`<对话>~chat`：引擎的 gate 规定「线程有自己的工单时，一律消息归该工单」
  * （followup 分支先于准入表生效），所以只要还在原线程上，对话消息就会被排进运行中工单的队列、router 收不到。
@@ -104,8 +107,10 @@ declare const inject: string[];
  * 正常跟进必须留在原线程，交给该工单的 worker 处理，否则会另起新工单、原工单永远收不到跟进。
  * 无论走哪条线程，`channel` 始终指回原会话，回复仍显示在原对话里。
  */
-declare function paneTrigger(conversation: string, text: string, sender?: string, mode?: 'dispatch' | 'chat', options?: {
+/** 面板模式的内部取值。`note` 只给工单意见会话用：正文自带前缀，不再叠加模式约束。 */
+type PaneMode = 'assign' | 'chat' | 'note' | 'broadcast';
+declare function paneTrigger(conversation: string, text: string, sender?: string, mode?: PaneMode, options?: {
   thread?: string;
 }): Trigger;
 declare function apply(ctx: Context): void;
-export { apply, inject, name, paneTrigger };
+export { PaneMode, apply, inject, name, paneTrigger };

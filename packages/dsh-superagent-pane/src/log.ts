@@ -14,6 +14,10 @@ export type LogEntry = {
   text: string
   kind?: string
   ticketId?: string
+  /** dispatch（派活）或 chat（问答）；入站条目用来区分派活与闲聊。 */
+  mode?: string
+  /** 投递/处理状态标记。 */
+  status?: string
 }
 
 /** 每个对话保留的条数上限与字符总预算；超出后从最旧的开始丢弃。 */

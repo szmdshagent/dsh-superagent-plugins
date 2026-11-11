@@ -21,6 +21,11 @@ const PANE = 'pane'
 const DEFAULT_POLL_MS = 30_000
 /** worker 会话 id 的形状：`worker-<工单 id>`，与 `ticketOfSession` 一致。 */
 const WORKER_SESSION = /^worker-(.+)$/
+/** 收尾通知只写「刚刚结束」的工单；更早的历史工单不再翻出来重播。 */
+const NOTICE_MAX_AGE_MS = 30 * 60_000
+/** 已通知过的工单 id（持久化）：同一张工单只写一次，不随每轮扫描重复。 */
+const NOTIFIED_KEY = 'pane-tidy-notified' as any
+const NOTIFIED_LIMIT = 5000
 /** 工单结局的中文说法。 */
 const OUTCOME_TEXT: Record<string, string> = {
   completed: '完成', merged: '已合并', dropped: '已放弃',
@@ -63,12 +68,25 @@ export function apply(ctx: any, config: Config = {}): void {
     return undefined
   }
 
-  /** 把一张结束了的工单的结果写回面板对话；同一条只写一次。 */
-  const reportEnded = (source: any, ticketId: string): void => {
+  /**
+   * 收集一张结束了的工单的通知文案（不写日志）。同一条只收集一次。
+   *
+   * 2026-11-11 改：以前每张结束都往面板对话各写一条，一次收尾批次会瞬间刷 8~10 条「工单已结束」，
+   * 把真正有用的回答挤出可视区（实测 main 对话 1342 条里绝大部分是这类通知，用户的问题回复被淹没）。
+   * 现在改为：没人接手的废单不通知，有产出的按批次汇总成一条。
+   *
+   * 2026-11-11 再改：归档失败的会话会一直留在 workspace 列表里，每轮扫描都把它当"刚结束"重播一次
+   * （实测同一批 42 张旧工单被写了 200 多条一模一样的「本批 N 张工单已收尾」）。现在按工单 id 去重，
+   * 并且只通知最近 30 分钟内结束的工单——历史积压不再翻出来重播。
+   */
+  const collectEnded = (source: any, ticketId: string): { conversation: string; text: string } | undefined => {
     const ticket = source.tickets?.get(ticketId)
     const conversation = conversationOf(source, ticket)
-    if (!conversation) return
+    if (!conversation) return undefined
     const ended = ticket?.ended
+    // 只播报刚结束的：更早的工单用户早就知道了，重播只会刷屏。
+    const endedAt = Date.parse(String(ended?.at ?? ''))
+    if (!Number.isFinite(endedAt) || Date.now() - endedAt > NOTICE_MAX_AGE_MS) return undefined
     const outcome = OUTCOME_TEXT[String(ended?.outcome)] ?? (ended ? String(ended.outcome) : '已结束')
     const reason = typeof ended?.reason === 'string' && ended.reason ? `，原因：${ended.reason}` : ''
     const title = typeof ticket?.title === 'string' && ticket.title ? `「${ticket.title}」` : ` ${ticketId}`
@@ -80,15 +98,34 @@ export function apply(ctx: any, config: Config = {}): void {
       if (item.ticketId === ticketId) return true
       return item.ticketId === undefined && startedAt > 0 && Date.parse(item.at) >= startedAt
     })
-    const tail = answered ? '' : '\n（这张工单没有产生结果回复。）'
-    appendLog(source, conversation, {
-      id: `tidy:${ticketId}`,
-      direction: 'out',
-      at: new Date().toISOString(),
-      text: `工单${title}已结束：${outcome}${reason}${tail}`,
-      kind: 'notice',
-      ticketId,
-    })
+    // 无产出结束（被人停止/放弃）且没有结果回复的，属于噪音：不通知。
+    const silent = !answered && (ended?.by === 'human' || String(ended?.outcome) === 'stopped' || String(ended?.outcome) === 'dropped')
+    if (silent) return undefined
+    return { conversation, text: `工单${title}已结束：${outcome}${reason}` }
+  }
+
+  /** 把一批结束通知合并成极少数几条写回面板：同对话超过 3 张就只写一条汇总。 */
+  const flushEnded = (source: any, items: { conversation: string; text: string }[], stamp: string): void => {
+    const byConversation = new Map<string, string[]>()
+    for (const item of items) {
+      const list = byConversation.get(item.conversation) ?? []
+      list.push(item.text)
+      byConversation.set(item.conversation, list)
+    }
+    for (const [conversation, texts] of byConversation) {
+      // 单张照常逐条写（有上下文意义）；一次超过 3 张说明是批量收尾，只报数量与最近一张，
+      // 不把几十张旧工单的标题再列一遍（那一段长通知用户读不过来，也没人真的看）。
+      const chunks = texts.length > 3
+        ? [`本批 ${texts.length} 张工单已收尾：最近${texts[texts.length - 1]!.replace(/^工单/, '')}`]
+        : texts
+      chunks.forEach((text, index) => appendLog(source, conversation, {
+        id: `tidy:${stamp}:${index}`,
+        direction: 'out',
+        at: new Date().toISOString(),
+        text,
+        kind: 'notice',
+      }))
+    }
   }
 
   /** 归档一个 worker 会话；活跃中的工作由 `stopActivity` 停掉，不因为它在跑就放弃收尾。 */
@@ -118,6 +155,11 @@ export function apply(ctx: any, config: Config = {}): void {
     const source = orchestrator.context({ kind: PANE, health: ['pane'] })
     if (!source.configured || !source.configured()) return
     const open = new Set<string>((source.tickets?.open() ?? []).map((ticket: any) => String(ticket.id)))
+    /** 已通知过的工单 id（持久化）：同一张工单只播报一次，避免每轮扫描重播。 */
+    const notified = new Set<string>(Array.isArray(source.state.get(NOTIFIED_KEY)) ? source.state.get(NOTIFIED_KEY) : [])
+    /** 本轮收集到的结束通知，循环结束后统一合并写出（避免一次刷十几条）。 */
+    const endedNotices: { conversation: string; text: string }[] = []
+    const freshlyNotified: string[] = []
     for (const workspace of registry.list()) {
       const sessions: string[] = Array.from(workspace?.sessionIds ?? []).map(String)
       // 只认工单已经不在开放集合里的 worker 会话；正在跑的那张工单因此绝不会被碰到。
@@ -129,7 +171,10 @@ export function apply(ctx: any, config: Config = {}): void {
       for (const sessionId of finished) {
         const ticketId = WORKER_SESSION.exec(sessionId)![1]!
         try {
-          reportEnded(source, ticketId)
+          if (!notified.has(ticketId)) {
+            const item = collectEnded(source, ticketId)
+            if (item) { endedNotices.push(item); freshlyNotified.push(ticketId) }
+          }
         } catch (error) {
           status.errors.push(`report ${ticketId}: ${String(error)}`)
         }
@@ -152,6 +197,16 @@ export function apply(ctx: any, config: Config = {}): void {
         } catch (error) {
           status.errors.push(`workspace ${workspace.id}: ${String(error)}`)
         }
+      }
+    }
+    // 本轮收集到的结束通知统一写出：同对话超过 3 张合成一条，避免一次收尾刷屏。
+    if (endedNotices.length) {
+      try {
+        flushEnded(source, endedNotices, new Date().toISOString())
+        // 写成功才记名单，写失败下一轮还会重试。
+        source.state.set(NOTIFIED_KEY, [...notified, ...freshlyNotified].slice(-NOTIFIED_LIMIT))
+      } catch (error) {
+        status.errors.push(`notify: ${String(error)}`)
       }
     }
     status.sweeps += 1

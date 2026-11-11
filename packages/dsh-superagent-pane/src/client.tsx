@@ -5,8 +5,10 @@
  * 是本插件自己提供的 HTTP 路由，以及宿主公开的管理 API（工单列表）。
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
+import type { ReactNode } from 'react'
 import type { Context } from '@deepseek-ai/cordis'
 import { CcPanel, type CcStatus } from './ccpanel.tsx'
+import type { PaneSchedule, ScheduleSpec } from './schedule.ts'
 
 /** 后端 /pane/health 返回的真实健康度。 */
 type Health = { health: 'ok' | 'idle' | 'zombie' | 'working'; detail?: string; silentMs?: number }
@@ -22,6 +24,16 @@ const API = '/orchestrator/api/pane'
 const HOST_API = '/orchestrator/api'
 /** pane Source 的 Thread 键前缀，与 Node 侧一致。 */
 const THREAD_PREFIX = 'pane:'
+/** 没有进行中工单时，面板保留多少张已结束工单卡供人工评审。 */
+const REVIEW_KEEP = 8
+/** 已结束工单卡最多保留多久：更早收尾的工单用户早就知道了，不该继续占着面板。 */
+const REVIEW_WINDOW_MS = 30 * 60_000
+/** 不再展示的结束方式：人手动停的、放弃的——这些是用户主动了结的，留在面板上只会碍眼。 */
+const SILENT_OUTCOMES = new Set(['stopped', 'dropped'])
+/** 旧版批量收尾通知的长度上限：超过它的历史长通知（几十张工单标题拼成的一段）不再显示。 */
+const NOTICE_MAX_CHARS = 240
+/** 已收尾通知的结局文本：人手动停止 / 放弃的，不再在对话区出现。 */
+const SILENT_NOTICE = /已结束：(stopped|dropped|已放弃)/
 
 /** 派活面板选中态的持久键：记住本标签页里用户是不是停在派活界面。
  *  宿主的全局面板选中态只存在内存里：派活插件的客户端 bundle 热更新（HMR）会先注销它的 main 槽注册、
@@ -100,22 +112,45 @@ function rememberRemovedConversations(names: string[]): void {
   } catch { /* 隐私模式没有 localStorage */ }
 }
 
+/** 展开态的持久化键与上限：宿主按 lib/client.js 的 mtime 热替换时会重新执行本模块，
+ *  模块级 Set 会被清零；同步一份到 sessionStorage，重载后按 id 恢复展开态。 */
+const EXPANDED_STORAGE_KEY = 'dsh-pane-expanded-tickets'
+const EXPANDED_LIMIT = 200
+
+/** 从 sessionStorage 读回已展开的 id；没存过、JSON 坏掉、隐私模式不可用时都当作没有。 */
+function readExpandedTickets(): string[] {
+  try {
+    const parsed = JSON.parse(window.sessionStorage.getItem(EXPANDED_STORAGE_KEY) ?? '[]')
+    return Array.isArray(parsed)
+      ? parsed.filter((id): id is string => typeof id === 'string').slice(-EXPANDED_LIMIT)
+      : []
+  } catch { return [] }
+}
+
+/** 把当前已展开的 id 按 FIFO 顺序写回 sessionStorage；写不进去就算了，不能影响面板本身。 */
+function persistExpandedTickets(): void {
+  try {
+    window.sessionStorage.setItem(EXPANDED_STORAGE_KEY, JSON.stringify([...EXPANDED_TICKETS]))
+  } catch { /* 隐私模式没有 sessionStorage */ }
+}
+
 /** 用户展开过的工单卡 id：存模块级 Set，不用组件 state。
  *  轮询每 2.5 秒换掉 tickets 数组、宿主重渲染导致组件重挂时，展开态都不会丢；
- *  只有用户自己收起（toggle）或关闭（×）该卡时才移除。 */
-const EXPANDED_TICKETS = new Set<string>()
+ *  只有用户自己收起（toggle）或关闭（×）该卡时才移除。模块重载时从 sessionStorage 恢复。 */
+const EXPANDED_TICKETS = new Set<string>(readExpandedTickets())
 
 /** 记/忘一张卡的展开态；上限 200 条，超出丢最旧的，避免长期运行无限增长。 */
 function rememberExpandedTicket(id: string, value: boolean): void {
   if (value) {
     EXPANDED_TICKETS.add(id)
-    while (EXPANDED_TICKETS.size > 200) {
+    while (EXPANDED_TICKETS.size > EXPANDED_LIMIT) {
       const oldest = EXPANDED_TICKETS.values().next().value
       if (typeof oldest === 'string') EXPANDED_TICKETS.delete(oldest)
     }
   } else {
     EXPANDED_TICKETS.delete(id)
   }
+  persistExpandedTickets()
 }
 
 /** 同源管理调用需要的头，面板每个请求都带；令牌随页面 URL 而来。 */
@@ -195,9 +230,12 @@ const zh = {
   waitingBusy: '已送达 · worker 正忙，你的消息在排队（已等 {time}）',
   waitingChat: '已送达 · 等待路由器回复（已等 {time}）',
   modeDispatch: '派活',
-  modeChat: '对话（路由器）',
-  placeholderChat: '和路由器对话：问工单状态、闲聊、查设置（派活请用左侧「派活」）',
-  chatBusyHint: '此对话有进行中的工单：「派活」消息会并进该工单交给它的 worker（工单卡死时才改由路由器分诊）；「对话」消息由路由器即时回复。',
+  modeChat: '对话',
+  modeBroadcast: '广播',
+  placeholderChat: '和路由器对话：问工单状态、闲聊、查设置。只回答，不建工单、不改代码。',
+  placeholderBroadcast: '广播：直接写正文。默认投给最近 12 小时内创建的所有工单（含已结束的，会被唤醒继续干活）',
+  broadcastHint: '广播模式：默认范围是最近 12 小时内创建的所有工单，已结束的也会被唤醒继续处理（被人手动停止的除外）。想换范围就写时间词：最近N小时/最近N天、昨晚、昨天、今天、本周；写「所有/全部」则不限时间。',
+  chatBusyHint: '「对话」只回答问题：不建工单、不派 worker、不改代码。要动工单请用「派活」。',
   divertedHint: '这条派活消息没进卡死的工单，改由路由器分诊：{reason}',
   details: '详情',
   collapse: '收起',
@@ -221,14 +259,61 @@ const zh = {
   toolRoute: '分派工作',
   toolJob: '等待命令输出',
   toolOrchestrator: '处理工单',
+  scheduleOpen: '定时派活',
+  scheduleTitle: '定时派活',
+  scheduleHint: '到点自动把内容发进任务里的对话；服务停机时不补跑，错过会记在任务上。',
+  scheduleTextPlaceholder: '到点要派出去的任务…',
+  scheduleKind: '频率',
+  kindEvery: '每隔',
+  kindDaily: '每天',
+  kindWeekly: '每周',
+  kindOnce: '一次',
+  scheduleEvery: '间隔',
+  minutesUnit: '分钟',
+  scheduleTime: '时间',
+  scheduleWeekdays: '星期',
+  scheduleAt: '执行时间',
+  scheduleAtRequired: '请先选择执行时间',
+  scheduleMode: '方式',
+  scheduleAdd: '添加定时任务',
+  scheduleAdding: '添加中…',
+  scheduleEmpty: '当前对话还没有定时任务。',
+  scheduleNext: '下次 {time}',
+  schedulePaused: '已暂停',
+  scheduleLast: '上次 {time}：{result}',
+  scheduleRun: '立即执行',
+  scheduleRunning: '执行中…',
+  scheduleRunDone: '已立即执行',
+  scheduleToggleOff: '暂停',
+  scheduleToggleOn: '启用',
+  scheduleDelete: '删除',
+  scheduleConfirmDelete: '确认删除？',
+  scheduleCreated: '已创建定时任务',
+  scheduleFailed: '操作失败：{error}',
+  scheduleClose: '关闭',
+  weekday1: '一',
+  weekday2: '二',
+  weekday3: '三',
+  weekday4: '四',
+  weekday5: '五',
+  weekday6: '六',
+  weekday7: '日',
+  badgeScheduled: '定时',
   usageOpen: '打开用量统计',
   usageClose: '收起用量统计',
   usageTitle: '用量统计',
   usageToday: '今日',
   usageWeek: '近 7 天',
+  usageTrend: '近 7 天趋势',
   usageCalls: '{n} 次调用',
   usageByModel: '按模型',
   usageEmpty: '用量数据暂不可用',
+  usageCache: '缓存',
+  usageCacheRead: '读',
+  usageCacheWrite: '写',
+  usageCacheWriteUnreported: '—',
+  usageCacheWriteZeroHint: '当前上游通道不返回缓存写入计数（DeepSeek 无缓存写入计费）',
+  usageHitRate: '命中',
 }
 const en = {
   panel: 'Dispatch',
@@ -286,9 +371,12 @@ const en = {
   waitingBusy: 'Delivered · the worker is busy; your message is queued ({time} so far)',
   waitingChat: 'Delivered · waiting for the router ({time} so far)',
   modeDispatch: 'Dispatch',
-  modeChat: 'Chat (router)',
-  placeholderChat: 'Chat with the router: ticket status, questions, settings (use Dispatch on the left to assign work)',
-  chatBusyHint: 'This conversation has a running ticket: Dispatch messages join that ticket for its worker (they go to the router only when the ticket is stuck); Chat messages are answered by the router right away.',
+  modeChat: 'Chat',
+  modeBroadcast: 'Broadcast',
+  placeholderChat: 'Chat with the router: ticket status, questions, settings. It answers only; no tickets, no code changes.',
+  placeholderBroadcast: 'Broadcast: just type the message. By default it reaches every ticket created in the last 12 hours (ended ones are woken up and continue)',
+  broadcastHint: 'Broadcast mode: the default scope is every ticket created in the last 12 hours, including ended tickets, which are woken up to continue (except ones a person stopped). Add a time phrase to change it: last N hours / last N days, last night, yesterday, today, this week; write "all" for no time limit.',
+  chatBusyHint: 'Chat only answers: it creates no tickets, dispatches no worker and changes no code. Use Dispatch to work on tickets.',
   divertedHint: 'This dispatch message did not go into the stuck ticket; the router is triaging it instead: {reason}',
   details: 'details',
   collapse: 'hide',
@@ -311,22 +399,121 @@ const en = {
   toolRoute: 'routing',
   toolJob: 'waiting for job output',
   toolOrchestrator: 'ticket ops',
+  scheduleOpen: 'Scheduled dispatch',
+  scheduleTitle: 'Scheduled dispatch',
+  scheduleHint: 'The text is sent into its conversation at the set time. Missed runs while the host was down are recorded, not replayed.',
+  scheduleTextPlaceholder: 'The task to dispatch when due…',
+  scheduleKind: 'Frequency',
+  kindEvery: 'Every',
+  kindDaily: 'Daily',
+  kindWeekly: 'Weekly',
+  kindOnce: 'Once',
+  scheduleEvery: 'Every',
+  minutesUnit: 'min',
+  scheduleTime: 'Time',
+  scheduleWeekdays: 'Days',
+  scheduleAt: 'Run at',
+  scheduleAtRequired: 'Pick a run time first',
+  scheduleMode: 'Mode',
+  scheduleAdd: 'Add schedule',
+  scheduleAdding: 'Adding…',
+  scheduleEmpty: 'No schedules in this conversation yet.',
+  scheduleNext: 'Next {time}',
+  schedulePaused: 'paused',
+  scheduleLast: 'Last {time}: {result}',
+  scheduleRun: 'Run now',
+  scheduleRunning: 'Running…',
+  scheduleRunDone: 'Ran now',
+  scheduleToggleOff: 'Pause',
+  scheduleToggleOn: 'Enable',
+  scheduleDelete: 'Delete',
+  scheduleConfirmDelete: 'Delete it?',
+  scheduleCreated: 'Schedule created',
+  scheduleFailed: 'Failed: {error}',
+  scheduleClose: 'Close',
+  weekday1: 'Mon',
+  weekday2: 'Tue',
+  weekday3: 'Wed',
+  weekday4: 'Thu',
+  weekday5: 'Fri',
+  weekday6: 'Sat',
+  weekday7: 'Sun',
+  badgeScheduled: 'scheduled',
   usageOpen: 'Open usage stats',
   usageClose: 'Hide usage stats',
   usageTitle: 'Usage',
   usageToday: 'Today',
   usageWeek: 'Last 7 days',
+  usageTrend: 'Last 7 days trend',
   usageCalls: '{n} calls',
   usageByModel: 'By model',
   usageEmpty: 'Usage data is unavailable',
+  usageCache: 'Cache',
+  usageCacheRead: 'read',
+  usageCacheWrite: 'write',
+  usageCacheWriteUnreported: '—',
+  usageCacheWriteZeroHint: 'The current upstream channel does not report cache writes (DeepSeek has no cache-write billing)',
+  usageHitRate: 'hit',
 }
 
-type Item = { id: string; direction: 'in' | 'out'; at: string; text: string; kind?: string; mode?: string }
+/** 工单上"收到却没被读"的条数；由服务端按 inputs 的 readAt 算出后随列表下发。 */
+function unreadCount(ticket: Ticket): number {
+  const n = Number(ticket.unread ?? 0)
+  return Number.isFinite(n) && n > 0 ? n : 0
+}
+
+/** 入站消息的裁决徽标：只标"需要人留意"的情形；正常建单/转交不打标。 */
+function decisionBadge(item: Item): string {
+  const kind = item.decision?.kind
+  const reason = String(item.decision?.reason ?? '')
+  if (!kind) return ''
+  // routed = 正常转交给某张工单接管，属于健康流转，不打扰。
+  if (reason.startsWith('转交工单') || reason.includes('已在处理')) return ''
+  if (kind === 'ignore') return '未执行'
+  if (kind === 'unavailable') return '未处理'
+  if (kind === 'stop') return '已停止'
+  if (kind === 'evaluating') return '待分诊'
+  return ''
+}
+
+type Item = { id: string; direction: 'in' | 'out'; at: string; text: string; kind?: string; mode?: string; status?: string
+  /** 服务端补上的裁决信息：kind 为 ignore/accept/stop/evaluating 等；reason 是给人看的理由。 */
+  decision?: { kind?: string; reason?: string }
+  /** 该消息对应工单的当前状态（ended/completed/working 等）。 */
+  outcome?: string }
 type Ticket = {
   id: string; title: string; stage?: string; state?: string; summary?: string; sessionId?: string
   createdAt?: string; updatedAt?: string; threads?: { key?: string }[]
+  /** 结束信息：何时、被谁、以什么结局结束；进行中的工单没有。 */
+  ended?: { at?: string; by?: string; outcome?: string; reason?: string }
+  /** 工单累计收到的输入条数（服务端视图只给计数）。 */
+  inputs?: number
+  /** 尚未投递的输入条数。 */
+  undelivered?: number
+  /** 服务端算好的"收到但没被读过"的条数（当前仍存活且未读的输入）。 */
+  unread?: number
 }
 type Activity = { state?: string; kind?: string | null; tool?: string; text?: string; at?: number; ageMs?: number }
+/** 协作规模：未结束工单数、真正在跑的 worker 数、排队数，以及每张工单的状态。 */
+type CrewLane = { lane: string; state: 'running' | 'idle'; task?: string }
+
+/**
+ * lane 的显示名：统一叫 ccwN。
+ * 历史 lane 目录名是 w1/w2（2026-11-11 之前的演示），显示时映射成 ccw1/ccw2，
+ * 不改磁盘目录，避免破坏已有记录；新起的 lane 直接命名 ccwN。
+ */
+function laneLabel(name: string): string {
+  const match = /^w(\d+)$/.exec(name)
+  return match ? `ccw${match[1]}` : name
+}
+type Crew = {
+  tickets: number
+  active: number
+  queued: number
+  /** 真正在跑的 cc-worker 数（按 lane 计，不是进程数）。 */
+  workers?: number
+  items: { ticketId: string; title: string; assignment: string; working: boolean; sessionId?: string; lanes?: CrewLane[] }[]
+}
 type Translate = (key: keyof typeof zh, values?: Record<string, string>) => string
 
 /** 工具名到文案键的映射；未知工具直接显示原名。 */
@@ -441,8 +628,10 @@ function workSummary(t: Translate, activity: Activity): WorkSummary {
 const DOT_STYLE = `.dsh-pane-dot-running{animation:dsh-pane-pulse 1.6s ease-in-out infinite}@keyframes dsh-pane-pulse{0%,100%{opacity:1}50%{opacity:.35}}`
 
 /** 对话上方的一条工单状态条：哪个工单、到哪一步、worker 此刻在做什么（说人话，详情可展开原始命令）。 */
-function TicketBar({ ticket, activity, t, ccStatus, ccExpanded, onToggleCc, onInterrupt, onClear, ccBusy, health, confirmStop, onClose, onComment, onOpenComment }: {
+function TicketBar({ ticket, activity, t, ccStatus, ccExpanded, onToggleCc, onInterrupt, onClear, ccBusy, health, confirmStop, onClose, onComment, onOpenComment, crew }: {
   ticket: Ticket; activity: Activity | null; t: Translate
+  /** 本工单的协作 lane（来自 /crew）；没有或读不到时 undefined。 */
+  crew?: CrewLane[]
   ccStatus: CcStatus | null; ccExpanded: boolean
   onToggleCc: () => void; onInterrupt: () => void; onClear: () => void; ccBusy: boolean
   health?: Health | null; confirmStop: boolean; onClose: () => void
@@ -507,8 +696,30 @@ function TicketBar({ ticket, activity, t, ccStatus, ccExpanded, onToggleCc, onIn
       <span className={stage === 'working' ? 'dsh-pane-dot-running' : ''} style={{ color: dot, fontSize: 10, flexShrink: 0 }}>●</span>
       <strong title={ticket.title} style={{ fontWeight: 600, fontSize: 13, lineHeight: 1.25, flex: '0 1 auto',
         minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: expanded ? 'normal' : 'nowrap' }}>{ticket.title}</strong>
+      {(() => {
+        const lanes = crew ?? []
+        if (lanes.length === 0) return null
+        const running = lanes.filter(lane => lane.state === 'running').length
+        return <span data-pane-ticket-crew={ticket.id}
+          title={`这张工单下有 ${lanes.length} 个 cc-worker（${running} 个在跑）：`
+            + lanes.map(lane => `${laneLabel(lane.lane)} ${lane.state === 'running' ? '运行中' : '空闲'}${lane.task ? ' — ' + lane.task : ''}`).join('；')}
+          style={{ fontSize: 11, fontWeight: 700, padding: '1px 8px', borderRadius: 10, flexShrink: 0,
+            letterSpacing: 0.3, lineHeight: 1.5,
+            border: running > 0 ? '1px solid #4a9eff' : '1px solid #555',
+            background: running > 0 ? '#1d4ed8' : '#3a3a3a',
+            color: running > 0 ? '#fff' : '#ccc',
+            boxShadow: running > 0 ? '0 0 0 2px rgba(74,158,255,.25)' : 'none' }}>
+          👥 协作 {lanes.length}{running > 0 ? ` · ${running} 在跑` : ''}
+        </span>
+      })()}
       {!expanded && compact && <span title={compact} style={{ fontSize: 11, opacity: 0.6, flex: '1 1 0', minWidth: 0,
         overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{compact}</span>}
+      {unreadCount(ticket) > 0 && <span title="这张工单收到了消息但 worker 没读过；工单结束时仍未读，说明消息没被处理就关门了"
+        style={{ fontSize: 10, padding: '0 4px', borderRadius: 3, flexShrink: 0,
+          background: (ticket.stage ?? 'ended') === 'ended' ? '#7a1f1f' : '#6b4c00',
+          color: (ticket.stage ?? 'ended') === 'ended' ? '#ffb4b4' : '#ffd88a' }}>
+        未读 {unreadCount(ticket)}
+      </span>}
       <span style={{ marginLeft: 'auto', opacity: 0.65, whiteSpace: 'nowrap', flexShrink: 0 }}>{label}{elapsed ? ` · ${elapsed}` : ''}</span>
       <button type="button" data-pane-ticket-comment={ticket.id}
         aria-label={t('commentOnTicket')} title={t('commentOnTicket')}
@@ -524,6 +735,32 @@ function TicketBar({ ticket, activity, t, ccStatus, ccExpanded, onToggleCc, onIn
         {confirmStop ? t('stopTicket') : '×'}
       </button>
     </div>
+    {expanded && (crew ?? []).length > 0 && <div data-pane-ticket-crew-detail={ticket.id}
+      style={{ marginTop: 2, padding: '6px 9px', borderRadius: 6,
+        background: 'rgba(74, 158, 255, 0.12)', borderLeft: '3px solid #4a9eff',
+        display: 'flex', flexDirection: 'column', gap: 3 }}>
+      <div style={{ fontSize: 12, fontWeight: 700, color: '#7cb8ff', letterSpacing: 0.2 }}>
+        👥 协作分工 · {(crew ?? []).length} 个 cc-worker
+      </div>
+      {(crew ?? []).map(lane => (
+        <div key={lane.lane} style={{ display: 'flex', gap: 6, alignItems: 'baseline', fontSize: 11.5, minWidth: 0 }}>
+          <span style={{ flexShrink: 0, fontSize: 9, color: lane.state === 'running' ? '#38a169' : '#777' }}>●</span>
+          <span style={{ flexShrink: 0, width: 58, fontWeight: 600, fontFamily: 'monospace',
+            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+            color: lane.state === 'running' ? '#9ae6b4' : '#aaa' }}
+            title={lane.lane}>{laneLabel(lane.lane)}</span>
+          <span style={{ flexShrink: 0, fontSize: 10, padding: '0 5px', borderRadius: 3,
+            background: lane.state === 'running' ? '#1f4d33' : '#333',
+            color: lane.state === 'running' ? '#9ae6b4' : '#999' }}>
+            {lane.state === 'running' ? '运行中' : '空闲'}
+          </span>
+          <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: '#ddd' }}
+            title={lane.task ?? '该 lane 没有登记任务'}>
+            {lane.task ?? <span style={{ opacity: 0.45 }}>未登记任务</span>}
+          </span>
+        </div>
+      ))}
+    </div>}
     {expanded && work && <div style={{ opacity: 0.88 }}>
       {work.phrase}{work.detail ? `（${work.detail}）` : ''}
       {work.stalled !== undefined && <span style={{ color: '#d69e2e' }}>{` · ${fill(t('stalled'), { mins: String(work.stalled) })}`}</span>}
@@ -688,7 +925,10 @@ async function fetchWidgetToken(now: number): Promise<{ tokens: number; calls: n
 }
 
 /** 用量统计一行：daily / byModel 两种粒度共用这个形状。 */
-type UsageBucket = { key: string; calls: number; totalTokens: number; cost: number }
+type UsageBucket = {
+  key: string; calls: number; totalTokens: number; cost: number
+  inputTokens: number; cacheReadTokens: number; cacheWriteTokens: number
+}
 type UsageOverview = {
   today: UsageBucket | null
   /** 近 7 天逐日序列，按日期升序，缺数据的天补 0；柱状图直接用它。 */
@@ -696,8 +936,86 @@ type UsageOverview = {
   weekTokens: number
   weekCost: number
   weekCalls: number
+  /** 近 7 天缓存聚合；命中率 = cacheRead / (input + cacheRead)。 */
+  weekInputTokens: number
+  weekCacheReadTokens: number
+  weekCacheWriteTokens: number
   models: UsageBucket[]
   symbol: string
+}
+
+/** 缓存命中率：inputTokens 为 0（或无数据）时显示「—」，避免除零误导。 */
+function widgetHitRate(inputTokens: number, cacheReadTokens: number): string {
+  if (!Number.isFinite(inputTokens) || inputTokens <= 0) return '—'
+  return `${Math.round((cacheReadTokens / (inputTokens + cacheReadTokens)) * 100)}%`
+}
+
+/** 用量浮层的分组块：块间细分隔线 + 11px 弱化小标题，块内结构由调用方决定。 */
+function UsageSection({ group, title, first, children }:
+  { group: string; title: string; first?: boolean; children: ReactNode }) {
+  return (
+    <div data-pane-usage-group={group}
+      style={{ display: 'flex', flexDirection: 'column', gap: 3,
+        marginTop: first === true ? 2 : 8, paddingTop: first === true ? 0 : 8,
+        borderTop: first === true ? 'none' : '1px solid rgba(140, 140, 140, 0.7)' }}>
+      <div style={{ fontSize: 11, lineHeight: 1.3, opacity: 0.6 }}>{title}</div>
+      {children}
+    </div>
+  )
+}
+
+/**
+ * 缓存行：今日 / 近 7 天共用，data-* 留给浏览器验证抓真实数值。
+ * 用固定列宽 + tabular-nums 把「读 / 写 / 命中」三对齐，两个时期块之间不会错位。
+ */
+function UsageCacheRow({ period, t, inputTokens, cacheReadTokens, cacheWriteTokens }:
+  { period: 'today' | 'week'; t: Translate; inputTokens: number; cacheReadTokens: number; cacheWriteTokens: number }) {
+  const rate = widgetHitRate(inputTokens, cacheReadTokens)
+  // 当前上游通道（DeepSeek over anthropic-messages）不返回 cache_creation_input_tokens，
+  // 会话层把缺失折叠成 0；这里把 0 渲染成「—」，避免「未上报」被误读成「真的写了 0」。
+  const writeReported = Number.isFinite(cacheWriteTokens) && cacheWriteTokens > 0
+  const writeHint = writeReported ? undefined : t('usageCacheWriteZeroHint')
+  return (
+    <div data-pane-usage-cache={period} data-cache-read={cacheReadTokens} data-cache-write={cacheWriteTokens}
+      data-cache-write-reported={writeReported}
+      data-hit-rate={rate}
+      style={{ display: 'grid', gridTemplateColumns: '40px 1fr 1fr 54px', columnGap: 4, alignItems: 'baseline',
+        marginTop: 3, paddingTop: 3, borderTop: '1px solid rgba(140, 140, 140, 0.25)',
+        fontSize: 10, lineHeight: 1.4, fontVariantNumeric: 'tabular-nums' }}>
+      <span style={{ opacity: 0.7, whiteSpace: 'nowrap' }}>{t('usageCache')}</span>
+      <span style={{ whiteSpace: 'nowrap' }}>
+        <span style={{ opacity: 0.6 }}>{t('usageCacheRead')} </span>{widgetCompact(cacheReadTokens)}
+      </span>
+      <span style={{ whiteSpace: 'nowrap' }} title={writeHint}>
+        <span style={{ opacity: 0.6 }}>{t('usageCacheWrite')} </span>
+        {writeReported ? widgetCompact(cacheWriteTokens) : t('usageCacheWriteUnreported')}
+      </span>
+      <span style={{ whiteSpace: 'nowrap', textAlign: 'right' }}>
+        <span style={{ opacity: 0.6 }}>{t('usageHitRate')} </span>{rate}
+      </span>
+    </div>
+  )
+}
+
+/** 单个时期的统计块：主行 token 总量，次行调用数与费用，第三行缓存明细。 */
+function UsagePeriodBlock({ period, t, label, tokens, calls, cost, symbol, inputTokens, cacheReadTokens, cacheWriteTokens, first }:
+  { period: 'today' | 'week'; t: Translate; label: string; tokens: number; calls: number; cost: number; symbol: string
+    inputTokens: number; cacheReadTokens: number; cacheWriteTokens: number; first?: boolean }) {
+  return (
+    <UsageSection group={period} title={label} first={first}>
+      <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 8 }}>
+        <span style={{ fontSize: 14, fontWeight: 600, lineHeight: 1.2, fontVariantNumeric: 'tabular-nums' }}>
+          {widgetCompact(tokens)}
+          <span style={{ marginLeft: 2, fontSize: 10, fontWeight: 400, opacity: 0.55 }}>tok</span>
+        </span>
+        <span style={{ fontSize: 10, lineHeight: 1.4, opacity: 0.65, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>
+          {fill(t('usageCalls'), { n: String(calls) })}<span style={{ opacity: 0.6 }}> · </span>{widgetCost(cost, symbol)}
+        </span>
+      </div>
+      <UsageCacheRow period={period} t={t} inputTokens={inputTokens}
+        cacheReadTokens={cacheReadTokens} cacheWriteTokens={cacheWriteTokens} />
+    </UsageSection>
+  )
 }
 
 /** 费用格式化：小额保留 3 位，1 以上两位，大额取整。 */
@@ -733,6 +1051,9 @@ async function fetchUsageOverview(now: number): Promise<UsageOverview | null> {
       calls: Number(raw?.calls ?? 0),
       totalTokens: Number(raw?.totalTokens ?? 0),
       cost: Number(raw?.cost ?? 0),
+      inputTokens: Number(raw?.inputTokens ?? 0),
+      cacheReadTokens: Number(raw?.cacheReadTokens ?? 0),
+      cacheWriteTokens: Number(raw?.cacheWriteTokens ?? 0),
     })
     const rawDays = (Array.isArray(body.value.daily) ? body.value.daily : []).map(bucket)
     // sv-SE 输出 YYYY-MM-DD，且按本地时区，与 daily.key 口径一致。
@@ -743,7 +1064,9 @@ async function fetchUsageOverview(now: number): Promise<UsageOverview | null> {
     const days: UsageBucket[] = []
     for (let offset = 6; offset >= 0; offset -= 1) {
       const key = new Date(widgetStartOfDay(now) - offset * 86_400_000).toLocaleDateString('sv-SE')
-      days.push(dayByKey.get(key) ?? { key, calls: 0, totalTokens: 0, cost: 0 })
+      days.push(dayByKey.get(key) ?? {
+        key, calls: 0, totalTokens: 0, cost: 0, inputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
+      })
     }
     return {
       today: dayByKey.get(todayKey) ?? null,
@@ -751,6 +1074,9 @@ async function fetchUsageOverview(now: number): Promise<UsageOverview | null> {
       weekTokens: days.reduce((sum, item) => sum + item.totalTokens, 0),
       weekCost: days.reduce((sum, item) => sum + item.cost, 0),
       weekCalls: days.reduce((sum, item) => sum + item.calls, 0),
+      weekInputTokens: days.reduce((sum, item) => sum + item.inputTokens, 0),
+      weekCacheReadTokens: days.reduce((sum, item) => sum + item.cacheReadTokens, 0),
+      weekCacheWriteTokens: days.reduce((sum, item) => sum + item.cacheWriteTokens, 0),
       models: (Array.isArray(body.value.byModel) ? body.value.byModel : [])
         .map(bucket).filter(item => item.totalTokens > 0).sort((a, b) => b.totalTokens - a.totalTokens),
       symbol: typeof body.value.currency?.symbol === 'string' ? body.value.currency.symbol : '',
@@ -881,33 +1207,42 @@ function PaneStatusWidget({ t }: { t: Translate }) {
         <span aria-hidden style={{ opacity: 0.6, fontSize: 9 }}>{open ? '▲' : '▼'}</span>
       </button>
       {open && <div data-pane-usage-panel="" role="region" aria-label={t('usageTitle')}
-        style={{ position: 'absolute', top: 'calc(100% + 6px)', right: 0, width: 268, padding: '8px 10px',
-          display: 'flex', flexDirection: 'column', gap: 3, whiteSpace: 'normal', textAlign: 'left',
+        style={{ position: 'absolute', top: 'calc(100% + 6px)', right: 0, width: 290, boxSizing: 'border-box',
+          padding: '8px 10px',
+          display: 'flex', flexDirection: 'column', gap: 0, whiteSpace: 'normal', textAlign: 'left',
           borderRadius: 8, border: '0.5px solid var(--dsw-alias-border-l3, #4b5563)',
           background: 'var(--dsw-alias-bg-layer-2, #1b1b1b)', boxShadow: '0 8px 24px rgba(0, 0, 0, 0.4)', fontSize: 11 }}>
         {usage === null ? <span style={{ opacity: 0.7 }}>{t('usageEmpty')}</span> : <>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 3 }}>
-            <strong>{t('usageTitle')}</strong><span style={{ opacity: 0.6 }}>{t('usageWeek')}</span>
+          <div style={{ display: 'flex', alignItems: 'baseline', marginBottom: 2 }}>
+            <strong>{t('usageTitle')}</strong>
           </div>
-          <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
-            <span style={{ opacity: 0.75 }}>{t('usageToday')}</span>
-            <span>{widgetCompact(usage.today?.totalTokens ?? 0)}tok · {fill(t('usageCalls'), { n: String(usage.today?.calls ?? 0) })}
-              · {widgetCost(usage.today?.cost ?? 0, usage.symbol)}</span>
-          </div>
-          <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
-            <span style={{ opacity: 0.75 }}>{t('usageWeek')}</span>
-            <span>{widgetCompact(usage.weekTokens)}tok · {fill(t('usageCalls'), { n: String(usage.weekCalls) })}
-              · {widgetCost(usage.weekCost, usage.symbol)}</span>
-          </div>
-          <UsageBars days={usage.days} />
-          <div style={{ marginTop: 5, opacity: 0.6 }}>{t('usageByModel')}</div>
-          {usage.models.slice(0, 5).map(model => (
-            <div key={model.key} style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
-              <span title={model.key} style={{ maxWidth: 150, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{model.key}</span>
-              <span style={{ flexShrink: 0 }}>{widgetCompact(model.totalTokens)}tok
-                {usage.weekTokens > 0 ? ` · ${((model.totalTokens / usage.weekTokens) * 100).toFixed(0)}%` : ''}</span>
-            </div>
-          ))}
+          <UsagePeriodBlock period="today" t={t} first label={t('usageToday')}
+            tokens={usage.today?.totalTokens ?? 0} calls={usage.today?.calls ?? 0}
+            cost={usage.today?.cost ?? 0} symbol={usage.symbol}
+            inputTokens={usage.today?.inputTokens ?? 0} cacheReadTokens={usage.today?.cacheReadTokens ?? 0}
+            cacheWriteTokens={usage.today?.cacheWriteTokens ?? 0} />
+          <UsagePeriodBlock period="week" t={t} label={t('usageWeek')}
+            tokens={usage.weekTokens} calls={usage.weekCalls} cost={usage.weekCost} symbol={usage.symbol}
+            inputTokens={usage.weekInputTokens} cacheReadTokens={usage.weekCacheReadTokens}
+            cacheWriteTokens={usage.weekCacheWriteTokens} />
+          <UsageSection group="trend" title={t('usageTrend')}>
+            <UsageBars days={usage.days} />
+          </UsageSection>
+          <UsageSection group="models" title={t('usageByModel')}>
+            {usage.models.slice(0, 5).map((model, index) => (
+              <div key={model.key} data-pane-usage-model-row={model.key}
+                style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) 68px 36px',
+                  columnGap: 6, alignItems: 'baseline', lineHeight: 1.5, fontVariantNumeric: 'tabular-nums',
+                  paddingTop: index === 0 ? 0 : 4, paddingBottom: 3,
+                  borderTop: index === 0 ? 'none' : '1px solid rgba(140, 140, 140, 0.45)' }}>
+                <span title={model.key} style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{model.key}</span>
+                <span style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>{widgetCompact(model.totalTokens)}tok</span>
+                <span style={{ textAlign: 'right', whiteSpace: 'nowrap', opacity: 0.6 }}>
+                  {usage.weekTokens > 0 ? `${((model.totalTokens / usage.weekTokens) * 100).toFixed(0)}%` : '—'}
+                </span>
+              </div>
+            ))}
+          </UsageSection>
         </>}
       </div>}
     </div>
@@ -926,9 +1261,11 @@ function PanePanel({ t }: { t: Translate }) {
   const [ticketConversations, setTicketConversations] = useState<string[]>([])
   const [items, setItems] = useState<Item[]>([])
   const [draft, setDraft] = useState('')
-  const [mode, setMode] = useState<'dispatch' | 'chat'>('dispatch')
+  const [mode, setMode] = useState<'assign' | 'chat' | 'broadcast'>('assign')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  /** 每张工单的协作 lane 明细（/crew）：直接显示在各自工单卡上，不再走右上角汇总。 */
+  const [crew, setCrew] = useState<Crew | null>(null)
   const [tickets, setTickets] = useState<Ticket[]>([])
   const [activities, setActivities] = useState<Record<string, Activity>>({})
   const [ccStatuses, setCcStatuses] = useState<Record<string, CcStatus>>({})
@@ -941,6 +1278,8 @@ function PanePanel({ t }: { t: Translate }) {
   const [confirmRemove, setConfirmRemove] = useState<string | null>(null)
   /** 删除被拒绝时的可见提示（不进发送失败的 error，两者文案不同）。 */
   const [removeNotice, setRemoveNotice] = useState('')
+  /** 定时派活弹窗是否打开。 */
+  const [schedulesOpen, setSchedulesOpen] = useState(false)
   const [confirmStop, setConfirmStop] = useState<string | null>(null)
   /** 上一次发送被服务端分流时的原因；下次发送或切换对话即清除。 */
   const [divertedNotice, setDivertedNotice] = useState('')
@@ -963,12 +1302,37 @@ function PanePanel({ t }: { t: Translate }) {
   // 切换对话时回到「跟随」状态：新对话应该直接看到最新消息。
   useEffect(() => { pinnedRef.current = true }, [conversation])
 
+  // 协作明细轮询：5 秒一次。只在结构正确时覆盖，接口偶发异常不让整块面板崩。
+  useEffect(() => {
+    let alive = true
+    const tick = () => {
+      void call('/crew')
+        .then(next => {
+          if (!alive) return
+          const body = next as Crew
+          if (body && Array.isArray(body.items)) setCrew(body)
+        })
+        .catch(() => { /* 读不到就保持上次 */ })
+    }
+    tick()
+    const timer = setInterval(tick, 5000)
+    return () => { alive = false; clearInterval(timer) }
+  }, [])
+
   useEffect(() => { setDivertedNotice('') }, [conversation])
 
   const load = useCallback(async () => {
     try {
       const body = await call(`/log/${encodeURIComponent(conversation)}`)
-      setItems(Array.isArray(body?.items) ? body.items : [])
+      // 收尾通知只在刚结束时有用；陈年的「工单已结束」不再占据对话区（用户的消息与回复一律保留）。
+      // 旧版本按批次把几十张旧工单标题拼成一两千字的长通知（用户明确嫌烦），这类历史条目也一并隐藏。
+      const since = Date.now() - REVIEW_WINDOW_MS
+      setItems((Array.isArray(body?.items) ? body.items : []).filter((item: Item) => {
+        if (item.kind !== 'notice') return true
+        const text = String(item.text ?? '')
+        if (text.length > NOTICE_MAX_CHARS || SILENT_NOTICE.test(text)) return false
+        return Date.parse(String(item.at ?? '')) >= since
+      }))
     } catch { /* 未知对话就是还没有消息 */ }
   }, [conversation])
 
@@ -1076,7 +1440,7 @@ function PanePanel({ t }: { t: Translate }) {
       const hideList = await call('/hidden').catch(() => ({ ids: [] }))
       const hiddenIds: string[] = Array.isArray(hideList?.ids) ? hideList.ids : []
       // 显式带 limit：宿主默认只回最新 20 条 open 工单，open 多时目标会话的卡会被漏掉。
-      const open = await request(`${HOST_API}/tickets?state=open&limit=1000`)
+      const open = await call('/tickets?state=open&limit=200').catch(() => ({ items: [] }))
       // 从进行中工单绑定（含 ~chat / ~d* 子线程）的线程反推 pane 会话名：有任务的会话不能从下拉消失。
       const derived = new Set<string>()
       for (const item of (open?.items ?? []))
@@ -1089,10 +1453,19 @@ function PanePanel({ t }: { t: Translate }) {
       const mine = (open?.items ?? []).filter(onThread)
       let list: Ticket[] = mine
       if (!list.length) {
-        const ended = await request(`${HOST_API}/tickets?state=ended&limit=20`)
-        // 参照卡只认最近一张已结束的工单；关过的那张不再显示，也不顺延到更旧的。
-        const latest = (ended?.items ?? []).filter(onThread)[0]
-        list = latest && !hiddenIds.includes(latest.id) ? [latest] : []
+        // 没有进行中的工单时，保留最近若干张已结束的工单卡以便人工评审——此前只保留一张，
+        // 新工单完成后会把上一张顶掉，看起来像"一完成就自动消失"。手动关闭过的（pane-hidden）仍不显示。
+        // 只留 30 分钟内结束、且不是人停/放弃的：陈年旧单和用户手动了结的工单不再占着面板。
+        const since = Date.now() - REVIEW_WINDOW_MS
+        const ended = await call('/tickets?state=ended&limit=30').catch(() => ({ items: [] }))
+        list = (ended?.items ?? []).filter(onThread).filter(item => !hiddenIds.includes(item.id))
+          .filter(item => {
+            // 还带着未读 / 未投递消息的，说明有人还没看到结果：不论多老都留着，别静默吞掉。
+            if (unreadCount(item) > 0) return true
+            const at = Date.parse(String(item.ended?.at ?? item.updatedAt ?? ''))
+            return Number.isFinite(at) && at >= since && !SILENT_OUTCOMES.has(String(item.ended?.outcome ?? ''))
+          })
+          .slice(0, REVIEW_KEEP)
       }
       setTickets(list)
       const next: Record<string, Activity> = {}
@@ -1217,7 +1590,7 @@ function PanePanel({ t }: { t: Translate }) {
    *  只走 Eval → 路由器按文本里的工单 id 挂到那一张。 */
   const commentOnTicket = useCallback(async (ticket: Ticket, text: string) => {
     const composed = `【给工单「${ticket.title}」(${ticket.id}) 的意见，请交给该工单的 worker，不要新建工单】\n${text}`
-    const sent = await call('/message', { method: 'POST', body: JSON.stringify({ conversation: commentConversation(ticket.id), text: composed, mode: 'dispatch' }) })
+    const sent = await call('/message', { method: 'POST', body: JSON.stringify({ conversation: commentConversation(ticket.id), text: composed, mode: 'note' }) })
     setDivertedNotice(typeof sent?.diverted === 'string' ? sent.diverted : '')
     pinnedRef.current = true
     await load()
@@ -1262,12 +1635,18 @@ function PanePanel({ t }: { t: Translate }) {
           cursor: canDeleteConversation ? 'pointer' : 'not-allowed' }}>
         {confirmingRemove ? t('confirmDelete') : '×'}
       </button>
+      <button type="button" data-pane-schedules="" aria-label={t('scheduleOpen')} title={t('scheduleOpen')}
+        onClick={() => setSchedulesOpen(true)}
+        style={{ height: 24, padding: '0 8px', fontSize: 12, lineHeight: 1, flexShrink: 0,
+          opacity: 0.75, cursor: 'pointer' }}>⏰</button>
     </div>
     {/* 工单区独立限高滚动：工单多或展开时只在这个区域里滚，不撑破面板。 */}
     {tickets.length > 0 && <div className="dsh-pane-tickets"
       style={{ display: 'flex', flexDirection: 'column', gap: 6, flex: '0 1 auto', minHeight: 0, overflowY: 'auto' }}>
       {tickets.map(ticket => (
-        <TicketBar key={ticket.id} ticket={ticket} activity={ticket.sessionId ? activities[ticket.sessionId] ?? null : null} t={t}
+        <TicketBar key={ticket.id} ticket={ticket}
+          crew={crew?.items.find(item => item.ticketId === ticket.id)?.lanes}
+          activity={ticket.sessionId ? activities[ticket.sessionId] ?? null : null} t={t}
           ccStatus={ccStatuses[ticket.id] ?? null} ccExpanded={ccExpanded}
           health={healths[ticket.id] ?? null}
           onToggleCc={() => setCcExpanded(value => !value)}
@@ -1290,6 +1669,16 @@ function PanePanel({ t }: { t: Translate }) {
           color: item.direction === 'in' ? '#fff' : 'inherit' }}>
           <div style={{ fontSize: 11, opacity: 0.7, marginBottom: 2 }}>
             {item.direction === 'in' ? t('you') : `${t('agent')}${item.kind ? ` · ${item.kind}` : ''}`}
+            {item.direction === 'in' && item.status === 'scheduled' && (
+              <span style={{ marginLeft: 6, padding: '0 5px', borderRadius: 3,
+                background: '#2f4f37', color: '#9ae6b4', fontSize: 10 }}>{t('badgeScheduled')}</span>
+            )}
+            {item.direction === 'in' && decisionBadge(item) && (
+              <span title={item.decision?.reason ?? ''} style={{ marginLeft: 6, padding: '0 5px', borderRadius: 3,
+                background: '#8a5a00', color: '#ffd88a', fontSize: 10 }}>
+                {decisionBadge(item)}
+              </span>
+            )}
           </div>
           {item.text}
         </div>
@@ -1308,19 +1697,20 @@ function PanePanel({ t }: { t: Translate }) {
     </div>}
     <div style={{ display: 'flex', gap: 8, alignItems: 'stretch' }}>
       <textarea value={draft} onChange={event => setDraft(event.target.value)}
-        placeholder={mode === 'chat' ? t('placeholderChat') : t('placeholder')} rows={3}
+        placeholder={mode === 'chat' ? t('placeholderChat')
+          : mode === 'broadcast' ? t('placeholderBroadcast') : t('placeholder')} rows={3}
         onKeyDown={event => {
           if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void send() }
         }}
         style={{ flex: 1, resize: 'vertical', padding: 8 }} />
       <div style={{ display: 'flex', flexDirection: 'column', gap: 6, justifyContent: 'space-between' }}>
         <div style={{ display: 'flex', border: '1px solid var(--dt-border, #333)', borderRadius: 6, overflow: 'hidden' }}>
-          {(['dispatch', 'chat'] as const).map(item => (
+          {(['assign', 'broadcast', 'chat'] as const).map(item => (
             <button key={item} type="button" onClick={() => setMode(item)}
-              title={item === 'chat' ? t('placeholderChat') : ''}
+              title={item === 'chat' ? t('placeholderChat') : item === 'broadcast' ? t('placeholderBroadcast') : ''}
               style={{ padding: '3px 10px', fontSize: 12, border: 'none', cursor: 'pointer',
                 background: mode === item ? 'var(--dt-accent, #2b6cb0)' : 'transparent', color: mode === item ? '#fff' : 'inherit' }}>
-              {item === 'dispatch' ? t('modeDispatch') : t('modeChat')}
+              {item === 'assign' ? t('modeDispatch') : item === 'broadcast' ? t('modeBroadcast') : t('modeChat')}
             </button>
           ))}
         </div>
@@ -1329,7 +1719,9 @@ function PanePanel({ t }: { t: Translate }) {
         </button>
       </div>
     </div>
-    {mode === 'chat' && working && <div style={{ fontSize: 11, opacity: 0.6 }}>{t('chatBusyHint')}</div>}
+    {mode === 'chat' && <div style={{ fontSize: 11, opacity: 0.6 }}>{t('chatBusyHint')}</div>}
+    {mode === 'broadcast' && <div style={{ fontSize: 11, opacity: 0.6 }}>{t('broadcastHint')}</div>}
+    {schedulesOpen && <SchedulePanel t={t} conversation={conversation} onClose={() => setSchedulesOpen(false)} />}
   </div>
 }
 
@@ -1376,4 +1768,187 @@ export function apply(ctx: Context): void {
     sync()
     return () => { off() }
   }, 'pane: remember selected panel')
+}
+
+/** 定时派活弹窗：管理当前对话的定时任务（列表 + 新建 + 启停 / 立即执行 / 删除）。 */
+function SchedulePanel({ t, conversation, onClose }: { t: Translate; conversation: string; onClose: () => void }) {
+  const [items, setItems] = useState<PaneSchedule[]>([])
+  const [text, setText] = useState('')
+  const [kind, setKind] = useState<'daily' | 'weekly' | 'every' | 'at'>('daily')
+  const [time, setTime] = useState('09:00')
+  const [weekdays, setWeekdays] = useState<number[]>([1])
+  const [minutes, setMinutes] = useState('30')
+  const [at, setAt] = useState(() => {
+    const date = new Date(Date.now() + 3_600_000)
+    const pad = (value: number) => String(value).padStart(2, '0')
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`
+  })
+  const [mode, setMode] = useState<'assign' | 'chat' | 'broadcast'>('assign')
+  const [busy, setBusy] = useState(false)
+  const [runBusy, setRunBusy] = useState('')
+  const [error, setError] = useState('')
+  const [notice, setNotice] = useState('')
+  const [confirmId, setConfirmId] = useState<string | null>(null)
+
+  const load = useCallback(async () => {
+    try {
+      const body = await call('/schedules')
+      setItems(Array.isArray(body?.items) ? body.items : [])
+    } catch { /* 列表读不到就保持上一次结果 */ }
+  }, [])
+
+  useEffect(() => {
+    void load()
+    const timer = setInterval(() => { void load() }, 5000)
+    return () => clearInterval(timer)
+  }, [load])
+
+  // 「确认删除？」亮着 5 秒没有下文就自动还原，和工单卡、对话删除一致。
+  useEffect(() => {
+    if (!confirmId) return
+    const timer = setTimeout(() => setConfirmId(null), 5000)
+    return () => clearTimeout(timer)
+  }, [confirmId])
+
+  const summary = (spec: ScheduleSpec): string => {
+    if (spec.kind === 'every') return `${t('kindEvery')} ${spec.everyMinutes} ${t('minutesUnit')}`
+    if (spec.kind === 'daily') return `${t('kindDaily')} ${spec.time}`
+    if (spec.kind === 'weekly') return `${t('kindWeekly')} ${spec.weekdays.map(day => t(`weekday${day}` as keyof typeof zh)).join('、')} ${spec.time}`
+    return `${t('kindOnce')} ${spec.at.replace('T', ' ')}`
+  }
+
+  /** 列表里的时间都按浏览器本地时间显示；主机与浏览器通常同一台机器。 */
+  const formatWhen = (ms: number): string => {
+    const date = new Date(ms)
+    const pad = (value: number) => String(value).padStart(2, '0')
+    return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
+  }
+
+  const fail = (failure: unknown): void => setError(failure instanceof Error ? failure.message : String(failure))
+
+  const add = async () => {
+    if (!text.trim() || busy) return
+    setBusy(true); setError(''); setNotice('')
+    try {
+      const spec: ScheduleSpec = kind === 'daily' ? { kind, time }
+        : kind === 'weekly' ? { kind, weekdays: weekdays.length ? [...weekdays].sort((a, b) => a - b) : [1], time }
+          : kind === 'every' ? { kind, everyMinutes: Math.max(1, Math.min(43_200, Math.floor(Number(minutes) || 0))) }
+            : { kind, at }
+      if (spec.kind === 'at' && !spec.at) throw new Error(t('scheduleAtRequired'))
+      await call('/schedules', { method: 'POST', body: JSON.stringify({ conversation, text: text.trim(), mode, spec }) })
+      setText('')
+      setNotice(t('scheduleCreated'))
+      await load()
+    } catch (failure) { fail(failure) } finally { setBusy(false) }
+  }
+
+  const toggle = async (record: PaneSchedule) => {
+    setError(''); setNotice('')
+    try {
+      await call(`/schedules/${record.id}/toggle`, { method: 'POST', body: JSON.stringify({ enabled: !record.enabled }) })
+      await load()
+    } catch (failure) { fail(failure) }
+  }
+
+  const run = async (record: PaneSchedule) => {
+    if (runBusy) return
+    setRunBusy(record.id); setError(''); setNotice('')
+    try {
+      await call(`/schedules/${record.id}/run`, { method: 'POST', body: '{}' })
+      setNotice(t('scheduleRunDone'))
+      await load()
+    } catch (failure) { fail(failure) } finally { setRunBusy('') }
+  }
+
+  const remove = async (record: PaneSchedule) => {
+    if (confirmId !== record.id) { setConfirmId(record.id); return }
+    setConfirmId(null); setError(''); setNotice('')
+    try {
+      await call(`/schedules/${record.id}/delete`, { method: 'POST', body: '{}' })
+      await load()
+    } catch (failure) { fail(failure) }
+  }
+
+  const inputStyle = { padding: '2px 4px', fontSize: 12, border: '1px solid var(--dt-border,#333)', borderRadius: 4,
+    background: 'var(--dt-surface,#2d2d2d)', color: 'inherit' } as const
+  const buttonStyle = { padding: '3px 8px', fontSize: 12 } as const
+
+  return <div style={{ position: 'fixed', inset: 0, zIndex: 60, background: 'rgba(0,0,0,.45)',
+    display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 12 }} onClick={onClose}>
+    <div onClick={event => event.stopPropagation()} style={{ width: 'min(640px, 96vw)', maxHeight: '86vh', overflowY: 'auto',
+      background: 'var(--dt-surface, #222)', border: '1px solid var(--dt-border, #333)', borderRadius: 10, padding: 14,
+      display: 'flex', flexDirection: 'column', gap: 10 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <strong style={{ fontSize: 14 }}>{t('scheduleTitle')}</strong>
+        <span style={{ fontSize: 11, opacity: 0.6 }}>{conversation}</span>
+        <button type="button" onClick={onClose} style={{ ...buttonStyle, marginLeft: 'auto' }}>{t('scheduleClose')}</button>
+      </div>
+      <div style={{ fontSize: 11, opacity: 0.6 }}>{t('scheduleHint')}</div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8, border: '1px solid var(--dt-border, #333)', borderRadius: 8, padding: 10 }}>
+        <textarea value={text} onChange={event => setText(event.target.value)} rows={2}
+          placeholder={t('scheduleTextPlaceholder')} style={{ resize: 'vertical', padding: 6, fontSize: 12 }} />
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', fontSize: 12 }}>
+          <label>{t('scheduleKind')} <select value={kind} onChange={event => setKind(event.target.value as typeof kind)} style={inputStyle}>
+            <option value="daily">{t('kindDaily')}</option>
+            <option value="weekly">{t('kindWeekly')}</option>
+            <option value="every">{t('kindEvery')}</option>
+            <option value="at">{t('kindOnce')}</option>
+          </select></label>
+          {kind === 'every' && <label>{t('scheduleEvery')} <input type="number" min={1} max={43200} value={minutes}
+            onChange={event => setMinutes(event.target.value)} style={{ ...inputStyle, width: 72 }} /> {t('minutesUnit')}</label>}
+          {(kind === 'daily' || kind === 'weekly') && <label>{t('scheduleTime')} <input type="time" value={time}
+            onChange={event => setTime(event.target.value)} style={inputStyle} /></label>}
+          {kind === 'weekly' && <span style={{ display: 'flex', gap: 4, alignItems: 'center' }}>{t('scheduleWeekdays')}
+            {[1, 2, 3, 4, 5, 6, 7].map(day => <label key={day} style={{ display: 'inline-flex', alignItems: 'center', gap: 1 }}>
+              <input type="checkbox" checked={weekdays.includes(day)}
+                onChange={() => setWeekdays(previous => previous.includes(day)
+                  ? previous.filter(item => item !== day)
+                  : [...previous, day].sort((a, b) => a - b))} />{t(`weekday${day}` as keyof typeof zh)}
+            </label>)}
+          </span>}
+          {kind === 'at' && <label>{t('scheduleAt')} <input type="datetime-local" value={at}
+            onChange={event => setAt(event.target.value)} style={inputStyle} /></label>}
+          <label>{t('scheduleMode')} <select value={mode} onChange={event => setMode(event.target.value as typeof mode)} style={inputStyle}>
+            <option value="dispatch">{t('modeDispatch')}</option>
+            <option value="broadcast">{t('modeBroadcast')}</option>
+            <option value="chat">{t('modeChat')}</option>
+          </select></label>
+          <button type="button" onClick={() => { void add() }} disabled={busy || !text.trim()}
+            style={{ ...buttonStyle, marginLeft: 'auto' }}>{busy ? t('scheduleAdding') : t('scheduleAdd')}</button>
+        </div>
+        {notice && <div style={{ fontSize: 11, color: '#9ae6b4' }}>{notice}</div>}
+        {error && <div style={{ color: '#e53e3e', fontSize: 11 }}>{fill(t('scheduleFailed'), { error })}</div>}
+      </div>
+      {items.length === 0
+        ? <div style={{ fontSize: 12, opacity: 0.6 }}>{t('scheduleEmpty')}</div>
+        : items.map(record => (
+          <div key={record.id} style={{ display: 'flex', flexDirection: 'column', gap: 4,
+            border: '1px solid var(--dt-border, #333)', borderRadius: 8, padding: 9, opacity: record.enabled ? 1 : 0.6 }}>
+            <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', fontSize: 11 }}>
+              <span style={{ padding: '1px 6px', borderRadius: 3, border: '1px solid var(--dt-border,#333)' }}>{summary(record.spec)}</span>
+              {record.conversation !== conversation && <span style={{ opacity: 0.6 }}>{record.conversation}</span>}
+              <span style={{ opacity: 0.7, marginLeft: 'auto' }}>
+                {record.enabled ? fill(t('scheduleNext'), { time: formatWhen(record.nextAtMs) }) : t('schedulePaused')}
+              </span>
+            </div>
+            <div style={{ fontSize: 12, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{record.text}</div>
+            {record.lastAt && <div style={{ fontSize: 11, opacity: 0.6 }}>
+              {fill(t('scheduleLast'), { time: formatWhen(Date.parse(record.lastAt)), result: record.lastResult ?? '' })}
+            </div>}
+            <div style={{ display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
+              <button type="button" onClick={() => { void run(record) }} disabled={runBusy === record.id} style={buttonStyle}>
+                {runBusy === record.id ? t('scheduleRunning') : t('scheduleRun')}
+              </button>
+              <button type="button" onClick={() => { void toggle(record) }} style={buttonStyle}>
+                {record.enabled ? t('scheduleToggleOff') : t('scheduleToggleOn')}
+              </button>
+              <button type="button" onClick={() => { void remove(record) }}
+                style={{ ...buttonStyle, color: confirmId === record.id ? '#e53e3e' : 'inherit' }}>
+                {confirmId === record.id ? t('scheduleConfirmDelete') : t('scheduleDelete')}
+              </button>
+            </div>
+          </div>
+        ))}
+    </div>
+  </div>
 }

@@ -1,9 +1,10 @@
 import { o as teamStatus } from "./guard-C6Yt-xRB.js";
+import { n as logKey$1, t as appendLog$1 } from "./log-Co3EtYpg.js";
 import { randomUUID } from "node:crypto";
 import { closeSync, existsSync, openSync, readFileSync, readSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { z } from "zod";
 import { key } from "dsh-superagent";
-import { join } from "node:path";
 /** 增量读缓存；按目录键。 */
 const cache = /* @__PURE__ */ new Map();
 const CACHE_TTL_MS = 18e5;
@@ -17,6 +18,7 @@ function inputText(tool, input) {
 function describe(events) {
 	const steps = [];
 	let pending;
+	let lastToolUseId = "";
 	let error;
 	let sessionId;
 	let sawResult = false;
@@ -35,12 +37,54 @@ function describe(events) {
 			const content = event.message?.content ?? [];
 			for (const part of content) if (part?.type === "tool_use") {
 				if (pending) steps.push(pending);
+				const id = String(part.id ?? "");
 				pending = {
 					step: steps.length + 1,
 					tool: String(part.name ?? ""),
 					detail: inputText(part.name, part.input),
+					done: false,
+					id
+				};
+				lastToolUseId = id;
+			}
+			continue;
+		}
+		if (event.type === "tool_progress") {
+			const id = String(event.parent_tool_use_id ?? event.tool_use_id ?? "");
+			const secs = typeof event.elapsed_time_seconds === "number" ? event.elapsed_time_seconds : void 0;
+			if (!!pending && (!id || id === lastToolUseId || id === pending.id)) {
+				if (secs !== void 0) pending.elapsedSec = secs;
+			} else if (!pending) {
+				pending = {
+					step: steps.length + 1,
+					tool: String(event.tool_name ?? "工具"),
+					done: false,
+					elapsedSec: secs
+				};
+				if (id) pending.id = id;
+			}
+			continue;
+		}
+		if (event.type === "system" && event.subtype === "task_started") {
+			const id = String(event.tool_use_id ?? "");
+			if (pending) {
+				if (!pending.detail && event.description) pending.detail = event.description;
+			} else {
+				pending = {
+					step: steps.length + 1,
+					tool: "后台任务",
+					detail: event.description,
 					done: false
 				};
+				if (id) pending.id = id;
+			}
+			continue;
+		}
+		if (event.type === "system" && event.subtype === "task_notification") {
+			if (pending && event.status === "completed") {
+				pending.done = true;
+				steps.push(pending);
+				pending = void 0;
 			}
 			continue;
 		}
@@ -66,9 +110,30 @@ function describe(events) {
 		sessionId
 	};
 }
+/** lane 名白名单：与 cc-worker 的校验一致，防路径注入（`..`、`/` 一律拒绝）。 */
+const LANE_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+/** 把外部传入的 lane 归一成目录名；空 / main / 非法名字都按 main 处理（旧行为）。 */
+function normalizeLane(lane) {
+	const name = (lane ?? "").trim();
+	if (!name || name === "main") return "main";
+	return LANE_PATTERN.test(name) ? name : "main";
+}
+/**
+* lane 的工作根目录。
+*
+* cc-worker `--lane` 的布局（2026-11-11）：
+*   main → `<dir>/.cc-worker`
+*   其它 → `<dir>/.cc-worker/lanes/<lane>`
+* 所有 runs/log/stderr/interrupt/claude.pid 都在这个根下，不能写死 `.cc-worker`。
+*/
+function workerDir(dir, lane) {
+	const name = normalizeLane(lane);
+	return name === "main" ? join(dir, ".cc-worker") : join(dir, ".cc-worker", "lanes", name);
+}
 /** 取目录下最新的 runs/<时间戳>.jsonl；没有则退回 log.jsonl。 */
-function latestEventFile(dir) {
-	const runDir = join(dir, ".cc-worker", "runs");
+function latestEventFile(dir, lane) {
+	const base = workerDir(dir, lane);
+	const runDir = join(base, "runs");
 	let newest;
 	try {
 		for (const name of readdirSync(runDir)) {
@@ -84,11 +149,11 @@ function latestEventFile(dir) {
 		}
 	} catch {}
 	if (newest) return newest.path;
-	const log = join(dir, ".cc-worker", "log.jsonl");
+	const log = join(base, "log.jsonl");
 	return existsSync(log) ? log : void 0;
 }
-/** 增量读出事件尾部。 */
-function readTail(dir, file) {
+/** 增量读出事件尾部；缓存按事件文件路径分键，main 与各 lane 互不串。 */
+function readTail(file) {
 	let stat;
 	try {
 		stat = statSync(file);
@@ -100,7 +165,7 @@ function readTail(dir, file) {
 		};
 	}
 	const now = Date.now();
-	let entry = cache.get(dir);
+	let entry = cache.get(file);
 	if (!entry || entry.file !== file || stat.size < entry.size) entry = {
 		file,
 		size: 0,
@@ -123,7 +188,7 @@ function readTail(dir, file) {
 		}
 	}
 	for (const [id, item] of cache) if (item !== entry && now - item.touched > CACHE_TTL_MS) cache.delete(id);
-	cache.set(dir, entry);
+	cache.set(file, entry);
 	return {
 		events: entry.tail,
 		mtime: stat.mtimeMs,
@@ -220,7 +285,7 @@ function readCcStatus(dir) {
 		team,
 		interruptRequested: existsSync(interruptPath(dir))
 	};
-	const { events, mtime } = readTail(dir, file);
+	const { events, mtime } = readTail(file);
 	if (!events.length) return {
 		...empty,
 		present: true,
@@ -348,6 +413,72 @@ function ticketHealth(ticket, now = Date.now(), signals) {
 		detail: `执行器已 ${mins} 分钟没有任何动静，多半是卡死的僵尸任务；新消息会投进去出不来`
 	};
 }
+// src/schedule.ts
+/** KV 前缀：与面板日志的 `pane-log:` 并列，互不干扰。 */
+const SCHEDULE_PREFIX = "pane-sched:";
+/** 外部插件用普通字符串键即可（kv.ts 明确支持）。 */
+const scheduleKey = (id) => `${SCHEDULE_PREFIX}${id}`;
+const MINUTE = 6e4;
+const DAY = 864e5;
+/** 解析 HH:mm；非法返回 undefined。 */
+function parseTime(time) {
+	const match = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(time);
+	if (!match) return void 0;
+	return {
+		hour: Number(match[1]),
+		minute: Number(match[2])
+	};
+}
+/** 本地某天的零点毫秒，向后偏移 offsetDays 天。 */
+function localDayStart$1(ms, offsetDays = 0) {
+	const date = new Date(ms);
+	date.setDate(date.getDate() + offsetDays);
+	date.setHours(0, 0, 0, 0);
+	return date.getTime();
+}
+/** 某天零点的本地 HH:mm 对应的时间戳。 */
+function localAt(dayStartMs, hour, minute) {
+	const date = new Date(dayStartMs);
+	date.setHours(hour, minute, 0, 0);
+	return date.getTime();
+}
+/**
+* 从 fromMs 起算的下一次触发时间。
+*
+* - `every`：from + N 分钟；
+* - `daily`：今天的时间还没到就是今天，否则明天；
+* - `weekly`：向后最多找 7 天，命中第一个选中的星期；
+* - `at`：一次性时间原样返回；调用方判断是否已过期。
+*/
+function nextOccurrence(spec, fromMs) {
+	const from = Math.max(0, Math.floor(fromMs));
+	switch (spec.kind) {
+		case "every": return from + Math.max(1, Math.floor(spec.everyMinutes)) * MINUTE;
+		case "daily": {
+			const time = parseTime(spec.time);
+			if (!time) return from + DAY;
+			const today = localAt(localDayStart$1(from), time.hour, time.minute);
+			return today > from ? today : localAt(localDayStart$1(from, 1), time.hour, time.minute);
+		}
+		case "weekly": {
+			const time = parseTime(spec.time);
+			if (!time) return from + 7 * DAY;
+			const days = [...new Set(spec.weekdays.map((day) => Math.min(7, Math.max(1, Math.floor(day)))))].sort((a, b) => a - b);
+			const todayIso = new Date(from).getDay() || 7;
+			for (let offset = 0; offset <= 7; offset += 1) {
+				const iso = (todayIso - 1 + offset) % 7 + 1;
+				if (!days.includes(iso)) continue;
+				const when = localAt(localDayStart$1(from, offset), time.hour, time.minute);
+				if (when > from) return when;
+			}
+			return from + 7 * DAY;
+		}
+		case "at": {
+			const when = Date.parse(spec.at);
+			return Number.isFinite(when) ? when : from;
+		}
+	}
+}
 // src/index.ts
 const name = "dsh-superagent-pane";
 const inject = [
@@ -365,27 +496,30 @@ const OWNER = "owner";
 const ConversationSchema = z.string().trim().min(1).max(200).regex(/^[A-Za-z0-9_-]+$/, "仅限字母、数字、- 和 _");
 const TextSchema = z.string().trim().min(1).max(8e3);
 const SessionIdSchema = z.string().regex(/^[A-Za-z0-9_-]+$/);
-/**
-* 构造面板里一条消息的 Trigger。
-*
-* 两种模式对齐引擎语义：
-* - `dispatch`（默认）：`addressed: 'mention'` → 已允许发送者的消息是 explicit，直接建单/追加给工单，权限完整。
-* - `chat`：不带 addressed → 消息按准入表成为 inferred 候选，交给主 Session（router）分诊：它能直接答疑，
-*   或按规则接下小活；不需要工单的问题不会再变成工单。
-*
-* 对话模式刻意走「影子线程」`<对话>~chat`：引擎的 gate 规定「线程有自己的工单时，一律消息归该工单」
-* （followup 分支先于准入表生效），所以只要还在原线程上，对话消息就会被排进运行中工单的队列、router 收不到。
-* 影子线程永不被工单订阅，router 任何时刻都能立刻接话；回复经 channel 地址仍回落到原对话显示。
-*
-* 派活模式**只在会话线程上的工单已卡死（zombie，永远接不了手）时**才走一条子线程（`<对话>~d<base36>`，
-* 由调用方通过 `options.thread` 指定）：死工单仍占着订阅，fanout 会把消息并进去，而 intake 又因为
-* followupOwners 非空永不排 Eval，这条消息就永远搁浅（2026-11-03 的 897f223d… 即此）。子线程上没有订阅者，
-* 消息会进 Eval 由主 Session 分诊（可 attach 也可新建工单）。健康/待命的工单不触发改投：它对运行中工单的
-* 正常跟进必须留在原线程，交给该工单的 worker 处理，否则会另起新工单、原工单永远收不到跟进。
-* 无论走哪条线程，`channel` 始终指回原会话，回复仍显示在原对话里。
-*/
-function paneTrigger(conversation, text, sender = OWNER, mode = "dispatch", options = {}) {
-	const thread = options.thread ?? (mode === "chat" ? `${conversation}~chat` : conversation);
+/** 定时派活的频率与请求体。 */
+const ScheduleTimeSchema = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, "时间须为 HH:mm");
+const ScheduleSpecSchema = z.discriminatedUnion("kind", [
+	z.object({
+		kind: z.literal("every"),
+		everyMinutes: z.number().int().min(1).max(43200)
+	}).strict(),
+	z.object({
+		kind: z.literal("daily"),
+		time: ScheduleTimeSchema
+	}).strict(),
+	z.object({
+		kind: z.literal("weekly"),
+		weekdays: z.array(z.number().int().min(1).max(7)).min(1).max(7),
+		time: ScheduleTimeSchema
+	}).strict(),
+	z.object({
+		kind: z.literal("at"),
+		at: z.string().regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/, "一次性时间须为 YYYY-MM-DDTHH:mm")
+	}).strict()
+]);
+const ScheduleIdSchema = z.string().regex(/^[0-9a-f]{12,32}$/);
+function paneTrigger(conversation, text, sender = OWNER, mode = "assign", options = {}) {
+	const thread = options.thread ?? (mode === "chat" || mode === "note" ? `${conversation}~chat` : conversation);
 	return {
 		id: key("pane", thread, randomUUID()),
 		source: SOURCE,
@@ -398,7 +532,7 @@ function paneTrigger(conversation, text, sender = OWNER, mode = "dispatch", opti
 			id: sender
 		},
 		human: true,
-		...mode === "chat" ? {} : { addressed: "mention" },
+		addressed: "mention",
 		at: (/* @__PURE__ */ new Date()).toISOString(),
 		text,
 		channel: {
@@ -406,7 +540,10 @@ function paneTrigger(conversation, text, sender = OWNER, mode = "dispatch", opti
 			thread: `${SOURCE}:${thread}`,
 			address: { conversation }
 		},
-		meta: { conversation }
+		meta: {
+			conversation,
+			paneMode: mode
+		}
 	};
 }
 /**
@@ -529,13 +666,29 @@ function sendJson(res, status, value) {
 	});
 	res.end(JSON.stringify(value));
 }
-const logKey = (conversation) => `pane-log:${conversation}`;
+/**
+* 把消息累积进面板自己的对话记录。
+*
+* 领域层把入站 Trigger 与出站回执分开存放，而面板的读取接口不在本插件的可达面内，所以对话在这里镜像一份：
+* 每个对话一条 KV 记录，设上限，避免长对话把存储撑爆。
+*/
+const logKey = logKey$1;
 const hiddenKey = "pane-hidden";
-function appendLog(source, conversation, entry) {
-	const key = logKey(conversation);
-	const next = [...(source.state.get(key) ?? []).filter((item) => item.id !== entry.id), entry].slice(-200);
-	source.state.set(key, next);
-}
+/** 面板只显示 30 分钟内的收尾通知；更早的属于历史积压。 */
+const NOTICE_MAX_AGE_MS = 18e5;
+/** 旧版批量收尾通知的长度阈值：超过它的长通知是把几十张工单标题拼在一起，属于污染。 */
+const NOTICE_MAX_CHARS = 240;
+/** 人手动停止 / 放弃的收尾通知：不再保留在对话区。 */
+const SILENT_NOTICE = /已结束：(stopped|dropped|已放弃)/;
+/** 定时派活：每 20 秒扫一轮；晚到不超过 10 分钟才补跑，停机更久只记「错过」并推进到下一次。 */
+const SCHEDULE_SWEEP_MS = 2e4;
+const SCHEDULE_GRACE_MS = 6e5;
+/**
+* 对话日志统一走 ./log.ts 的共享实现：那边是 2000 条 / 40 万字符双上限并按 id 去重。
+* 这里早先各自维护过一份 200 条上限的版本，两处实现互相覆盖、谁后写谁生效，
+* 结果长对话被截到 200 条——批量收尾通知一涌进来就把真实消息挤掉。改为单一实现。
+*/
+const appendLog = appendLog$1;
 /** 只读句柄缓存，键为会话 id；增量读取，避免每 2.5 秒轮询都全量解析长会话。 */
 const openReads = /* @__PURE__ */ new Map();
 /** 空闲这么久（毫秒）的句柄会被关闭，不让缓存无限占用文件。 */
@@ -657,6 +810,55 @@ async function collectExecutorSignals(ctx, ticket) {
 	} catch {}
 	return signals;
 }
+/**
+* 读一张工单目录下的协作 lane 状态。
+*
+* lane 布局（cc-worker --lane 引入，2026-11-11）：
+*   <dir>/.cc-worker/{lock,session_id,...}             → lane = main（传统单 worker）
+*   <dir>/.cc-worker/lanes/<name>/{lock,session_id,...} → lane = <name>（协作子 worker）
+*
+* 「在跑」的判据与面板其它地方一致：claude.pid 存在且该 pid 的命令行含 claude。
+* 只读目录，不改任何东西；读不到就当没有 lane。
+*/
+function readLanes(dir) {
+	if (!dir) return [];
+	const out = [];
+	const alive = (base) => {
+		try {
+			const pid = Number(readFileSync(join(base, "claude.pid"), "utf8").trim());
+			if (!Number.isInteger(pid) || pid <= 0) return false;
+			return readFileSync(`/proc/${pid}/cmdline`, "utf8").includes("claude");
+		} catch {
+			return false;
+		}
+	};
+	const taskOf = (base) => {
+		try {
+			const text = readFileSync(join(base, "task.txt"), "utf8").replace(/\s+/g, " ").trim();
+			return text ? text.slice(0, 160) : void 0;
+		} catch {
+			return;
+		}
+	};
+	try {
+		const root = join(dir, ".cc-worker");
+		if (alive(root)) out.push({
+			lane: "main",
+			state: "running",
+			task: taskOf(root)
+		});
+		for (const name of readdirSync(join(root, "lanes"), { withFileTypes: true })) {
+			if (!name.isDirectory()) continue;
+			const base = join(root, "lanes", name.name);
+			out.push({
+				lane: name.name,
+				state: alive(base) ? "running" : "idle",
+				task: taskOf(base)
+			});
+		}
+	} catch {}
+	return out;
+}
 /** 按 id 找工单（含已结束的）；读不到就返回 undefined。 */
 function findTicket(ctx, ticketId) {
 	try {
@@ -712,11 +914,514 @@ async function divertDispatch(ctx, conversation) {
 		reason: `该对话的工单 ${first.ticketId} 已卡死（${first.detail ?? "无执行活动"}），消息改由路由器分诊，不会投进这个死工单`
 	};
 }
+/** 面板自己的拒绝错误：带 HTTP 状态码，路由层原样回给前端（409 = 状态冲突，可换模式重试）。 */
+var PaneRefusal = class extends Error {
+	status;
+	constructor(status, message) {
+		super(message);
+		this.status = status;
+	}
+};
+/**
+* 给消息正文加一段模式约束。
+*
+* 为什么不靠引擎区分：三种模式在引擎里都是 explicit 请求（见 paneTrigger 注释），只有正文能告诉路由器
+* 该建单、该并单还是只答话。约束放最前面并明确写「不要……」的边界，避免路由器按规则把闲聊变成工单。
+*/
+function composeText(mode, text) {
+	if (mode === "note" || mode === "broadcast") return text;
+	if (mode === "chat") return "【对话模式：只回答这个问题，不要新建工单、不要 attach 工单、不要派 worker、不要改代码。能直接答就直接答；需要动代码或长期工作的事，建议我用「派活」重发。重要：如果我重复问了同一个问题，说明我没看到你上次的回答——请把答案简短再说一遍，不要因为「已答过」而忽略。】\n" + text;
+	return "【派活模式：这是我明确要你去做的任务。若它是本对话进行中工单的补充/追问/修正，就 attach 给那张工单的 worker 继续做；若要动代码、要交付结果、且没有可接手的工单，就新建工单并派给 worker。只答疑、不动代码的问题请直接回答，不必建单。】\n" + text;
+}
 /**
 * 面板路由。
 *
 * `receive` 与 GitHub、Feishu 两个 Source 用的是同一个入口，所以面板消息走完全相同的路径：准入、路由、工单、worker。
 */
+/** 把引擎的 reason（`{code, values?}` 数组）渲染成一句可读文本。 */
+function reasonText(reason) {
+	if (typeof reason === "string") return reason;
+	if (!Array.isArray(reason)) return "";
+	return reason.slice(0, 2).map((item) => {
+		if (typeof item === "string") return item;
+		const code = String(item?.code ?? "");
+		const values = item?.values && typeof item.values === "object" ? item.values : {};
+		const text = typeof values.text === "string" && values.text ? values.text : "";
+		if (text) return text;
+		if (code === "routed") return `转交工单 ${String(values.ticket ?? "").slice(0, 8)}`;
+		if (code === "startedTicket") return `该工单已在处理 ${String(values.ticket ?? "").slice(0, 8)}`;
+		if (code === "forwarded") return "已转交给该线程上的工单 worker";
+		if (code === "said") return "";
+		return code;
+	}).filter(Boolean).join("；");
+}
+/** 这张工单当前挂在哪些线程上（面板按线程过滤用）。 */
+function threadKeysOf(ctx, ticketId) {
+	try {
+		return (ctx?.orchestrator?.store?.read?.subscribedThreads?.() ?? []).filter((thread) => Array.isArray(thread?.subscriptions) && thread.subscriptions.includes(ticketId)).map((thread) => ({ key: String(thread?.key ?? "") })).filter((item) => item.key);
+	} catch {
+		return [];
+	}
+}
+/** 工单当前阶段压成面板能直接显示的短状态。 */
+function ticketStageOf(ticket) {
+	if (ticket?.ended) return "ended";
+	return (typeof ticket?.stage === "string" ? ticket.stage : "") || "working";
+}
+/** 广播单次最多投递的工单数：关键词过宽时不要把全部工单一次打醒。 */
+const BROADCAST_MAX = 20;
+/**
+* 广播前缀：`@广播[关键词] 正文`。也接受 `@broadcast[...]` 与全角括号；
+* 关键词可用逗号/顿号分隔多个，任一命中即投；`[全部]`/`[all]` 表示不筛选。
+* 匹配口径是「标题 + 执行器任务正文」的子串（忽略大小写）。
+*/
+const BROADCAST_PATTERN = /^@(?:广播|broadcast)\s*[\[［【(（]\s*([^\]］】)）]{1,80}?)\s*[\]］】)）]\s*([\s\S]*)$/i;
+/** 工单侧参与文字匹配的内容：标题 + 执行器收到的任务正文。 */
+function ticketMatchText(ticket) {
+	return `${typeof ticket?.title === "string" ? ticket.title : ""}\n${typeof ticket?.execution?.assignment === "string" ? ticket.execution.assignment : ""}`.toLowerCase();
+}
+const HOUR_MS = 36e5;
+const DAY_MS = 24 * HOUR_MS;
+/** 以本地零点为基准偏移天数。 */
+function localDayStart(now, offsetDays = 0) {
+	const day = new Date(now);
+	day.setHours(0, 0, 0, 0);
+	day.setDate(day.getDate() + offsetDays);
+	return day.getTime();
+}
+/**
+* 正文里的时间限定词 → 工单创建时间窗。命中后从正文移除，避免「昨晚」被当成普通关键词。
+* 顺序即优先级（「昨晚」必须排在「昨天」前面）。
+*/
+const TIME_RULES = [
+	{
+		re: /(?:最近|近|过去)\s*(\d+)\s*(?:天|日)/,
+		describe: (now, match) => {
+			const days = Math.max(1, Math.min(30, Number(match[1]) || 1));
+			return {
+				label: `最近 ${days} 天`,
+				from: now.getTime() - days * DAY_MS,
+				to: now.getTime()
+			};
+		}
+	},
+	{
+		re: /(?:最近|近|过去)\s*(\d+)\s*(?:小时|钟头)/,
+		describe: (now, match) => {
+			const hours = Math.max(1, Math.min(72, Number(match[1]) || 1));
+			return {
+				label: `最近 ${hours} 小时`,
+				from: now.getTime() - hours * HOUR_MS,
+				to: now.getTime()
+			};
+		}
+	},
+	{
+		re: /昨晚|昨夜|昨天晚上/,
+		describe: (now) => ({
+			label: "昨晚（昨天 00:00-今天 06:00）",
+			from: localDayStart(now, -1),
+			to: localDayStart(now, 0) + 6 * HOUR_MS
+		})
+	},
+	{
+		re: /前天/,
+		describe: (now) => ({
+			label: "前天",
+			from: localDayStart(now, -2),
+			to: localDayStart(now, -1)
+		})
+	},
+	{
+		re: /昨天|昨日/,
+		describe: (now) => ({
+			label: "昨天",
+			from: localDayStart(now, -1),
+			to: localDayStart(now, 0)
+		})
+	},
+	{
+		re: /今早|今晨|早上|上午/,
+		describe: (now) => ({
+			label: "今天上午",
+			from: localDayStart(now, 0),
+			to: localDayStart(now, 0) + 12 * HOUR_MS
+		})
+	},
+	{
+		re: /下午/,
+		describe: (now) => ({
+			label: "今天下午",
+			from: localDayStart(now, 0) + 12 * HOUR_MS,
+			to: localDayStart(now, 0) + 18 * HOUR_MS
+		})
+	},
+	{
+		re: /今天|今日|刚才|刚刚/,
+		describe: (now) => ({
+			label: "今天",
+			from: localDayStart(now, 0),
+			to: now.getTime()
+		})
+	},
+	{
+		re: /本周|这周|这个星期/,
+		describe: (now) => {
+			const monday = new Date(now);
+			monday.setHours(0, 0, 0, 0);
+			monday.setDate(monday.getDate() - (monday.getDay() + 6) % 7);
+			return {
+				label: "本周",
+				from: monday.getTime(),
+				to: now.getTime()
+			};
+		}
+	},
+	{
+		re: /上周|上个星期/,
+		describe: (now) => {
+			const monday = new Date(now);
+			monday.setHours(0, 0, 0, 0);
+			monday.setDate(monday.getDate() - (monday.getDay() + 6) % 7);
+			return {
+				label: "上周",
+				from: monday.getTime() - 7 * DAY_MS,
+				to: monday.getTime()
+			};
+		}
+	}
+];
+new RegExp([
+	...[
+		"所有",
+		"全部",
+		"每张",
+		"每个",
+		"继续",
+		"接着",
+		"然后",
+		"处理",
+		"完成",
+		"未完成",
+		"没完成",
+		"运行中",
+		"进行中",
+		"还没结束",
+		"没有结束",
+		"工单",
+		"任务",
+		"工作",
+		"相关",
+		"问题",
+		"内容",
+		"东西",
+		"事情",
+		"一下",
+		"一些",
+		"帮忙",
+		"帮我",
+		"我们",
+		"你们",
+		"他们",
+		"她们",
+		"它们",
+		"这里",
+		"那里",
+		"这个",
+		"那个",
+		"这些",
+		"那些",
+		"哪张",
+		"哪个",
+		"关于",
+		"针对",
+		"按照",
+		"根据",
+		"需要",
+		"应该",
+		"可以",
+		"直接",
+		"一起",
+		"同时",
+		"自动",
+		"尽快",
+		"优先",
+		"清楚",
+		"明白",
+		"情况",
+		"状态",
+		"结果"
+	],
+	"的",
+	"了",
+	"吗",
+	"呢",
+	"吧",
+	"啊",
+	"哦",
+	"着",
+	"过",
+	"把",
+	"给",
+	"和",
+	"与",
+	"及",
+	"在",
+	"对",
+	"从",
+	"到",
+	"是",
+	"我",
+	"你",
+	"要",
+	"就",
+	"也",
+	"都",
+	"再",
+	"还",
+	"没",
+	"不",
+	"有",
+	"这",
+	"那",
+	"个",
+	"张",
+	"些"
+].join("|"), "g");
+/**
+* 选出广播的目标工单。
+* - 显式 `@广播[a,b]`：直接用给定词；`[全部]/[all]` 不筛；
+* - 广播模式：先剥掉时间词和「所有/全部」等限定词，再从正文提取技术词；
+* - 时间词只筛工单创建时间（createdAt），不参与文字匹配；
+* - 一个技术词都没提取到 → 全量投；提取到但零命中 → 定向广播没有对象，不投。
+*/
+function selectBroadcastTargets(tickets, text, explicitKeyword) {
+	const now = /* @__PURE__ */ new Date();
+	let rest = text;
+	let timeLabel;
+	let fromMs;
+	let toMs;
+	for (const rule of TIME_RULES) {
+		const match = rest.match(rule.re);
+		if (!match) continue;
+		const info = rule.describe(now, match);
+		timeLabel = info.label;
+		fromMs = info.from;
+		toMs = info.to;
+		rest = rest.replace(rule.re, " ");
+		break;
+	}
+	const allKeyword = /^(?:全部|所有|all|every|\*)$/i.test(explicitKeyword.trim());
+	allKeyword || /(?:所有|全部|每张|每个)/.test(rest);
+	rest = rest.replace(/所有|全部|每张|每个|未完成|没完成|还没结束|没有结束|运行中|进行中|在跑|还在跑/g, " ");
+	const tokens = allKeyword ? [] : explicitKeyword.trim() ? explicitKeyword.split(/[,，、;；\s]+/).map((word) => word.trim().toLowerCase()).filter(Boolean) : [];
+	if (fromMs === void 0 || toMs === void 0) {
+		fromMs = now.getTime() - 12 * HOUR_MS;
+		toMs = now.getTime();
+		timeLabel = "最近 12 小时";
+	}
+	const inWindow = (ticket) => {
+		if (fromMs === void 0 || toMs === void 0) return true;
+		const at = Date.parse(String(ticket?.createdAt ?? ""));
+		return Number.isNaN(at) ? true : at >= fromMs && at < toMs;
+	};
+	const scoped = tickets.filter(inWindow);
+	const contentOf = /* @__PURE__ */ new Map();
+	for (const ticket of scoped) contentOf.set(ticket.id, ticketMatchText(ticket));
+	const hits = /* @__PURE__ */ new Map();
+	for (const token of tokens) {
+		const set = /* @__PURE__ */ new Set();
+		for (const [id, content] of contentOf) if (content.includes(token)) set.add(id);
+		hits.set(token, set);
+	}
+	const textMatched = tokens.length ? scoped.filter((ticket) => tokens.some((token) => hits.get(token).has(ticket.id))) : scoped;
+	const anyHit = tokens.length === 0 || tokens.some((token) => hits.get(token).size > 0);
+	const live = textMatched.filter((ticket) => !ticket.ended || ticket.ended.by !== "human");
+	const stopped = textMatched.filter((ticket) => !!ticket.ended && ticket.ended.by === "human");
+	return {
+		targets: live,
+		criteria: {
+			tokens,
+			timeLabel,
+			mode: allKeyword ? "all" : explicitKeyword.trim() ? "explicit" : "auto"
+		},
+		autoAll: tokens.length === 0,
+		noMatch: tokens.length > 0 && !anyHit,
+		matchedTotal: textMatched.length,
+		ended: textMatched.length - live.length,
+		stopped: stopped.length
+	};
+}
+/**
+* 广播消息：先按时间窗与关键词筛出目标，再逐单投递。
+*
+* 为什么不能复用普通 `source.receive`：同一会话线程上多张 live 工单会让 intake 判定 `ambiguous`，
+* 整条消息一张都不投（这正是「一条共同消息所有工单都不响应」的根因）；而一条 Trigger 也只能 attach
+* 给一张工单。所以这里为每张工单各建一条独立 Trigger，落在线程 `pane:t<工单id>`（该工单的意见会话，
+* 不是共享的会话线程），再直接调用引擎的 `attach` 把消息作为 Input 交给它——与路由器
+* `orchestrator_route attach` 走同一条路径，不经过 Eval、不依赖模型分诊。`channel` 仍指回用户发消息
+* 的原对话，worker 的回复会显示在那里。
+*/
+async function broadcastByTitle(ctx, conversation, keyword, text) {
+	const store = ctx?.orchestrator?.store;
+	const engine = ctx?.orchestrator?.engine;
+	if (typeof store?.tickets?.list !== "function" || typeof store?.triggers?.save !== "function" || typeof engine?.attach !== "function") throw new Error("宿主未提供广播所需的工单/引擎接口");
+	const selection = selectBroadcastTargets(store.tickets.list().filter((ticket) => typeof ticket?.id === "string" && ticket.id && typeof ticket?.title === "string"), text, keyword);
+	const targets = [...selection.targets].sort((a, b) => String(b.updatedAt ?? "").localeCompare(String(a.updatedAt ?? ""))).slice(0, BROADCAST_MAX);
+	const scope = [selection.criteria.timeLabel ? `时间窗「${selection.criteria.timeLabel}」` : "", selection.criteria.tokens.length ? `关键词「${selection.criteria.tokens.join("、")}」` : ""].filter(Boolean).join(" + ") || "最近 12 小时";
+	const delivered = [];
+	const failed = [];
+	for (const ticket of targets) {
+		const title = String(ticket.title).trim();
+		const trigger = paneTrigger(conversation, `【广播给工单「${title}」(${ticket.id})：这条消息按${scope}筛选后同时投给了多张工单，请按本工单的上下文处理，不要新建工单】
+${text}`, OWNER, "note", { thread: `t${ticket.id}` });
+		try {
+			store.triggers.save(trigger);
+			engine.attach(ticket.id, trigger.id, `面板广播（${scope}）`);
+			delivered.push({
+				ticketId: ticket.id,
+				title
+			});
+		} catch (error) {
+			failed.push({
+				ticketId: ticket.id,
+				title,
+				error: error instanceof Error ? error.message : String(error)
+			});
+		}
+	}
+	return {
+		keyword,
+		criteria: selection.criteria,
+		autoAll: selection.autoAll,
+		noMatch: selection.noMatch,
+		matched: selection.matchedTotal,
+		ended: selection.ended,
+		stopped: selection.stopped,
+		overLimit: selection.targets.length - targets.length,
+		delivered,
+		failed
+	};
+}
+/** 读出全部定时任务，按下次触发时间升序；扫描与面板列表共用同一份校验。 */
+function readSchedules(state) {
+	const items = [];
+	for (const key of state.keys("pane-sched:") ?? []) {
+		const record = state.get(key);
+		if (record && typeof record.id === "string" && typeof record.conversation === "string" && typeof record.text === "string" && record.spec && typeof record.nextAtMs === "number") items.push(record);
+	}
+	return items.sort((a, b) => a.nextAtMs - b.nextAtMs);
+}
+/** 写入一条任务；同 id 覆盖。 */
+function writeSchedule(state, record) {
+	state.set(scheduleKey(record.id), record);
+}
+/** 删除一条任务（state.set 传 undefined 即删行）。 */
+function deleteSchedule(state, id) {
+	state.set(scheduleKey(id), void 0);
+}
+/**
+* 面板发送与定时派活的唯一实现。抽出来是为了让定时器与 HTTP 路由走**完全相同**的一条路：
+* 广播展开、僵尸改投、投递前解档、Trigger 构造、对话日志，一处改动两边同时生效。
+*
+* 定时来源会在入站日志上标 `status: 'scheduled'`，面板据此显示「定时」徽标。
+*/
+async function dispatchPaneMessage(ctx, body, origin = "panel") {
+	const mode = body.mode === "dispatch" ? "assign" : body.mode;
+	const source = ctx.orchestrator.context({
+		kind: SOURCE,
+		health: ["pane"]
+	});
+	const matched = mode === "assign" ? BROADCAST_PATTERN.exec(body.text) : null;
+	if (mode === "broadcast" || matched) {
+		const keyword = matched ? matched[1].trim() : "";
+		const content = (matched ? matched[2] : body.text).trim();
+		if (mode === "assign" && !keyword) throw new Error("广播关键词不能为空：请写成 @广播[关键词] 正文");
+		if (!content) throw new Error(mode === "broadcast" ? "广播内容不能为空" : "广播内容不能为空：请写成 @广播[关键词] 正文");
+		const result = await broadcastByTitle(ctx, body.conversation, keyword, content);
+		const at = (/* @__PURE__ */ new Date()).toISOString();
+		const basis = [result.criteria.timeLabel ? `时间窗「${result.criteria.timeLabel}」` : "", result.criteria.tokens.length ? `关键词「${result.criteria.tokens.join("、")}」` : ""].filter(Boolean).join(" + ");
+		const notice = result.delivered.length ? `已广播给 ${result.delivered.length} 张工单：${result.delivered.map((item) => `「${item.title}」`).join("、")}` + (result.criteria.mode === "all" ? "（范围内全部工单）" : basis ? `（筛选依据：${basis}）` : "") + (result.autoAll ? `（${basis || "默认范围"}内全部工单，含已结束可唤醒的）` : "") + (result.stopped ? `；另有 ${result.stopped} 张已被人停止、无法唤醒，未投递` : "") + (result.ended ? `；另有 ${result.ended} 张不符合条件，未投递` : "") + (result.overLimit ? `；超过单次上限 ${result.overLimit} 张未投递` : "") + (result.failed.length ? `；投递失败 ${result.failed.length} 张：${result.failed.map((item) => `「${item.title}」`).join("、")}` : "") : result.noMatch ? `没有工单匹配${basis ? `（${basis}）` : ""}，未广播` : result.matched ? `范围内的 ${result.matched} 张工单都已结束且无法唤醒${result.stopped ? `（其中 ${result.stopped} 张被人停止）` : ""}，未广播` : `${basis || "最近 12 小时"}内没有符合条件的工单，未广播`;
+		appendLog(source, body.conversation, {
+			id: `broadcast-${randomUUID()}`,
+			direction: "in",
+			at,
+			text: body.text,
+			mode: "broadcast",
+			...origin === "schedule" ? { status: "scheduled" } : {}
+		});
+		appendLog(source, body.conversation, {
+			id: `broadcast-notice-${randomUUID()}`,
+			direction: "out",
+			at,
+			text: notice,
+			kind: "broadcast"
+		});
+		return {
+			broadcast: true,
+			thread: `${SOURCE}:${body.conversation}`,
+			received: result.delivered.length ? "stored" : "none",
+			notice,
+			...result
+		};
+	}
+	const conversation = body.conversation;
+	const diverted = mode === "assign" ? await divertDispatch(ctx, conversation) : void 0;
+	await wakeThreadSessions(ctx, conversation);
+	const trigger = paneTrigger(conversation, composeText(mode, body.text), OWNER, mode, diverted ? { thread: diverted.thread } : {});
+	appendLog(source, conversation, {
+		id: trigger.id,
+		direction: "in",
+		at: trigger.at,
+		text: body.text,
+		mode,
+		...origin === "schedule" ? { status: "scheduled" } : {}
+	});
+	const received = await source.receive(trigger);
+	return {
+		triggerId: trigger.id,
+		thread: `${SOURCE}:${trigger.threads[0].id}`,
+		received,
+		mode,
+		...diverted ? { diverted: diverted.reason } : {}
+	};
+}
+/** 到点扫描：晚到 10 分钟内补跑，停机更久只记录「错过」并推进；单条异常不打断其它任务。 */
+async function runDueSchedules(ctx) {
+	const state = (liveSource ?? ctx.orchestrator?.context({
+		kind: SOURCE,
+		health: ["pane"]
+	}))?.state;
+	if (!state?.keys) return;
+	const now = Date.now();
+	for (const record of readSchedules(state)) {
+		if (!record.enabled || record.nextAtMs > now) continue;
+		const overdue = now - record.nextAtMs;
+		if (overdue > SCHEDULE_GRACE_MS) {
+			record.lastAt = new Date(now).toISOString();
+			record.lastResult = `错过：服务停机约 ${Math.max(1, Math.round(overdue / 6e4))} 分钟，未执行`;
+			if (record.spec.kind === "at") record.enabled = false;
+			else record.nextAtMs = nextOccurrence(record.spec, now);
+			writeSchedule(state, record);
+			continue;
+		}
+		try {
+			const outcome = await dispatchPaneMessage(ctx, {
+				conversation: record.conversation,
+				text: record.text,
+				mode: record.mode
+			}, "schedule");
+			record.lastAt = new Date(now).toISOString();
+			record.lastResult = outcome?.broadcast ? String(outcome.notice ?? "已广播") : "已派发";
+		} catch (error) {
+			record.lastAt = new Date(now).toISOString();
+			record.lastResult = `失败：${error instanceof Error ? error.message : String(error)}`;
+		}
+		if (record.spec.kind === "at") record.enabled = false;
+		else record.nextAtMs = nextOccurrence(record.spec, now);
+		writeSchedule(state, record);
+	}
+}
 function paneHandler(ctx) {
 	return async (req, res) => {
 		if (req.headers["x-orchestrator-request"] !== "1") {
@@ -730,29 +1435,17 @@ function paneHandler(ctx) {
 		});
 		try {
 			if (req.method === "POST" && url.pathname === "/orchestrator/api/pane/message") {
-				const body = z.object({
+				sendJson(res, 200, await dispatchPaneMessage(ctx, z.object({
 					conversation: ConversationSchema,
 					text: TextSchema,
-					mode: z.enum(["dispatch", "chat"]).default("dispatch")
-				}).parse(await readJson(req));
-				const conversation = body.conversation;
-				const diverted = body.mode === "dispatch" ? await divertDispatch(ctx, conversation) : void 0;
-				await wakeThreadSessions(ctx, conversation);
-				const trigger = paneTrigger(conversation, body.text, OWNER, body.mode, diverted ? { thread: diverted.thread } : {});
-				appendLog(source, conversation, {
-					id: trigger.id,
-					direction: "in",
-					at: trigger.at,
-					text: trigger.text,
-					mode: body.mode
-				});
-				const received = await source.receive(trigger);
-				sendJson(res, 200, {
-					triggerId: trigger.id,
-					thread: `${SOURCE}:${trigger.threads[0].id}`,
-					received,
-					...diverted ? { diverted: diverted.reason } : {}
-				});
+					mode: z.enum([
+						"dispatch",
+						"chat",
+						"broadcast",
+						"assign",
+						"note"
+					]).default("dispatch")
+				}).parse(await readJson(req)), "panel"));
 				return;
 			}
 			const activityMatch = /^\/orchestrator\/api\/pane\/activity\/([A-Za-z0-9_-]+)$/.exec(url.pathname);
@@ -785,15 +1478,128 @@ function paneHandler(ctx) {
 			const logMatch = /^\/orchestrator\/api\/pane\/log\/([A-Za-z0-9_-]+)$/.exec(url.pathname);
 			if (req.method === "GET" && logMatch) {
 				const conversation = logMatch[1];
+				const entries = source.state.get(logKey(conversation)) ?? [];
+				const store = ctx.orchestrator?.store;
+				const annotated = entries.map((entry) => {
+					if (entry.direction !== "in") return entry;
+					try {
+						const disposition = store?.triggers?.disposition?.(entry.id);
+						if (!disposition) return entry;
+						const out = { ...entry };
+						const decisionId = String(disposition.decisionId ?? "");
+						if (decisionId && typeof store?.decisions?.get === "function") {
+							const decision = store.decisions.get(decisionId);
+							if (decision) {
+								out.decision = {
+									kind: decision.kind,
+									reason: reasonText(decision.reason)
+								};
+								const ticketId = String(decision.ticketId ?? "");
+								const ticket = ticketId && typeof store?.tickets?.get === "function" ? store.tickets.get(ticketId) : void 0;
+								if (ticket) out.outcome = ticket.ended ? String(ticket.ended.outcome ?? "ended") : ticketStageOf(ticket);
+							}
+						} else if (disposition.evalId) out.decision = { kind: "evaluating" };
+						return out;
+					} catch {
+						return entry;
+					}
+				});
 				sendJson(res, 200, {
 					conversation,
 					thread: `${SOURCE}:${conversation}`,
-					items: source.state.get(logKey(conversation)) ?? []
+					items: annotated
+				});
+				return;
+			}
+			const cleanMatch = /^\/orchestrator\/api\/pane\/log\/([A-Za-z0-9_-]+)\/clean$/.exec(url.pathname);
+			if (req.method === "POST" && cleanMatch) {
+				const conversation = cleanMatch[1];
+				const entries = source.state.get(logKey(conversation)) ?? [];
+				const since = Date.now() - NOTICE_MAX_AGE_MS;
+				const polluted = (entry) => {
+					if (entry.direction === "in") return false;
+					if (entry.kind !== "notice" && entry.kind !== "broadcast") return false;
+					const text = String(entry.text ?? "");
+					if (text.length > NOTICE_MAX_CHARS || SILENT_NOTICE.test(text)) return true;
+					return !(Date.parse(String(entry.at ?? "")) >= since);
+				};
+				const kept = entries.filter((entry) => !polluted(entry));
+				if (kept.length !== entries.length) source.state.set(logKey(conversation), kept);
+				sendJson(res, 200, {
+					conversation,
+					removed: entries.length - kept.length,
+					kept: kept.length
+				});
+				return;
+			}
+			if (req.method === "GET" && url.pathname === "/orchestrator/api/pane/tickets") {
+				const state = url.searchParams.get("state") === "ended" ? "ended" : "open";
+				const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? 30) || 30, 1), 200);
+				const store = ctx.orchestrator?.store;
+				const all = state === "ended" ? (store?.tickets?.list?.() ?? []).filter((t) => !!t?.ended) : store?.tickets?.open?.() ?? [];
+				all.sort((a, b) => String(b?.updatedAt ?? "").localeCompare(String(a?.updatedAt ?? "")));
+				const unreadOf = (ticket) => {
+					const inputs = Array.isArray(ticket?.inputs) ? ticket.inputs : [];
+					const ids = /* @__PURE__ */ new Set();
+					for (const item of inputs) if (!item?.readAt && item?.id) ids.add(String(item.id));
+					else if (!item?.readAt) ids.add(`idx:${ids.size}`);
+					for (const id of Array.isArray(ticket?.undelivered) ? ticket.undelivered : []) ids.add(String(id));
+					return ids.size;
+				};
+				sendJson(res, 200, {
+					items: all.slice(0, limit).map((ticket) => ({
+						id: ticket.id,
+						title: ticket.title,
+						stage: ticketStageOf(ticket),
+						state: ticket.ended ? "ended" : "open",
+						ended: ticket.ended,
+						createdAt: ticket.createdAt,
+						updatedAt: ticket.updatedAt,
+						summary: typeof ticket?.assignments?.slice?.(-1)?.[0]?.report?.summary === "string" ? ticket.assignments.slice(-1)[0].report.summary : "",
+						sessionId: Array.isArray(ticket?.assignments) && ticket.assignments.some((a) => a?.startedAt) ? `worker-${ticket.id}` : "",
+						inputs: Array.isArray(ticket?.inputs) ? ticket.inputs.length : 0,
+						undelivered: Array.isArray(ticket?.undelivered) ? ticket.undelivered.length : 0,
+						unread: unreadOf(ticket),
+						threads: threadKeysOf(ctx, ticket.id)
+					})),
+					total: all.length
 				});
 				return;
 			}
 			if (req.method === "GET" && url.pathname === "/orchestrator/api/pane/hidden") {
 				sendJson(res, 200, { ids: source.state.get(hiddenKey) ?? [] });
+				return;
+			}
+			if (req.method === "GET" && url.pathname === "/orchestrator/api/pane/crew") {
+				const tickets = ctx.orchestrator?.store?.tickets;
+				const live = [];
+				try {
+					for (const ticket of tickets?.list?.() ?? []) {
+						const assignments = Array.isArray(ticket.assignments) ? ticket.assignments : [];
+						const last = assignments.length ? assignments[assignments.length - 1] : void 0;
+						const state = String(last?.state ?? "idle");
+						const lanes = readLanes(String(ticket.execution?.directory ?? ""));
+						const ended = !!ticket?.ended;
+						if (ended && lanes.length === 0) continue;
+						live.push({
+							ticketId: String(ticket.id),
+							title: String(ticket.title ?? "").slice(0, 80),
+							assignment: state,
+							working: !ended && state === "running",
+							sessionId: typeof ticket.sessionId === "string" ? ticket.sessionId : void 0,
+							lanes
+						});
+					}
+				} catch {}
+				const active = live.filter((item) => item.working).length;
+				const workers = live.reduce((sum, item) => sum + item.lanes.filter((lane) => lane.state === "running").length, 0);
+				sendJson(res, 200, {
+					tickets: live.length,
+					active,
+					queued: live.filter((item) => item.assignment === "pending").length,
+					workers,
+					items: live.sort((a, b) => Number(b.working) - Number(a.working))
+				});
 				return;
 			}
 			if (req.method === "POST" && url.pathname === "/orchestrator/api/pane/hide") {
@@ -871,9 +1677,90 @@ function paneHandler(ctx) {
 				});
 				return;
 			}
+			if (url.pathname === "/orchestrator/api/pane/schedules" && req.method === "GET") {
+				const wanted = url.searchParams.get("conversation") ?? "";
+				sendJson(res, 200, {
+					items: readSchedules(source.state).filter((item) => !wanted || item.conversation === wanted),
+					now: Date.now()
+				});
+				return;
+			}
+			if (url.pathname === "/orchestrator/api/pane/schedules" && req.method === "POST") {
+				const body = z.object({
+					conversation: ConversationSchema,
+					text: TextSchema,
+					mode: z.enum([
+						"dispatch",
+						"chat",
+						"broadcast",
+						"assign",
+						"note"
+					]).default("dispatch"),
+					spec: ScheduleSpecSchema
+				}).parse(await readJson(req));
+				const now = Date.now();
+				const nextAtMs = nextOccurrence(body.spec, now);
+				if (body.spec.kind === "at" && nextAtMs <= now) throw new Error("指定时间已经过去，请改到将来");
+				const record = {
+					id: randomUUID().replace(/-/g, ""),
+					conversation: body.conversation,
+					text: body.text,
+					mode: body.mode,
+					spec: body.spec,
+					enabled: true,
+					createdAt: new Date(now).toISOString(),
+					nextAtMs
+				};
+				writeSchedule(source.state, record);
+				sendJson(res, 200, { schedule: record });
+				return;
+			}
+			const scheduleMatch = /^\/orchestrator\/api\/pane\/schedules\/([0-9a-f]{12,32})\/(toggle|run|delete)$/.exec(url.pathname);
+			if (req.method === "POST" && scheduleMatch) {
+				const id = ScheduleIdSchema.parse(scheduleMatch[1]);
+				const action = scheduleMatch[2];
+				const record = source.state.get(scheduleKey(id));
+				if (!record) {
+					sendJson(res, 404, { error: "没有这条定时任务" });
+					return;
+				}
+				if (action === "toggle") {
+					const body = z.object({ enabled: z.boolean() }).parse(await readJson(req));
+					if (body.enabled && record.nextAtMs <= Date.now()) {
+						if (record.spec.kind === "at") throw new Error("指定时间已经过去，不能再启用；请重新创建");
+						record.nextAtMs = nextOccurrence(record.spec, Date.now());
+					}
+					record.enabled = body.enabled;
+					writeSchedule(source.state, record);
+					sendJson(res, 200, { schedule: record });
+					return;
+				}
+				if (action === "delete") {
+					deleteSchedule(source.state, id);
+					sendJson(res, 200, {
+						deleted: true,
+						id
+					});
+					return;
+				}
+				const outcome = await dispatchPaneMessage(ctx, {
+					conversation: record.conversation,
+					text: record.text,
+					mode: record.mode
+				}, "schedule");
+				record.lastAt = (/* @__PURE__ */ new Date()).toISOString();
+				record.lastResult = outcome?.broadcast ? String(outcome.notice ?? "已广播") : "已派发";
+				if (record.spec.kind === "at") record.enabled = false;
+				writeSchedule(source.state, record);
+				sendJson(res, 200, {
+					schedule: record,
+					outcome
+				});
+				return;
+			}
 			sendJson(res, 404, { error: "Unknown pane operation" });
 		} catch (error) {
-			sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+			sendJson(res, error instanceof PaneRefusal ? error.status : 400, { error: error instanceof Error ? error.message : String(error) });
 		}
 	};
 }
@@ -986,7 +1873,7 @@ async function recoverStranded(ctx) {
 		for (let index = entries.length - 1; index >= 0 && handled < STRANDED_MAX_PER_SWEEP; index--) {
 			const entry = entries[index];
 			try {
-				if (entry.direction !== "in" || entry.mode !== "dispatch") continue;
+				if (entry.direction !== "in" || !["dispatch", "assign"].includes(String(entry.mode))) continue;
 				const sentAt = entry.at ? Date.parse(entry.at) : NaN;
 				if (!Number.isFinite(sentAt) || sentAt < oldest) continue;
 				const trigger = store.triggers.get(entry.id);
@@ -1144,5 +2031,23 @@ function apply(ctx) {
 			clearInterval(timer);
 		};
 	}, "pane: stranded recovery");
+	ctx.effect(() => {
+		let busy = false;
+		const sweep = () => {
+			if (busy) return;
+			busy = true;
+			runDueSchedules(ctx).catch((error) => {
+				ctx.logger?.warn?.("dsh-superagent-pane: 定时派活检查失败 %s", String(error));
+			}).finally(() => {
+				busy = false;
+			});
+		};
+		const boot = setTimeout(sweep, 2e3);
+		const timer = setInterval(sweep, SCHEDULE_SWEEP_MS);
+		return () => {
+			clearTimeout(boot);
+			clearInterval(timer);
+		};
+	}, "pane: scheduled dispatch");
 }
 export { apply, inject, name, paneTrigger };

@@ -33,6 +33,16 @@ type CcEvent = {
   result?: string
   is_error?: boolean
   session_id?: string
+  /** tool_progress 心跳：工具名与已耗时。 */
+  tool_name?: string
+  elapsed_time_seconds?: number
+  /** tool_progress / system 任务事件指向的原始工具调用。 */
+  tool_use_id?: string
+  parent_tool_use_id?: string
+  /** system task_started 的可读描述（如「全片枪口 ROI 亮度扫描」）。 */
+  description?: string
+  /** system task_notification 的结束状态：completed / failed 等。 */
+  status?: string
 }
 
 export type CcStep = {
@@ -44,6 +54,10 @@ export type CcStep = {
   detail?: string
   /** 这一步是否已拿到工具结果。 */
   done: boolean
+  /** 这一步对应的 tool_use id，用来把心跳事件归到正确的那一步。 */
+  id?: string
+  /** 心跳报告的本步已耗时（秒）。 */
+  elapsedSec?: number
 }
 
 export type CcStatus = {
@@ -86,6 +100,7 @@ function inputText(tool: string | undefined, input: any): string | undefined {
 function describe(events: readonly CcEvent[]): Pick<CcStatus, 'steps' | 'current' | 'state' | 'error' | 'sessionId'> {
   const steps: CcStep[] = []
   let pending: CcStep | undefined
+  let lastToolUseId = ''
   let error: string | undefined
   let sessionId: string | undefined
   let sawResult = false
@@ -102,8 +117,43 @@ function describe(events: readonly CcEvent[]): Pick<CcStatus, 'steps' | 'current
       for (const part of content) {
         if (part?.type === 'tool_use') {
           if (pending) steps.push(pending)
-          pending = { step: steps.length + 1, tool: String(part.name ?? ''), detail: inputText(part.name, part.input), done: false }
+          const id = String(part.id ?? '')
+          pending = { step: steps.length + 1, tool: String(part.name ?? ''), detail: inputText(part.name, part.input), done: false, id }
+          lastToolUseId = id
         }
+      }
+      continue
+    }
+    // 心跳与后台任务事件：长命令（视频扫描、大文件 md5 等）期间只有这类事件，
+    // 没有它们 pending 会一直是空的，面板就退化成「思考中」且看不到在跑什么。
+    if (event.type === 'tool_progress') {
+      const id = String(event.parent_tool_use_id ?? event.tool_use_id ?? '')
+      const secs = typeof event.elapsed_time_seconds === 'number' ? event.elapsed_time_seconds : undefined
+      const same = !!pending && (!id || id === lastToolUseId || id === pending.id)
+      if (same) {
+        if (secs !== undefined) pending!.elapsedSec = secs
+      } else if (!pending) {
+        pending = { step: steps.length + 1, tool: String(event.tool_name ?? '工具'), done: false, elapsedSec: secs }
+        if (id) pending.id = id
+      }
+      continue
+    }
+    if (event.type === 'system' && event.subtype === 'task_started') {
+      const id = String(event.tool_use_id ?? '')
+      if (pending) {
+        if (!pending.detail && event.description) pending.detail = event.description
+      } else {
+        pending = { step: steps.length + 1, tool: '后台任务', detail: event.description, done: false }
+        if (id) pending.id = id
+      }
+      continue
+    }
+    if (event.type === 'system' && event.subtype === 'task_notification') {
+      // 后台任务已结束：把这一步收尾，不要让它一直挂着当「当前动作」。
+      if (pending && event.status === 'completed') {
+        pending.done = true
+        steps.push(pending)
+        pending = undefined
       }
       continue
     }
@@ -127,9 +177,33 @@ function describe(events: readonly CcEvent[]): Pick<CcStatus, 'steps' | 'current
   return { steps, current, state, error, sessionId }
 }
 
+/** lane 名白名单：与 cc-worker 的校验一致，防路径注入（`..`、`/` 一律拒绝）。 */
+export const LANE_PATTERN = /^[A-Za-z0-9_-]{1,64}$/
+
+/** 把外部传入的 lane 归一成目录名；空 / main / 非法名字都按 main 处理（旧行为）。 */
+export function normalizeLane(lane?: string | null): string {
+  const name = (lane ?? '').trim()
+  if (!name || name === 'main') return 'main'
+  return LANE_PATTERN.test(name) ? name : 'main'
+}
+
+/**
+ * lane 的工作根目录。
+ *
+ * cc-worker `--lane` 的布局（2026-11-11）：
+ *   main → `<dir>/.cc-worker`
+ *   其它 → `<dir>/.cc-worker/lanes/<lane>`
+ * 所有 runs/log/stderr/interrupt/claude.pid 都在这个根下，不能写死 `.cc-worker`。
+ */
+export function workerDir(dir: string, lane?: string | null): string {
+  const name = normalizeLane(lane)
+  return name === 'main' ? join(dir, '.cc-worker') : join(dir, '.cc-worker', 'lanes', name)
+}
+
 /** 取目录下最新的 runs/<时间戳>.jsonl；没有则退回 log.jsonl。 */
-function latestEventFile(dir: string): string | undefined {
-  const runDir = join(dir, '.cc-worker', 'runs')
+function latestEventFile(dir: string, lane?: string | null): string | undefined {
+  const base = workerDir(dir, lane)
+  const runDir = join(base, 'runs')
   let newest: { path: string; at: number } | undefined
   try {
     for (const name of readdirSync(runDir)) {
@@ -142,16 +216,16 @@ function latestEventFile(dir: string): string | undefined {
     }
   } catch { /* 没有 runs 目录 */ }
   if (newest) return newest.path
-  const log = join(dir, '.cc-worker', 'log.jsonl')
+  const log = join(base, 'log.jsonl')
   return existsSync(log) ? log : undefined
 }
 
-/** 增量读出事件尾部。 */
-function readTail(dir: string, file: string): { events: CcEvent[]; mtime: number; size: number } {
+/** 增量读出事件尾部；缓存按事件文件路径分键，main 与各 lane 互不串。 */
+function readTail(file: string): { events: CcEvent[]; mtime: number; size: number } {
   let stat
   try { stat = statSync(file) } catch { return { events: [], mtime: 0, size: 0 } }
   const now = Date.now()
-  let entry = cache.get(dir)
+  let entry = cache.get(file)
   // 文件被换成新的（新一轮运行）就重新开始，不承接上一轮的尾部。
   if (!entry || entry.file !== file || stat.size < entry.size) entry = { file, size: 0, tail: [], touched: now }
   entry.touched = now
@@ -169,7 +243,7 @@ function readTail(dir: string, file: string): { events: CcEvent[]; mtime: number
     } finally { closeSync(fd) }
   }
   for (const [id, item] of cache) if (item !== entry && now - item.touched > CACHE_TTL_MS) cache.delete(id)
-  cache.set(dir, entry)
+  cache.set(file, entry)
   return { events: entry.tail, mtime: stat.mtimeMs, size: stat.size }
 }
 
@@ -248,7 +322,7 @@ export function readCcStatus(dir: string): CcStatus {
     return { ...empty, present: teamPresent, state: derived ?? empty.state, team,
       interruptRequested: existsSync(interruptPath(dir)) }
   }
-  const { events, mtime } = readTail(dir, file)
+  const { events, mtime } = readTail(file)
   if (!events.length) {
     return { ...empty, present: true, state: derived ?? empty.state, team,
       interruptRequested: existsSync(interruptPath(dir)) }
