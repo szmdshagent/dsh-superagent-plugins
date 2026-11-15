@@ -26,7 +26,9 @@ jobs:
           cache: pnpm
           cache-dependency-path: packages/${{ matrix.pkg }}/package.json
       - name: 安装依赖
-        run: pnpm install --no-frozen-lockfile
+        # --config.auto-install-peers=false 必须走命令行：.npmrc 里的同名设置实测不生效，
+        # 否则 pnpm 会去 registry 找 dsh-superagent（只存在于 DSH profile）而 404
+        run: pnpm install --no-frozen-lockfile --config.auto-install-peers=false
       - name: 类型检查
         run: |
           if [ "${{ matrix.pkg }}" = "dsh-superagent-pane" ]; then
