@@ -33,6 +33,12 @@
           "en": "Governance",
           "zh": "治理"
         }
+      },
+      "usage": {
+        "title": {
+          "en": "Usage",
+          "zh": "用量"
+        }
       }
     }
   },
@@ -106,6 +112,19 @@
         ]
       },
       "versions": [
+        {
+          "version": "0.2.0",
+          "publishTimestamp": 1794756878,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/szmdshagent/dsh-superagent-plugins",
+            "commit": "652a8e1ed61f436728841ad25e9b66994948627c",
+            "path": "packages/dsh-superagent-pane"
+          },
+          "engines": {
+            "dsh": ">=0.2.1-rc.3"
+          }
+        },
         {
           "version": "0.1.0",
           "publishTimestamp": 1793742000,
@@ -193,6 +212,19 @@
       },
       "versions": [
         {
+          "version": "0.2.0",
+          "publishTimestamp": 1794756878,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/szmdshagent/dsh-superagent-plugins",
+            "commit": "652a8e1ed61f436728841ad25e9b66994948627c",
+            "path": "packages/dsh-governance-panel"
+          },
+          "engines": {
+            "dsh": ">=0.2.1-rc.3"
+          }
+        },
+        {
           "version": "0.1.0",
           "publishTimestamp": 1794412351,
           "source": {
@@ -200,6 +232,88 @@
             "url": "https://github.com/szmdshagent/dsh-superagent-plugins",
             "commit": "7802ded9aa4fa5b563ecc1cd32d04f89cdeb9d83",
             "path": "packages/dsh-governance-panel"
+          },
+          "engines": {
+            "dsh": ">=0.2.1-rc.3"
+          }
+        }
+      ]
+    },
+    {
+      "name": "dsh-cc-worker",
+      "title": {
+        "en": "CC Worker",
+        "zh": "Claude Code 执行器"
+      },
+      "description": {
+        "en": "Gives agents a real pair of hands: runs scripts, builds, measurements and bulk edits through Claude Code. Ships its own executor and works out of the box, or delegates to a local cc-worker script.",
+        "zh": "给 agent 一双能真正干活的手：把脚本、构建、测量、批量改动交给 Claude Code 执行；自带执行器，装好即用，也可指向本机 cc-worker 脚本。"
+      },
+      "author": "szm",
+      "homepage": "https://github.com/szmdshagent/dsh-superagent-plugins#readme",
+      "repository": {
+        "url": "https://github.com/szmdshagent/dsh-superagent-plugins",
+        "directory": "packages/dsh-cc-worker"
+      },
+      "metadata": {
+        "category": "execution",
+        "keywords": [
+          "executor",
+          "claude-code",
+          "worker",
+          "执行"
+        ]
+      },
+      "versions": [
+        {
+          "version": "0.1.0",
+          "publishTimestamp": 1794756878,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/szmdshagent/dsh-superagent-plugins",
+            "commit": "652a8e1ed61f436728841ad25e9b66994948627c",
+            "path": "packages/dsh-cc-worker"
+          },
+          "engines": {
+            "dsh": ">=0.2.1-rc.3"
+          }
+        }
+      ]
+    },
+    {
+      "name": "dsh-token-live",
+      "title": {
+        "en": "Token Live",
+        "zh": "Token 实时计量"
+      },
+      "description": {
+        "en": "Shows today's cumulative tokens and live tok/s under the composer. Data comes from dsh-plugin-usage; it stays hidden when that plugin is absent.",
+        "zh": "输入框下方显示今日累计 token 与实时 tok/s；数据来自 dsh-plugin-usage，未装时静默不显示。"
+      },
+      "author": "szm",
+      "homepage": "https://github.com/szmdshagent/dsh-superagent-plugins#readme",
+      "repository": {
+        "url": "https://github.com/szmdshagent/dsh-superagent-plugins",
+        "directory": "packages/dsh-token-live"
+      },
+      "metadata": {
+        "category": "usage",
+        "keywords": [
+          "token",
+          "usage",
+          "meter",
+          "用量"
+        ]
+      },
+      "versions": [
+        {
+          "version": "0.1.0",
+          "publishTimestamp": 1794756878,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/szmdshagent/dsh-superagent-plugins",
+            "commit": "652a8e1ed61f436728841ad25e9b66994948627c",
+            "path": "packages/dsh-token-live"
           },
           "engines": {
             "dsh": ">=0.2.1-rc.3"
