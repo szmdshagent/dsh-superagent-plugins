@@ -1,8 +1,8 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { join } from "node:path";
-// ../../../../home/szm/src/dsh-cc-worker/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/util.js
+// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/util.js
 function getEnumValues(entries) {
 	const numericValues = Object.values(entries).filter((v) => typeof v === "number");
 	return Object.entries(entries).filter(([k, _]) => numericValues.indexOf(+k) === -1).map(([_, v]) => v);
@@ -536,7 +536,7 @@ function constantCatch(value) {
 	fn[CONSTANT_CATCH] = true;
 	return fn;
 }
-// ../../../../home/szm/src/dsh-cc-worker/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/core.js
+// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/core.js
 var _a$1;
 const _zodDesc = {
 	value: void 0,
@@ -642,7 +642,7 @@ function config(newConfig) {
 	if (newConfig) Object.assign(globalConfig, newConfig);
 	return globalConfig;
 }
-// ../../../../home/szm/src/dsh-cc-worker/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/errors.js
+// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/errors.js
 function _getMessage() {
 	const internals = this._zod;
 	internals.message ?? (internals.message = JSON.stringify(internals.def, jsonStringifyReplacer, 2));
@@ -756,7 +756,7 @@ function formatError(error, mapper = (issue) => issue.message) {
 	processError(error);
 	return fieldErrors;
 }
-// ../../../../home/szm/src/dsh-cc-worker/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/parse.js
+// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/parse.js
 function finalizeParams(callee, params) {
 	return {
 		callee: params?.callee ?? callee,
@@ -958,7 +958,7 @@ const _safeEncodeAsync = (_Err) => async (schema, value, _ctx) => {
 const _safeDecodeAsync = (_Err) => async (schema, value, _ctx) => {
 	return _safeParseAsync(_Err)(schema, value, _ctx);
 };
-// ../../../../home/szm/src/dsh-cc-worker/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/regexes.js
+// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/regexes.js
 /**
 * @deprecated CUID v1 is deprecated by its authors due to information leakage
 * (timestamps embedded in the id). Use {@link cuid2} instead.
@@ -1029,7 +1029,7 @@ const number$1 = /^-?\d+(?:\.\d+)?$/;
 const boolean$1 = /^(?:true|false)$/i;
 const lowercase = /^[^A-Z]*$/;
 const uppercase = /^[^a-z]*$/;
-// ../../../../home/szm/src/dsh-cc-worker/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/checks.js
+// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/checks.js
 const $ZodCheck = /*@__PURE__*/ $constructor("$ZodCheck", (inst, def) => {
 	var _a;
 	inst._zod ?? (inst._zod = {});
@@ -1324,7 +1324,7 @@ const $ZodCheckOverwrite = /*@__PURE__*/ $constructor("$ZodCheckOverwrite", (ins
 		payload.value = def.tx(payload.value);
 	};
 });
-// ../../../../home/szm/src/dsh-cc-worker/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/doc.js
+// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/doc.js
 var Doc = class {
 	constructor(args = [], closed = {}) {
 		this.content = [];
@@ -1357,13 +1357,13 @@ var Doc = class {
 		return new F(...Object.keys(this.closed), `return function (${this.args.join(", ")}) {\n${content.join("\n")}\n};`)(...Object.values(this.closed));
 	}
 };
-// ../../../../home/szm/src/dsh-cc-worker/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/versions.js
+// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/versions.js
 const version = {
 	major: 4,
 	minor: 6,
 	patch: 7
 };
-// ../../../../home/szm/src/dsh-cc-worker/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/schemas.js
+// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/schemas.js
 const $ZodType = /*@__PURE__*/ $constructor("$ZodType", (inst, def) => {
 	var _a;
 	inst ?? (inst = {});
@@ -2601,7 +2601,7 @@ function handleRefineResult(result, payload, input, inst) {
 		payload.issues.push(issue(_iss));
 	}
 }
-// ../../../../home/szm/src/dsh-cc-worker/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/memoizer.js
+// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/memoizer.js
 var $ZodCyclicError = class extends Error {
 	constructor() {
 		super(`Cannot parse a reference cycle that closes through a transform`);
@@ -2853,7 +2853,7 @@ function isBackEdge(ctx, value) {
 	const backEdges = ctx[STATE]?.backEdges;
 	return backEdges !== void 0 && isRef(value) && backEdges.has(value);
 }
-// ../../../../home/szm/src/dsh-cc-worker/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/en.js
+// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/en.js
 const error = () => {
 	const Sizable = {
 		string: {
@@ -2960,7 +2960,7 @@ const error = () => {
 function en_default() {
 	return { localeError: error() };
 }
-// ../../../../home/szm/src/dsh-cc-worker/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/registries.js
+// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/registries.js
 var _a;
 var $ZodRegistry = class {
 	constructor() {
@@ -3006,7 +3006,7 @@ function registry() {
 }
 (_a = globalThis).__zod_globalRegistry ?? (_a.__zod_globalRegistry = registry());
 const globalRegistry = globalThis.__zod_globalRegistry;
-// ../../../../home/szm/src/dsh-cc-worker/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/api.js
+// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/api.js
 function snapshotChecks(def) {
 	if (def.checks) def.checks = [...def.checks];
 	return def;
@@ -3514,7 +3514,7 @@ function _check(fn, params) {
 	ch._zod.check = fn;
 	return ch;
 }
-// ../../../../home/szm/src/dsh-cc-worker/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/to-json-schema.js
+// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/to-json-schema.js
 function assignProps(target, ...sources) {
 	for (const source of sources) for (const key of Reflect.ownKeys(source)) if (Object.prototype.propertyIsEnumerable.call(source, key)) assignProp(target, key, source[key]);
 	return target;
@@ -3957,7 +3957,7 @@ const createStandardJSONSchemaMethod = (schema, io, processors = {}) => (params)
 	extractDefs(ctx, schema);
 	return finalize(ctx, schema);
 };
-// ../../../../home/szm/src/dsh-cc-worker/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/json-schema-processors.js
+// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/json-schema-processors.js
 const narrowMin = (agg, key, value) => {
 	if (agg[key] === void 0 || value > agg[key]) agg[key] = value;
 };
@@ -4602,7 +4602,7 @@ function toJSONSchema(input, params) {
 	extractDefs(ctx, input);
 	return finalize(ctx, input);
 }
-// ../../../../home/szm/src/dsh-cc-worker/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/classic/errors.js
+// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/classic/errors.js
 const _installedErrorProtos = /* @__PURE__ */ new WeakSet([Object.prototype, Error.prototype]);
 function _lazyMethod(proto, key, make) {
 	Object.defineProperty(proto, key, {
@@ -4651,7 +4651,7 @@ const initializer = (inst, issues) => {
 	});
 };
 const ZodRealError = /*@__PURE__*/ $constructor("ZodError", initializer, void 0, { Parent: Error });
-// ../../../../home/szm/src/dsh-cc-worker/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/classic/parse.js
+// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/classic/parse.js
 const parse = /* @__PURE__ */ _parse(ZodRealError);
 const parseAsync = /* @__PURE__ */ _parseAsync(ZodRealError);
 const safeParse = /* @__PURE__ */ _safeParse(ZodRealError);
@@ -4664,7 +4664,7 @@ const safeEncode = /* @__PURE__ */ _safeEncode(ZodRealError);
 const safeDecode = /* @__PURE__ */ _safeDecode(ZodRealError);
 const safeEncodeAsync = /* @__PURE__ */ _safeEncodeAsync(ZodRealError);
 const safeDecodeAsync = /* @__PURE__ */ _safeDecodeAsync(ZodRealError);
-// ../../../../home/szm/src/dsh-cc-worker/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/classic/schemas.js
+// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/classic/schemas.js
 function _ensureDefaultLocale() {
 	if (!globalConfig.localeError) config(en_default());
 }
@@ -5771,6 +5771,7 @@ function parseOutput(stdout) {
 		const parsed = JSON.parse(last);
 		return {
 			ok: parsed.ok === true,
+			error: typeof parsed.error === "string" ? parsed.error : void 0,
 			result: typeof parsed.result === "string" ? parsed.result : void 0,
 			sessionId: parsed.session_id ?? void 0,
 			costUsd: typeof parsed.cost_usd === "number" ? parsed.cost_usd : void 0,
@@ -5786,7 +5787,7 @@ function parseOutput(stdout) {
 	}
 }
 /** 执行一次任务；永不抛异常，失败以 ok:false 返回。 */
-async function runWorker(options, signal) {
+async function runWorker(options, signal, scriptPath = CCW_PATH) {
 	const timeoutMs = (options.timeoutS ?? 1800) * 1e3;
 	return await new Promise((resolve) => {
 		let settled = false;
@@ -5799,7 +5800,7 @@ async function runWorker(options, signal) {
 		};
 		let child;
 		try {
-			child = spawn(CCW_PATH, buildArgs(options), {
+			child = spawn(scriptPath, buildArgs(options), {
 				stdio: [
 					"ignore",
 					"pipe",
@@ -5851,6 +5852,7 @@ async function runWorker(options, signal) {
 			clearTimeout(timer);
 			signal?.removeEventListener("abort", onAbort);
 			const parsed = parseOutput(stdout);
+			const fallback = stderr ? stderr.slice(-1e3) : "cc-worker 退出码 " + code;
 			finish({
 				...parsed,
 				code,
@@ -5858,7 +5860,7 @@ async function runWorker(options, signal) {
 					timedOut: true,
 					error: "执行超时"
 				} : {},
-				...!parsed.ok && stderr ? { error: parsed.error ?? stderr.slice(-1e3) } : {}
+				...!parsed.ok ? { error: parsed.error ?? parsed.result ?? fallback } : {}
 			});
 		});
 	});
@@ -5892,6 +5894,21 @@ const DEFAULTS = {
 };
 /** 在跑的任务：id → 句柄。 */
 const running = /* @__PURE__ */ new Map();
+/**
+* 去掉值为 undefined 的键。
+* 宿主会校验工具返回值必须是「无损 JSON」——带 undefined 属性的对象会被拒收
+* （JSON 序列化会丢键，回读就不是同一个值）。执行器失败分支天然会产出 undefined 字段，
+* 所以统一在返回前压一遍。
+*/
+const compact = (value) => {
+	if (Array.isArray(value)) return value.map(compact);
+	if (value && typeof value === "object") {
+		const out = {};
+		for (const [key, item] of Object.entries(value)) if (item !== void 0) out[key] = compact(item);
+		return out;
+	}
+	return value;
+};
 const taskId = () => "ccw-" + Math.random().toString(36).slice(2, 10);
 /**
 * 输出契约：宿主强制要求每个工具声明 output。
@@ -5958,17 +5975,21 @@ function apply(ctx, config = {}) {
 				abort
 			});
 			try {
-				if (settings.legacyScript) return {
-					task_id: id,
-					...await runWorker({
+				if (settings.legacyScript) {
+					const options = {
 						task: input.task,
-						dir: input.dir,
+						dir: input.dir ?? join(settings.workRoot, "ccw-" + id),
 						fresh: input.fresh,
 						model: input.model,
 						timeoutS: input.timeout_s,
 						maxTurns: input.max_turns
-					}, abort.signal)
-				};
+					};
+					if (!input.dir) mkdirSync(join(settings.workRoot, "ccw-" + id), { recursive: true });
+					return compact({
+						task_id: id,
+						...await runWorker(options, abort.signal, settings.legacyScript)
+					});
+				}
 				const request = {
 					task: input.task,
 					dir,
@@ -5978,10 +5999,10 @@ function apply(ctx, config = {}) {
 					timeoutS: input.timeout_s,
 					maxTurns: input.max_turns
 				};
-				return {
+				return compact({
 					task_id: id,
 					...await runClaude(runnerConfig, request, abort.signal)
-				};
+				});
 			} finally {
 				running.delete(id);
 			}

@@ -69,6 +69,8 @@ export function parseOutput (stdout: string): RunResult {
     const parsed = JSON.parse(last)
     return {
       ok: parsed.ok === true,
+      // 脚本失败时会带 error；漏了这一行，失败原因就彻底丢了（只剩退出码）
+      error: typeof parsed.error === 'string' ? parsed.error : undefined,
       result: typeof parsed.result === 'string' ? parsed.result : undefined,
       sessionId: parsed.session_id ?? undefined,
       costUsd: typeof parsed.cost_usd === 'number' ? parsed.cost_usd : undefined,
@@ -81,7 +83,7 @@ export function parseOutput (stdout: string): RunResult {
 }
 
 /** 执行一次任务；永不抛异常，失败以 ok:false 返回。 */
-export async function runWorker (options: RunOptions, signal?: AbortSignal): Promise<RunResult> {
+export async function runWorker (options: RunOptions, signal?: AbortSignal, scriptPath: string = CCW_PATH): Promise<RunResult> {
   const timeoutMs = (options.timeoutS ?? DEFAULT_TIMEOUT_S) * 1000
   return await new Promise<RunResult>(resolve => {
     let settled = false
@@ -89,7 +91,7 @@ export async function runWorker (options: RunOptions, signal?: AbortSignal): Pro
     const finish = (value: RunResult): void => { if (!settled) { settled = true; resolve(value) } }
     let child
     try {
-      child = spawn(CCW_PATH, buildArgs(options), { stdio: ['ignore', 'pipe', 'pipe'], detached: false })
+      child = spawn(scriptPath, buildArgs(options), { stdio: ['ignore', 'pipe', 'pipe'], detached: false })
     } catch (error) {
       finish({ ok: false, error: String(error) })
       return
@@ -115,8 +117,10 @@ export async function runWorker (options: RunOptions, signal?: AbortSignal): Pro
       clearTimeout(timer)
       signal?.removeEventListener('abort', onAbort)
       const parsed = parseOutput(stdout)
+      // 没拿到 error 时至少给出 stderr 尾巴或退出码，别让调用方只看到 ok:false
+      const fallback = stderr ? stderr.slice(-1000) : 'cc-worker 退出码 ' + code
       finish({ ...parsed, code, ...(timedOut ? { timedOut: true, error: '执行超时' } : {}),
-        ...(!parsed.ok && stderr ? { error: parsed.error ?? stderr.slice(-1000) } : {}) })
+        ...(!parsed.ok ? { error: parsed.error ?? parsed.result ?? fallback } : {}) })
     })
   })
 }

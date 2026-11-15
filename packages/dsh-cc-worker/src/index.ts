@@ -12,7 +12,8 @@
  *  而 ctx.tools.register() 是官方支持的 agent 作用域工具注册口，
  *  所以把「怎么干活」做成工具，既拿到插件生命周期，也不碰主包源码、升级不丢。
  */
-import { writeFileSync } from 'node:fs'
+import { mkdirSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { z } from 'zod'
 import { runClaude, type RunRequest, type RunnerConfig } from './runner.ts'
@@ -54,6 +55,22 @@ const DEFAULTS = {
 
 /** 在跑的任务：id → 句柄。 */
 const running = new Map<string, { startedAt: number; dir: string; abort: AbortController }>()
+
+/**
+ * 去掉值为 undefined 的键。
+ * 宿主会校验工具返回值必须是「无损 JSON」——带 undefined 属性的对象会被拒收
+ * （JSON 序列化会丢键，回读就不是同一个值）。执行器失败分支天然会产出 undefined 字段，
+ * 所以统一在返回前压一遍。
+ */
+const compact = (value: any): any => {
+  if (Array.isArray(value)) return value.map(compact)
+  if (value && typeof value === 'object') {
+    const out: any = {}
+    for (const [key, item] of Object.entries(value)) if (item !== undefined) out[key] = compact(item)
+    return out
+  }
+  return value
+}
 
 const taskId = (): string => 'ccw-' + Math.random().toString(36).slice(2, 10)
 
@@ -115,16 +132,19 @@ export function apply (ctx: Context, config: Config = {}): void {
         if (settings.legacyScript) {
           // 兼容路径：交给本机 cc-worker 脚本，保留 cctrim / team / handoff 等本机特有能力。
           const options: RunOptions = {
-            task: input.task, dir: input.dir, fresh: input.fresh, model: input.model,
+            // 省略 dir 时兜底到 workRoot：外部脚本同样要求 --dir 落在它允许的根下
+            task: input.task, dir: input.dir ?? join(settings.workRoot, 'ccw-' + id), fresh: input.fresh, model: input.model,
             timeoutS: input.timeout_s, maxTurns: input.max_turns,
           }
-          return { task_id: id, ...(await runLegacy(options, abort.signal)) }
+          // 外部脚本要求 --dir 是 workRoot 下的子目录（根目录本身会被拒），省略时按任务 id 建一个
+          if (!input.dir) mkdirSync(join(settings.workRoot, 'ccw-' + id), { recursive: true })
+          return compact({ task_id: id, ...(await runLegacy(options, abort.signal, settings.legacyScript)) })
         }
         const request: RunRequest = {
           task: input.task, dir, lane: input.lane, fresh: input.fresh, model: input.model,
           timeoutS: input.timeout_s, maxTurns: input.max_turns,
         }
-        return { task_id: id, ...(await runClaude(runnerConfig, request, abort.signal)) }
+        return compact({ task_id: id, ...(await runClaude(runnerConfig, request, abort.signal)) })
       } finally {
         running.delete(id)
       }
