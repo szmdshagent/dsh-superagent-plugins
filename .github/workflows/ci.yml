@@ -1,0 +1,42 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pkg: [dsh-cc-worker, dsh-governance-panel, dsh-superagent-pane, dsh-token-live]
+    defaults:
+      run:
+        working-directory: packages/${{ matrix.pkg }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: packages/${{ matrix.pkg }}/package.json
+      - name: 安装依赖
+        run: pnpm install --no-frozen-lockfile
+      - name: 类型检查
+        run: pnpm typecheck
+      - name: 构建
+        run: pnpm build
+      - name: 单测（有则跑）
+        run: |
+          if ls test/*.test.mjs >/dev/null 2>&1; then
+            node --test test/*.test.mjs
+          else
+            echo "该包没有单测，跳过"
+          fi
+      - name: 产物非空
+        run: test -s lib/index.js
