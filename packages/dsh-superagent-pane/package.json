@@ -1,6 +1,6 @@
 {
   "name": "dsh-superagent-pane",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "给 dsh-superagent 一个「派活」侧边栏：直接输入任务派活、看工单状态与 worker 正在做什么、收结果；含协作分组、僵尸检测与卡死自愈。",
   "license": "MIT",
   "type": "module",

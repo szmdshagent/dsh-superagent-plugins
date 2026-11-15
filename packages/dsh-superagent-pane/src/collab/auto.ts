@@ -5,8 +5,8 @@
  * 全部是词法规则，不调用 LLM/embedding；不读会话、不写工单。调用方（`Tickets.create`）
  * 负责在同一个 `repo.atomic` 里把结果写回工单。
  */
-import { key, type Ticket } from 'dsh-superagent'
-import { latestReport } from './types.ts'
+import { key } from 'dsh-superagent'
+import { latestReport, type Ticket } from './types.ts'
 
 import { artifactPaths, domainKeys, isGenericPath } from './results.ts'
 

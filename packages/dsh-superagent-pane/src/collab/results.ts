@@ -2,8 +2,7 @@
  * L1 结果卡：工单 ready 时把报告截成一张不超过 300 token 的只读卡片，按 repo/模块/产物路径索引，
  * 供同域新工单在首次 assignment 里直接复用，不新建会话、不额外唤醒、不调用 LLM。
  */
-import type { Ticket } from 'dsh-superagent'
-import type { ResultCard } from './types.ts'
+import type { ResultCard, Ticket } from './types.ts'
 
 /** 每张卡的展示字符上限，按中文约 1 token/字符留出余量，保证卡片本身不超过 300 token。 */
 const CONCLUSION_CHARS = 140

@@ -187,7 +187,7 @@ function readTail(file) {
 		}
 	}
 	for (const [id, item] of cache) if (item !== entry && now - item.touched > CACHE_TTL_MS) cache.delete(id);
-	cache.set(dir, entry);
+	cache.set(file, entry);
 	return {
 		events: entry.tail,
 		mtime: stat.mtimeMs,
@@ -266,7 +266,7 @@ function readCcStatus(dir) {
 		...empty,
 		interruptRequested: existsSync(interruptPath(dir))
 	};
-	const { events, mtime } = readTail(dir, file);
+	const { events, mtime } = readTail(file);
 	if (!events.length) return {
 		...empty,
 		present: true,
@@ -2182,13 +2182,14 @@ function apply(ctx) {
 			try {
 				const store = ctx.orchestrator?.store;
 				const engine = ctx.orchestrator?.engine;
-				if (typeof store?.tickets?.list === "function") {
-					const all = store.tickets.list();
+				const tickets = store?.tickets;
+				if (typeof tickets?.list === "function") {
+					const all = tickets.list();
 					const host = {
 						store,
 						now: Date.now(),
-						ticketThreads: (ticket) => [...(ticket.origin?.triggerIds ?? []).map((id) => store.triggers?.get?.(id)).filter(Boolean).flatMap((t) => (t.threads ?? []).map((r) => `${r.source}:${r.id}`)), ...(ticket.follows ?? []).map((f) => String(f.thread ?? ""))].filter(Boolean),
-						save: (ticket) => store.tickets.save?.(ticket),
+						ticketThreads: (ticket) => [...(ticket.origin?.triggerIds ?? []).map((id) => store?.triggers?.get?.(id)).filter(Boolean).flatMap((t) => (t.threads ?? []).map((r) => `${r.source}:${r.id}`)), ...(ticket.follows ?? []).map((f) => String(f.thread ?? ""))].filter(Boolean),
+						save: (ticket) => tickets.save?.(ticket),
 						addNote: (ticketId, note) => {
 							try {
 								engine?.note?.(ticketId, note.text);

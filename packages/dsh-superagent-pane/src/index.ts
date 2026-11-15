@@ -1,7 +1,7 @@
 /**
  * dsh-superagent-pane：在面板里派活给 superagent，并显示 worker 正在做什么。
  *
- * 这个包独立存在是有意为之：profile 里的 superagent 安装目录不是 git 检出，官方升级会整体覆盖目录。
+ * 这个包独立存在是有意为之：`/home/szm/src/dsh-superagent-prototype` 不是 git 检出，官方升级会整体覆盖目录。
  * 所以本包只依赖 dsh-superagent 公开导出的接口（`Trigger`、`key`）和 Cordis 服务（`orchestrator`、`webServer`、
  * `sessionPersistence`），路由与 Source 都自己注册，主包 `git pull && pnpm build` 不会碰它。
  */
@@ -36,7 +36,9 @@ declare module '@deepseek-ai/cordis' {
       readonly store?: {
         readonly tickets?: {
           open?: () => readonly { id?: string; sessionId?: string; ended?: unknown }[]
+          list?: () => any[]
           get?(id: string): any
+          save?(ticket: any): any
         }
         readonly threads?: { get?(key: string): any }
         readonly triggers?: {
@@ -1561,16 +1563,17 @@ export function apply(ctx: Context): void {
       try {
         const store = ctx.orchestrator?.store
         const engine = (ctx.orchestrator as any)?.engine
-        if (typeof store?.tickets?.list === 'function') {
-          const all = store.tickets.list()
+        const tickets = store?.tickets
+        if (typeof tickets?.list === 'function') {
+          const all = tickets.list()
           const host = {
             store, now: Date.now(),
             ticketThreads: (ticket: any) => [
-              ...(ticket.origin?.triggerIds ?? []).map((id: string) => store.triggers?.get?.(id))
+              ...(ticket.origin?.triggerIds ?? []).map((id: string) => store?.triggers?.get?.(id))
                 .filter(Boolean).flatMap((t: any) => (t.threads ?? []).map((r: any) => `${r.source}:${r.id}`)),
               ...(ticket.follows ?? []).map((f: any) => String(f.thread ?? '')),
             ].filter(Boolean),
-            save: (ticket: any) => store.tickets.save?.(ticket),
+            save: (ticket: any) => tickets.save?.(ticket),
             // 用 engine.note（主包正式接口）写一条 note；已结束工单由主包自行处理唤醒策略。
             addNote: (ticketId: string, note: any) => { try { engine?.note?.(ticketId, note.text) } catch { /* 已结束工单可能拒绝，忽略 */ } },
             logger: (ctx as any).logger,

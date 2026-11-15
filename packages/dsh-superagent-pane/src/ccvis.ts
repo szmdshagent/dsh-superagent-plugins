@@ -240,7 +240,7 @@ function readTail(file: string): { events: CcEvent[]; mtime: number; size: numbe
     } finally { closeSync(fd) }
   }
   for (const [id, item] of cache) if (item !== entry && now - item.touched > CACHE_TTL_MS) cache.delete(id)
-  cache.set(dir, entry)
+  cache.set(file, entry)
   return { events: entry.tail, mtime: stat.mtimeMs, size: stat.size }
 }
 
@@ -298,7 +298,7 @@ export function readCcStatus(dir: string): CcStatus {
   if (!dir) return empty
   const file = latestEventFile(dir)
   if (!file) return { ...empty, interruptRequested: existsSync(interruptPath(dir)) }
-  const { events, mtime } = readTail(dir, file)
+  const { events, mtime } = readTail(file)
   if (!events.length) return { ...empty, present: true, interruptRequested: existsSync(interruptPath(dir)) }
   const described = describe(events)
   const now = Date.now()
