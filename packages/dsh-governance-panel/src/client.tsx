@@ -332,8 +332,8 @@ function TeamCard({ team, conflicts }: { team: TeamReport; conflicts?: ConflictR
         计划 {team.workerLanes} 路 · 完成 {team.done} · 失败 {team.failed} · 进行中 {team.running} · 未启动 {team.pending}
       </span>
       <span style={{ fontSize: 11, opacity: 0.6, marginLeft: 'auto' }}>
-        成本 ${team.totalCostUsd.toFixed(4)} · token {team.totalTokens.toLocaleString('en-US')}
-        {' · '}峰值并行 {team.peakParallelism}
+        计划内 lane 成本 ${team.totalCostUsd.toFixed(4)} · lane token {team.totalTokens.toLocaleString('en-US')}
+        {' · '}峰值并行 {team.peakParallelism} lane
       </span>
     </div>
     {conflicts?.present && <div style={{ fontSize: 11, opacity: 0.65 }}>

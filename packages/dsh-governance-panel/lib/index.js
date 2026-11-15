@@ -474,7 +474,7 @@ const MAX_ROUND_CACHE_READ = 4e6;
 /**
 * 判断一行台账的累计缓存读里是否混进了「不属于本轮」的历史。
 *
-* 背景：abtopup 那单是把 52MB 的 long-dsh 会话文件 `cp` 成新 sid 起的头（脚本 /home/szm/cc-diag/ab-topup.sh:12），
+* 背景：abtopup 那单是把 52MB 的 long-dsh 会话文件 `cp` 成新 sid 起的头（脚本 ab-topup.sh:12），
 * 首轮就把 42.4M 缓存整体重放，花掉 $29.73。这类行的 `baseline_source=none`（找不到同 session 更早 result），
 * 但 `baseline_source=none` 本身不足以判定——正常新开会话的首轮也都是 none。
 *
@@ -694,7 +694,7 @@ function buildLaneExecutions(scans, now, costRows = trueCostRows(scans)) {
 				if (at) endedCandidates.push(at);
 			}
 			const lastRecordedMs = Math.max(...endedCandidates, 0);
-			const endedMs = status === "running" || status === "unknown" ? now : lastRecordedMs;
+			const endedMs = status === "running" ? now : lastRecordedMs;
 			const durationMs = startedMs > 0 && endedMs >= startedMs ? endedMs - startedMs : null;
 			const lastActivity = Math.max(scan?.at ?? 0, resultMtime, lastRecordedMs, laneMtime);
 			const plannedTask = planMap.get(lane);
@@ -768,7 +768,7 @@ function buildTeamReport(lanes, scans, now) {
 		const statusOf = (status) => workers.filter((lane) => lane.status === status).length;
 		const ticketStarted = ticketLanes.map((lane) => parseTime(lane.startedAt)).filter(Boolean);
 		const ticketEnded = ticketLanes.map((lane) => parseTime(lane.endedAt)).filter(Boolean);
-		const ongoing = workers.some((lane) => lane.status === "running" || lane.status === "pending" || lane.status === "unknown");
+		const ongoing = ticketLanes.some((lane) => lane.status === "running" || lane.status === "unknown");
 		const startedMs = ticketStarted.length ? Math.min(...ticketStarted) : 0;
 		const endedMs = ongoing || !ticketEnded.length ? 0 : Math.max(...ticketEnded);
 		teams.push({
@@ -785,7 +785,7 @@ function buildTeamReport(lanes, scans, now) {
 			totalRuns: ticketLanes.reduce((sum, lane) => sum + lane.runs, 0),
 			totalTokens: ticketLanes.reduce((sum, lane) => sum + lane.tokens.total, 0),
 			configuredParallelism: plan.lanes.length,
-			peakParallelism: peakParallelism(workers),
+			peakParallelism: peakParallelism(ticketLanes),
 			currentParallelism: workers.filter((lane) => lane.status === "running").length,
 			startedAt: isoAt(startedMs),
 			endedAt: ongoing ? null : isoAt(endedMs),
@@ -813,7 +813,7 @@ function buildTeamReport(lanes, scans, now) {
 		totalRuns: teams.reduce((sum, team) => sum + team.totalRuns, 0),
 		totalTokens: teams.reduce((sum, team) => sum + team.totalTokens, 0),
 		configuredParallelism: teams.reduce((sum, team) => sum + team.configuredParallelism, 0),
-		peakParallelism: teams.reduce((peak, team) => Math.max(peak, team.peakParallelism), 0),
+		peakParallelism: peakParallelism(teams.flatMap((team) => team.lanes)),
 		currentParallelism: teams.reduce((sum, team) => sum + team.currentParallelism, 0),
 		startedAt: isoAt(startedMs),
 		endedAt: anyOngoing ? null : isoAt(endedMs),
@@ -939,7 +939,7 @@ function teamFindings(lanes, team, conflicts, scans, now) {
 			severity: "info",
 			id: `team:summary:${summary.ticket}`,
 			title: `team 计划 ${summary.workerLanes} 路：完成 ${summary.done}、失败 ${summary.failed}、进行中 ${summary.running}、未启动 ${summary.pending}`,
-			detail: `含 lead 共 ${summary.lanes.length} 条 lane；团队成本 $${summary.totalCostUsd.toFixed(4)}，轮次 ${summary.totalRuns}，token ${summary.totalTokens}，峰值并行 ${summary.peakParallelism} 路。`,
+			detail: `含 lead 共 ${summary.lanes.length} 条 lane；计划内 lane 成本 $${summary.totalCostUsd.toFixed(4)}（不含同工单后续主 lane 轮次），lane 轮次 ${summary.totalRuns}，lane token ${summary.totalTokens}，峰值并行 ${summary.peakParallelism} 条 lane。`,
 			ticket: summary.ticket,
 			metrics: {
 				计划lane数: summary.workerLanes,
@@ -948,8 +948,8 @@ function teamFindings(lanes, team, conflicts, scans, now) {
 				进行中: summary.running,
 				未启动: summary.pending,
 				状态未知: summary.unknown,
-				团队总成本: summary.totalCostUsd,
-				总轮次: summary.totalRuns,
+				计划内lane成本: summary.totalCostUsd,
+				lane轮次: summary.totalRuns,
 				总token: summary.totalTokens,
 				峰值并行: summary.peakParallelism
 			}
@@ -1032,13 +1032,15 @@ function teamFindings(lanes, team, conflicts, scans, now) {
 		});
 	}
 	if (conflicts.findingsFiles > 0) {
-		const lanesCovered = new Set(conflicts.items.filter((item) => item.kind === "findings" && item.lane).map((item) => `${item.ticket}#${item.lane}`));
+		const realLanes = new Set(lanes.map((lane) => `${lane.ticket}#${lane.lane}`));
+		const byLane = conflicts.items.filter((item) => item.kind === "findings" && item.lane && realLanes.has(`${item.ticket}#${item.lane}`));
+		const lanesCovered = new Set(byLane.map((item) => `${item.ticket}#${item.lane}`));
 		findings.push({
 			dimension: "team",
 			severity: "info",
 			id: "team:findings",
-			title: `共享区有 ${conflicts.findingsFiles} 份 findings，覆盖 ${lanesCovered.size} 个 lane`,
-			detail: "findings 是 lane 之间避免重复劳动的中间结论；数量长期为 0 说明共享区没有被用起来。",
+			title: `共享区有 ${conflicts.findingsFiles} 份 findings，其中 ${lanesCovered.size} 份对应真实 lane`,
+			detail: "findings 是 lane 之间避免重复劳动的中间结论；数量长期为 0 说明共享区没有被用起来。其余文件是同名以外的小结/复查产物（如 final.md），计入文件数但不算「覆盖某个 lane」。",
 			metrics: {
 				findings文件: conflicts.findingsFiles,
 				覆盖lane: lanesCovered.size,
@@ -1100,24 +1102,27 @@ function executorFindings(scans) {
 		const benign = BENIGN_STDERR.some((pattern) => pattern.test(scan.stderr));
 		const entry = byKey.get(key) ?? {
 			message: scan.stderr.split("\n")[0].trim(),
-			tickets: [],
+			tickets: /* @__PURE__ */ new Set(),
+			units: 0,
 			benign
 		};
-		entry.tickets.push(scan.key);
+		entry.tickets.add(scan.name);
+		entry.units++;
 		byKey.set(key, entry);
 	}
 	const findings = [];
 	for (const [key, entry] of byKey) {
-		const count = entry.tickets.length;
+		const count = entry.tickets.size;
 		findings.push({
 			dimension: "executor",
 			severity: entry.benign ? "info" : "warn",
 			id: `executor:${key}`,
 			title: entry.benign ? `已知良性告警，${count} 个工单出现过（可忽略）` : `执行器报错，${count} 个工单出现过`,
 			detail: entry.benign ? "unrecognized_model 只是 Claude Code 对模型名的 SDK 侧标注，不影响执行结果。如果哪天它开始伴随失败，再升级处理。" : "同一句报错跨多个工单出现，通常来自全局配置（模型名、端点、凭据），不是单个任务的问题。",
-			ticket: count === 1 ? entry.tickets[0] : void 0,
+			ticket: count === 1 ? [...entry.tickets][0] : void 0,
 			metrics: {
 				命中工单数: count,
+				命中lane单元: entry.units,
 				良性: entry.benign ? "是" : "否"
 			},
 			evidence: entry.message.slice(0, 600)
@@ -1376,6 +1381,9 @@ function contextFindings(scans, now) {
 	let historyCacheTickets = /* @__PURE__ */ new Set();
 	let liveSwitches = 0;
 	let staleSwitchTickets = 0;
+	const window = windowDays(now, 7);
+	let historyStepsRuns = 0;
+	let historyStepsTickets = /* @__PURE__ */ new Set();
 	for (const scan of scans) {
 		const latest = scan.ledger.length ? scan.ledger.reduce((best, row) => String(row?.ts ?? "") >= String(best?.ts ?? "") ? row : best, scan.ledger[0]) : null;
 		const latestRun = String(latest?.run ?? "");
@@ -1424,16 +1432,23 @@ function contextFindings(scans, now) {
 					at: typeof row.ts === "string" ? row.ts : void 0
 				});
 			}
-			if (steps >= THRESHOLDS.stepsWarn) findings.push({
-				dimension: "context",
-				severity: "info",
-				id: `context:steps:${scan.key}:${run}`,
-				title: `单轮 ${steps} 步`,
-				detail: "步数偏多的轮次，工具输出累积是上下文膨胀的主要来源。",
-				ticket: scan.key,
-				metrics: { 步数: steps },
-				at: typeof row.ts === "string" ? row.ts : void 0
-			});
+			if (steps >= THRESHOLDS.stepsWarn) {
+				const isLatestRow = run === latestRun;
+				const inWindow = window.has(String(row?.ts ?? "").slice(0, 10));
+				if (!isLatestRow || !inWindow) {
+					historyStepsRuns++;
+					historyStepsTickets.add(scan.key);
+				} else findings.push({
+					dimension: "context",
+					severity: "info",
+					id: `context:steps:${scan.key}:${run}`,
+					title: `单轮 ${steps} 步`,
+					detail: "步数偏多的轮次，工具输出累积是上下文膨胀的主要来源。",
+					ticket: scan.key,
+					metrics: { 步数: steps },
+					at: typeof row.ts === "string" ? row.ts : void 0
+				});
+			}
 		}
 	}
 	if (historyCacheRuns > 0) findings.push({
@@ -1456,6 +1471,17 @@ function contextFindings(scans, now) {
 		metrics: {
 			已结束工单数: staleSwitchTickets,
 			进行中工单数: liveSwitches
+		}
+	});
+	if (historyStepsRuns > 0) findings.push({
+		dimension: "context",
+		severity: "info",
+		id: "context:steps-history",
+		title: `历史/窗口外 ${historyStepsRuns} 轮步数偏多，已折叠不再逐条报`,
+		detail: `这 ${historyStepsRuns} 轮分布在 ${historyStepsTickets.size} 个工单，都既不是各自工单的最新一轮、或落在近 7 天窗口之外：后续轮次已覆盖其运行状态，无法再处理，只作复盘。逐条展开请查对应工单的 budget-ledger.jsonl。`,
+		metrics: {
+			历史轮数: historyStepsRuns,
+			涉及工单数: historyStepsTickets.size
 		}
 	});
 	return findings;
@@ -1499,6 +1525,37 @@ function livenessFindings(scans, now) {
 	}
 	return findings;
 }
+/** 各维度的中文标题与图例，前端直接用。 */
+const DIMENSION_META = {
+	team: {
+		label: "团队协作",
+		hint: "team 计划、lane 状态、共享 findings 与冲突"
+	},
+	handoff: {
+		label: "交接闭环",
+		hint: "交接是否被写入、读走、正确提取"
+	},
+	executor: {
+		label: "执行器",
+		hint: "cc-worker 与 Claude Code 进程侧的报错"
+	},
+	budget: {
+		label: "预算纪律",
+		hint: "计划、重复调用、硬上限"
+	},
+	cost: {
+		label: "成本",
+		hint: "单轮与今日花费，异常贵的 run"
+	},
+	context: {
+		label: "上下文",
+		hint: "缓存读、换会话、步数膨胀"
+	},
+	liveness: {
+		label: "活性",
+		hint: "运行中是否真的在动"
+	}
+};
 /**
 * 跑一次完整治理扫描。
 * @param now 当前时间（毫秒），测试可注入。
@@ -1519,6 +1576,8 @@ function govern(now = Date.now(), options = {}) {
 	const switchTotal = scans.reduce((sum, scan) => sum + switchCount(scan.workerDir), 0);
 	const liveness = livenessFindings(scans, now);
 	const teamIssues = teamFindings(lanes, team, conflicts, scans, now);
+	const only = options.dims && options.dims.length > 0 ? new Set(options.dims) : null;
+	const keep = (key) => !only || only.has(key);
 	const findings = [
 		...teamIssues,
 		...handoff,
@@ -1527,7 +1586,7 @@ function govern(now = Date.now(), options = {}) {
 		...cost,
 		...context,
 		...liveness
-	];
+	].filter((item) => !only || only.has(item.dimension));
 	const severityRank = {
 		critical: 0,
 		warn: 1,
@@ -1544,14 +1603,16 @@ function govern(now = Date.now(), options = {}) {
 	];
 	findings.sort((a, b) => severityRank[a.severity] - severityRank[b.severity] || order.indexOf(a.dimension) - order.indexOf(b.dimension) || String(b.at ?? "").localeCompare(String(a.at ?? "")));
 	const groups = {
-		team: teamIssues,
-		handoff,
-		executor,
-		budget,
-		cost,
-		context,
-		liveness
+		team: keep("team") ? teamIssues : [],
+		handoff: keep("handoff") ? handoff : [],
+		executor: keep("executor") ? executor : [],
+		budget: keep("budget") ? budget : [],
+		cost: keep("cost") ? cost : [],
+		context: keep("context") ? context : [],
+		liveness: keep("liveness") ? liveness : []
 	};
+	const laneUnitCount = scans.filter((scan) => scan.lane).length;
+	const distinctTickets = (list) => new Set(list.map((item) => item.name)).size;
 	const dimensionMetrics = {
 		team: team.present || conflicts.present || team.lanes > 0 ? {
 			团队工单: team.tickets,
@@ -1560,32 +1621,39 @@ function govern(now = Date.now(), options = {}) {
 			失败: team.failed,
 			进行中: team.running,
 			未启动: team.pending,
-			团队总成本: team.totalCostUsd,
-			总轮次: team.totalRuns,
+			计划内lane成本: team.totalCostUsd,
+			lane轮次: team.totalRuns,
 			峰值并行: team.peakParallelism,
 			findings文件: conflicts.findingsFiles,
 			冲突路径: conflicts.conflictPaths
 		} : {},
 		handoff: {
-			有交接记录: scans.filter((scan) => scan.handoff).length,
-			工单数: ticketCount
+			有交接工单: distinctTickets(scans.filter((scan) => scan.handoff)),
+			工单数: ticketCount,
+			有交接lane: scans.filter((scan) => scan.lane && scan.handoff).length
 		},
 		executor: {
-			有错误日志: scans.filter((scan) => scan.stderr).length,
-			工单数: ticketCount
+			有错误工单: distinctTickets(scans.filter((scan) => scan.stderr)),
+			工单数: ticketCount,
+			有错误lane: scans.filter((scan) => scan.lane && scan.stderr).length
 		},
 		budget: {
 			台账轮数: scans.reduce((sum, scan) => sum + scan.ledger.length, 0),
-			有预算状态: scans.filter((scan) => scan.budget).length
+			有预算状态工单: distinctTickets(scans.filter((scan) => scan.budget)),
+			有预算状态lane: scans.filter((scan) => scan.lane && scan.budget).length
 		},
 		cost: costMetrics,
 		context: {
 			换会话合计: switchTotal,
-			有台账工单: scans.filter((scan) => scan.ledger.length > 0).length
+			有台账工单: distinctTickets(scans.filter((scan) => scan.ledger.length > 0)),
+			有台账lane: scans.filter((scan) => scan.lane && scan.ledger.length > 0).length
 		},
-		liveness: { 有worker目录: scans.filter((scan) => scan.workerDir).length }
+		liveness: {
+			有worker目录工单: distinctTickets(scans.filter((scan) => scan.workerDir)),
+			有worker目录lane: scans.filter((scan) => scan.lane && scan.workerDir).length
+		}
 	};
-	const dimensions = order.map((key) => {
+	const dimensions = order.filter(keep).map((key) => {
 		const list = groups[key];
 		const critical = list.filter((item) => item.severity === "critical").length;
 		const warn = list.filter((item) => item.severity === "warn").length;
@@ -1601,7 +1669,9 @@ function govern(now = Date.now(), options = {}) {
 	const totalCritical = findings.filter((item) => item.severity === "critical").length;
 	const totalWarn = findings.filter((item) => item.severity === "warn").length;
 	const overall = totalCritical > 0 ? "bad" : totalWarn > 0 ? "watch" : "ok";
-	const headline = overall === "ok" ? `七个维度全绿（${ticketCount} 个工单${team.present ? `，${team.workerLanes} 条 lane` : ""}，${costMetrics["近7天轮数"] ?? 0} 轮）` : `${totalCritical} 项需立刻处理，${totalWarn} 项值得看一眼`;
+	const scopeKeys = dimensions.map((item) => item.key);
+	const scopeLabel = scopeKeys.length === order.length ? "七个维度全绿" : `${scopeKeys.map((key) => DIMENSION_META[key].label).join("、")}（${scopeKeys.length} 个维度）全绿`;
+	const headline = overall === "ok" ? `${scopeLabel}（${ticketCount} 个工单${team.present ? `，${laneUnitCount} 条 lane` : ""}，${costMetrics["近7天轮数"] ?? 0} 轮）` : `${totalCritical} 项需立刻处理，${totalWarn} 项值得看一眼`;
 	return {
 		generatedAt: new Date(now).toISOString(),
 		overall,
@@ -1613,7 +1683,7 @@ function govern(now = Date.now(), options = {}) {
 		conflicts,
 		scanned: {
 			tickets: ticketCount,
-			laneUnits: scans.filter((scan) => scan.lane).length,
+			laneUnits: laneUnitCount,
 			withWorkerDir: scans.filter((scan) => scan.workerDir).length,
 			withHandoffState: scans.filter((scan) => scan.handoff).length,
 			ledgerRuns: scans.reduce((sum, scan) => sum + scan.ledger.length, 0),
@@ -1642,6 +1712,8 @@ function spendTrend(now = Date.now(), days = 7) {
 	}));
 }
 // src/index.ts
+/** ?dims= 的取值必须是真的维度名；写错的项直接忽略，不能把任意字符串塞进过滤集合。 */
+const isDimensionKey = (value) => Object.prototype.hasOwnProperty.call(DIMENSION_META, value);
 /** 必需服务：cordis 见到这个声明才会在 apply 之前把 ctx.webServer 装好。 */
 const inject = ["webServer"];
 /** 精确匹配：宿主 `/api` 前缀的 RPC 网关对无 cookie 请求回 401，精确表优先命中。 */
@@ -1707,13 +1779,11 @@ function apply(ctx) {
 			const wantWeekly = url.searchParams.get("weekly") === "1";
 			const wantTrend = url.searchParams.get("trend") === "1";
 			const only = (url.searchParams.get("dims") ?? "").split(",").map((item) => item.trim()).filter(Boolean);
-			const report = govern(now, { ticket: (url.searchParams.get("ticket") ?? "").trim() || void 0 });
-			if (only.length > 0) {
-				report.findings = report.findings.filter((item) => only.includes(item.dimension));
-				report.dimensions = report.dimensions.filter((item) => only.includes(item.key));
-			}
 			sendJson(res, 200, {
-				...report,
+				...govern(now, {
+					ticket: (url.searchParams.get("ticket") ?? "").trim() || void 0,
+					dims: only.length > 0 ? only.filter(isDimensionKey) : void 0
+				}),
 				weekly: wantWeekly ? readWeekly(now) : null,
 				trend: wantTrend ? spendTrend(now, 7) : null
 			});

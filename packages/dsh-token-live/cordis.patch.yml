@@ -1,0 +1,4 @@
+# dsh-token-live bundle patch: mounts the live token meter.
+- insert:
+    - id: token-live
+      name: dsh-token-live

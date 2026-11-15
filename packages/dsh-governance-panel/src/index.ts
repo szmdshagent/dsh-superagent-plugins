@@ -13,7 +13,12 @@ import type { Context } from '@deepseek-ai/cordis'
 import { execFileSync } from 'node:child_process'
 import { readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { govern, spendTrend } from './governance.ts'
+import { govern, spendTrend, DIMENSION_META } from './governance.ts'
+import type { DimensionKey } from './governance.ts'
+
+/** ?dims= 的取值必须是真的维度名；写错的项直接忽略，不能把任意字符串塞进过滤集合。 */
+const isDimensionKey = (value: string): value is DimensionKey =>
+  Object.prototype.hasOwnProperty.call(DIMENSION_META, value)
 
 /** 必需服务：cordis 见到这个声明才会在 apply 之前把 ctx.webServer 装好。 */
 export const inject = ['webServer']
@@ -81,11 +86,13 @@ export function apply(ctx: Context): void {
       const only = (url.searchParams.get('dims') ?? '').split(',').map(item => item.trim()).filter(Boolean)
       // ?ticket=<目录名> 只扫一个工单，便于面板钻取与验收取样。
       const ticket = (url.searchParams.get('ticket') ?? '').trim() || undefined
-      const report = govern(now, { ticket })
-      if (only.length > 0) {
-        report.findings = report.findings.filter(item => only.includes(item.dimension))
-        report.dimensions = report.dimensions.filter(item => only.includes(item.key))
-      }
+      // 过滤在 govern 内部完成：overall/headline/dimensions 的计数必须与过滤后的
+      // findings 同源，否则会出现「1 项需立刻处理」但 findings 里 0 条 critical 的分裂。
+      const report = govern(now, {
+        ticket,
+        // 全是非法维度名时等同「没传 dims」：宁可多报，也不要因为拼错参数返回一份空报告。
+        dims: only.length > 0 ? only.filter(isDimensionKey) : undefined,
+      })
       sendJson(res, 200, {
         ...report,
         weekly: wantWeekly ? readWeekly(now) : null,

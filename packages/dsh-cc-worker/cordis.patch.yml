@@ -1,0 +1,5 @@
+# dsh-cc-worker：给 superagent 提供 Claude Code 执行能力的配套插件。
+# 只注册工具（ccw_run / ccw_status / ccw_kill），不改主包、不接管 Executor。
+- insert:
+    - id: dsh-cc-worker
+      name: dsh-cc-worker

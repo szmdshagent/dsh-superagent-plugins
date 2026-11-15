@@ -11,7 +11,6 @@
  */
 import { closeSync, openSync, readFileSync, readSync, statSync, writeFileSync, existsSync, readdirSync, unlinkSync, fstatSync } from 'node:fs'
 import { join } from 'node:path'
-import { teamStatus, type TeamStatus } from './guard.ts'
 
 /** 事件流尾部只保留这么多行，足够描述当前动作。 */
 const TAIL_LIMIT = 120
@@ -84,8 +83,6 @@ export type CcStatus = {
   alertText?: string
   /** 报错摘要（来自事件或 stderr）。 */
   error?: string
-  /** team 协作视图：计划与每个 lane 的存活/完成/失败（旧版单 lane 时 lanes 为空）。 */
-  team?: TeamStatus
 }
 
 /** 把工具输入压成一行可读文本。 */
@@ -243,7 +240,7 @@ function readTail(file: string): { events: CcEvent[]; mtime: number; size: numbe
     } finally { closeSync(fd) }
   }
   for (const [id, item] of cache) if (item !== entry && now - item.touched > CACHE_TTL_MS) cache.delete(id)
-  cache.set(file, entry)
+  cache.set(dir, entry)
   return { events: entry.tail, mtime: stat.mtimeMs, size: stat.size }
 }
 
@@ -295,38 +292,14 @@ function stderrHint(dir: string): string | undefined {
   } catch { return undefined }
 }
 
-/**
- * 没有 main 事件流时，用 team lanes 推导一个整体状态。
- *
- * 否则纯 team 运行（lead/ccwN 各自写 lanes/<lane>/log.jsonl）会被面板当成「未委托」整个藏起来。
- */
-function teamState(team: TeamStatus): CcStatus['state'] | undefined {
-  if (!team.lanes.length) return team.plan.exists ? 'thinking' : undefined
-  if (team.lanes.some(lane => lane.state === 'running')) return 'running'
-  if (team.lanes.some(lane => lane.state === 'failed')) return 'error'
-  if (team.lanes.every(lane => lane.state === 'done')) return 'done'
-  // 还有 pending lane：团队已启动、部分路未开跑。
-  return 'running'
-}
-
 /** 汇总一个工单目录的 CC 执行状态。 */
 export function readCcStatus(dir: string): CcStatus {
   const empty: CcStatus = { present: false, state: 'none', steps: [], interruptRequested: false, alert: 'none' }
   if (!dir) return empty
-  // team 视图与主 lane 的事件流独立读取：即使 main 没有任何事件，也能看到并行 lane 的进展。
-  const team = teamStatus(dir)
-  const derived = teamState(team)
-  const teamPresent = team.lanes.length > 0 || team.plan.exists
   const file = latestEventFile(dir)
-  if (!file) {
-    return { ...empty, present: teamPresent, state: derived ?? empty.state, team,
-      interruptRequested: existsSync(interruptPath(dir)) }
-  }
-  const { events, mtime } = readTail(file)
-  if (!events.length) {
-    return { ...empty, present: true, state: derived ?? empty.state, team,
-      interruptRequested: existsSync(interruptPath(dir)) }
-  }
+  if (!file) return { ...empty, interruptRequested: existsSync(interruptPath(dir)) }
+  const { events, mtime } = readTail(dir, file)
+  if (!events.length) return { ...empty, present: true, interruptRequested: existsSync(interruptPath(dir)) }
   const described = describe(events)
   const now = Date.now()
   const ageMs = Math.max(0, now - mtime)
@@ -363,7 +336,6 @@ export function readCcStatus(dir: string): CcStatus {
     interruptRequested,
     alert,
     alertText,
-    team,
     error: described.error ?? (state === 'error' || alert === 'critical' ? stderrHint(dir) : undefined),
   }
 }
@@ -399,12 +371,6 @@ export function probeExecutor(dir: string): ExecutorProbe {
   const file = latestEventFile(dir)
   if (file) {
     try { probe.atMs = statSync(file).mtimeMs } catch { /* 文件刚被替换，忽略 */ }
-  }
-  // team 运行时 main 没有任何产物：把各 lane 的存活与最新活动并进来，否则长任务会被误判成僵尸。
-  const team = teamStatus(dir)
-  if (team.lanes.some(lane => lane.state === 'running')) probe.alive = true
-  for (const lane of team.lanes) {
-    if (lane.atMs && (probe.atMs === undefined || lane.atMs > probe.atMs)) probe.atMs = lane.atMs
   }
   return probe
 }

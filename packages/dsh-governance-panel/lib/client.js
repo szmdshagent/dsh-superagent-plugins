@@ -470,13 +470,14 @@ window.__ModuleLoader__.load({
 									marginLeft: "auto"
 								},
 								children: [
-									"成本 $",
+									"计划内 lane 成本 $",
 									team.totalCostUsd.toFixed(4),
-									" · token ",
+									" · lane token ",
 									team.totalTokens.toLocaleString("en-US"),
 									" · ",
 									"峰值并行 ",
-									team.peakParallelism
+									team.peakParallelism,
+									" lane"
 								]
 							})
 						]

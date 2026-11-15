@@ -677,7 +677,7 @@ const MAX_ROUND_CACHE_READ = 4_000_000
 /**
  * 判断一行台账的累计缓存读里是否混进了「不属于本轮」的历史。
  *
- * 背景：abtopup 那单是把 52MB 的 long-dsh 会话文件 `cp` 成新 sid 起的头（脚本 /home/szm/cc-diag/ab-topup.sh:12），
+ * 背景：abtopup 那单是把 52MB 的 long-dsh 会话文件 `cp` 成新 sid 起的头（脚本 ab-topup.sh:12），
  * 首轮就把 42.4M 缓存整体重放，花掉 $29.73。这类行的 `baseline_source=none`（找不到同 session 更早 result），
  * 但 `baseline_source=none` 本身不足以判定——正常新开会话的首轮也都是 none。
  *
@@ -904,7 +904,10 @@ function buildLaneExecutions(scans: TicketScan[], now: number, costRows: CostRow
       const endedCandidates: number[] = [resultMtime, mtimeMs(`${laneDir}/handoff.md`)]
       for (const row of rows) { const at = parseTime(row?.ts); if (at) endedCandidates.push(at) }
       const lastRecordedMs = Math.max(...endedCandidates, 0)
-      const endedMs = status === 'running' || status === 'unknown' ? now : lastRecordedMs
+      // 只有仍在跑的 lane 才把「现在」当结束时间。unknown 表示没拿到 result 且进程不在，
+      // 若按 now 算，一条 11-11 的 lane 会被显示成跑了 3 天（实测 266,310,846ms），
+      // 并把不存在的重叠算进峰值并行；这里退回最后一次有记录的活动时间。
+      const endedMs = status === 'running' ? now : lastRecordedMs
       const durationMs = startedMs > 0 && endedMs >= startedMs ? endedMs - startedMs : null
       const lastActivity = Math.max(scan?.at ?? 0, resultMtime, lastRecordedMs, laneMtime)
       const plannedTask = planMap.get(lane)
@@ -977,7 +980,10 @@ function buildTeamReport(lanes: LaneExecution[], scans: TicketScan[], now: numbe
     const statusOf = (status: LaneStatus) => workers.filter(lane => lane.status === status).length
     const ticketStarted = ticketLanes.map(lane => parseTime(lane.startedAt)).filter(Boolean)
     const ticketEnded = ticketLanes.map(lane => parseTime(lane.endedAt)).filter(Boolean)
-    const ongoing = workers.some(lane => lane.status === 'running' || lane.status === 'pending' || lane.status === 'unknown')
+    // pending 是「计划里有、目录还没建」，lead 已收尾时不会再有人启动它们：
+    // 旧实现把 pending 当「仍在进行」，导致 crew-team-demo 结束 3 天后 endedAt 仍是 null、
+    // 时长按 now-start 报成 74.6 小时。running/unknown 才代表还有未收尾的 lane（含 lead）。
+    const ongoing = ticketLanes.some(lane => lane.status === 'running' || lane.status === 'unknown')
     const startedMs = ticketStarted.length ? Math.min(...ticketStarted) : 0
     const endedMs = ongoing || !ticketEnded.length ? 0 : Math.max(...ticketEnded)
     teams.push({
@@ -994,7 +1000,9 @@ function buildTeamReport(lanes: LaneExecution[], scans: TicketScan[], now: numbe
       totalRuns: ticketLanes.reduce((sum, lane) => sum + lane.runs, 0),
       totalTokens: ticketLanes.reduce((sum, lane) => sum + lane.tokens.total, 0),
       configuredParallelism: plan.lanes.length,
-      peakParallelism: peakParallelism(workers),
+      // 并发口径是「同时在跑的 lane」，lead 也是独立 cc-worker 会话（它的成本/轮次已计入本队）：
+      // 只传 workers 会把 3 worker + 1 lead 同时跑报成 3（实测 team-sync 15:51–15:59）。
+      peakParallelism: peakParallelism(ticketLanes),
       currentParallelism: workers.filter(lane => lane.status === 'running').length,
       startedAt: isoAt(startedMs),
       endedAt: ongoing ? null : isoAt(endedMs),
@@ -1023,7 +1031,9 @@ function buildTeamReport(lanes: LaneExecution[], scans: TicketScan[], now: numbe
     totalRuns: teams.reduce((sum, team) => sum + team.totalRuns, 0),
     totalTokens: teams.reduce((sum, team) => sum + team.totalTokens, 0),
     configuredParallelism: teams.reduce((sum, team) => sum + team.configuredParallelism, 0),
-    peakParallelism: teams.reduce((peak, team) => Math.max(peak, team.peakParallelism), 0),
+    // 多工单/多组并发时必须做全局事件扫描；取各队峰值再 max，会在两个 team 同时跑时低估
+    // （各 3 路重叠会显示 3，实际 6）。这里对所有 team lane（含 lead）统一扫一遍。
+    peakParallelism: peakParallelism(teams.flatMap(team => team.lanes)),
     currentParallelism: teams.reduce((sum, team) => sum + team.currentParallelism, 0),
     startedAt: isoAt(startedMs),
     endedAt: anyOngoing ? null : isoAt(endedMs),
@@ -1150,8 +1160,9 @@ function teamFindings(lanes: LaneExecution[], team: TeamReport, conflicts: Confl
       severity: 'info',
       id: `team:summary:${summary.ticket}`,
       title: `team 计划 ${summary.workerLanes} 路：完成 ${summary.done}、失败 ${summary.failed}、进行中 ${summary.running}、未启动 ${summary.pending}`,
-      detail: `含 lead 共 ${summary.lanes.length} 条 lane；团队成本 $${summary.totalCostUsd.toFixed(4)}，`
-        + `轮次 ${summary.totalRuns}，token ${summary.totalTokens}，峰值并行 ${summary.peakParallelism} 路。`,
+      detail: `含 lead 共 ${summary.lanes.length} 条 lane；计划内 lane 成本 $${summary.totalCostUsd.toFixed(4)}`
+        + `（不含同工单后续主 lane 轮次），`
+        + `lane 轮次 ${summary.totalRuns}，lane token ${summary.totalTokens}，峰值并行 ${summary.peakParallelism} 条 lane。`,
       ticket: summary.ticket,
       metrics: {
         计划lane数: summary.workerLanes,
@@ -1160,8 +1171,8 @@ function teamFindings(lanes: LaneExecution[], team: TeamReport, conflicts: Confl
         进行中: summary.running,
         未启动: summary.pending,
         状态未知: summary.unknown,
-        团队总成本: summary.totalCostUsd,
-        总轮次: summary.totalRuns,
+        计划内lane成本: summary.totalCostUsd,
+        lane轮次: summary.totalRuns,
         总token: summary.totalTokens,
         峰值并行: summary.peakParallelism,
       },
@@ -1240,13 +1251,20 @@ function teamFindings(lanes: LaneExecution[], team: TeamReport, conflicts: Confl
     })
   }
   if (conflicts.findingsFiles > 0) {
-    const lanesCovered = new Set(conflicts.items.filter(item => item.kind === 'findings' && item.lane).map(item => `${item.ticket}#${item.lane}`))
+    // findings 文件名不一定等于 lane 名：协作里常见 `final.md`、`verify2.md`、`lead-recon.md`
+    // 这类汇总/复查产物（实测 21 份里只有 9 份与真实 lane 同名）。旧实现把文件名直接当 lane，
+    // 报成「覆盖 21 个 lane」，而全量 lane 单元只有 25 条、团队计划内 lane 只有 12 条。
+    const realLanes = new Set(lanes.map(lane => `${lane.ticket}#${lane.lane}`))
+    const byLane = conflicts.items.filter(item => item.kind === 'findings' && item.lane
+      && realLanes.has(`${item.ticket}#${item.lane}`))
+    const lanesCovered = new Set(byLane.map(item => `${item.ticket}#${item.lane}`))
     findings.push({
       dimension: 'team',
       severity: 'info',
       id: 'team:findings',
-      title: `共享区有 ${conflicts.findingsFiles} 份 findings，覆盖 ${lanesCovered.size} 个 lane`,
-      detail: 'findings 是 lane 之间避免重复劳动的中间结论；数量长期为 0 说明共享区没有被用起来。',
+      title: `共享区有 ${conflicts.findingsFiles} 份 findings，其中 ${lanesCovered.size} 份对应真实 lane`,
+      detail: 'findings 是 lane 之间避免重复劳动的中间结论；数量长期为 0 说明共享区没有被用起来。'
+        + '其余文件是同名以外的小结/复查产物（如 final.md），计入文件数但不算「覆盖某个 lane」。',
       metrics: { findings文件: conflicts.findingsFiles, 覆盖lane: lanesCovered.size, BLOCKED: conflicts.blockedFindings },
     })
   }
@@ -1301,19 +1319,22 @@ function stderrKey(text: string): string {
  * 而不是 67 条一模一样的条目。
  */
 function executorFindings(scans: TicketScan[]): Finding[] {
-  const byKey = new Map<string, { message: string; tickets: string[]; benign: boolean }>()
+  // 「工单数」必须按工单去重：一条 lane 的 stderr.log 也是独立扫描单元，
+  // 旧实现把 `<工单>#<lane>` 都当工单数，实测报出「119 个工单」而全量只有 100 个。
+  const byKey = new Map<string, { message: string; tickets: Set<string>; units: number; benign: boolean }>()
   for (const scan of scans) {
     if (!scan.stderr) continue
     const key = stderrKey(scan.stderr)
     if (!key) continue
     const benign = BENIGN_STDERR.some(pattern => pattern.test(scan.stderr))
-    const entry = byKey.get(key) ?? { message: scan.stderr.split('\n')[0]!.trim(), tickets: [], benign }
-    entry.tickets.push(scan.key)
+    const entry = byKey.get(key) ?? { message: scan.stderr.split('\n')[0]!.trim(), tickets: new Set<string>(), units: 0, benign }
+    entry.tickets.add(scan.name)
+    entry.units++
     byKey.set(key, entry)
   }
   const findings: Finding[] = []
   for (const [key, entry] of byKey) {
-    const count = entry.tickets.length
+    const count = entry.tickets.size
     // 良性告警只报一条 info，且标注「可忽略」，不再占 warn 名额。
     findings.push({
       dimension: 'executor',
@@ -1325,8 +1346,8 @@ function executorFindings(scans: TicketScan[]): Finding[] {
       detail: entry.benign
         ? 'unrecognized_model 只是 Claude Code 对模型名的 SDK 侧标注，不影响执行结果。如果哪天它开始伴随失败，再升级处理。'
         : '同一句报错跨多个工单出现，通常来自全局配置（模型名、端点、凭据），不是单个任务的问题。',
-      ticket: count === 1 ? entry.tickets[0] : undefined,
-      metrics: { 命中工单数: count, 良性: entry.benign ? '是' : '否' },
+      ticket: count === 1 ? [...entry.tickets][0] : undefined,
+      metrics: { 命中工单数: count, 命中lane单元: entry.units, 良性: entry.benign ? '是' : '否' },
       evidence: entry.message.slice(0, 600),
     })
   }
@@ -1608,6 +1629,8 @@ function costFindings(scans: TicketScan[], now: number, precomputed?: CostRow[])
       近7天未校准: Number(windowUncalCost.toFixed(4)),
       // 面板上显式说明这笔钱的来源：已花掉但台账未留行，按轮次基线反推补回，不是新增花费。
       历史基线补齐: Number(windowRecovered.toFixed(4)),
+      // 分母只含台账行（已校准轮），不含「历史基线补齐」——那笔钱没有对应轮次，
+      // 并进分母会把均值从 $1.55 漂到 $1.75，与「近7天已校准」并列时会看起来对不上。
       单轮均值: windowCalRuns ? Number((windowCalCost / windowCalRuns).toFixed(4)) : 0,
       最贵单轮: worst ? Number(worst.cost.toFixed(4)) : 0,
       最贵单轮工单: worst ? worst.ticket : null,
@@ -1627,6 +1650,12 @@ function contextFindings(scans: TicketScan[], now: number): Finding[] {
   let historyCacheTickets = new Set<string>()
   let liveSwitches = 0
   let staleSwitchTickets = 0
+  // 步数偏多（≥40 步）与成本一样，只有「该工单最新一轮 + 近 7 天窗口内」才逐条列；
+  // 历史轮、窗口外的旧轮折叠成一条。旧实现无条件逐条 push，实测 256 条 info 把
+  // 上下文卡片撑到 14217px（面板总高 16348px / 视口 914px），真正的告警被水淹。
+  const window = windowDays(now, 7)
+  let historyStepsRuns = 0
+  let historyStepsTickets = new Set<string>()
   for (const scan of scans) {
     const latest = scan.ledger.length
       ? scan.ledger.reduce((best: any, row: any) =>
@@ -1688,7 +1717,13 @@ function contextFindings(scans: TicketScan[], now: number): Finding[] {
         })
       }
       if (steps >= THRESHOLDS.stepsWarn) {
-        findings.push({
+        // 与成本维度同一套折叠口径：非最新一轮或窗口外的轮次只计数，不逐条铺。
+        const isLatestRow = run === latestRun
+        const inWindow = window.has(String(row?.ts ?? '').slice(0, 10))
+        if (!isLatestRow || !inWindow) {
+          historyStepsRuns++
+          historyStepsTickets.add(scan.key)
+        } else findings.push({
           dimension: 'context', severity: 'info',
           id: `context:steps:${scan.key}:${run}`,
           title: `单轮 ${steps} 步`,
@@ -1719,6 +1754,18 @@ function contextFindings(scans: TicketScan[], now: number): Finding[] {
       title: `${staleSwitchTickets} 个已结束工单换过多次会话，已折叠`,
       detail: '工单已结束，换会话次数只反映历史运行形态；仍计入「换会话合计」指标，不再占「值得看一眼」名额。',
       metrics: { 已结束工单数: staleSwitchTickets, 进行中工单数: liveSwitches },
+    })
+  }
+  // 折叠的步数流水账也要报规模，否则「上下文维度只剩几条」会被误读成历史上一路正常。
+  if (historyStepsRuns > 0) {
+    findings.push({
+      dimension: 'context', severity: 'info',
+      id: 'context:steps-history',
+      title: `历史/窗口外 ${historyStepsRuns} 轮步数偏多，已折叠不再逐条报`,
+      detail: `这 ${historyStepsRuns} 轮分布在 ${historyStepsTickets.size} 个工单，都既不是各自工单的最新一轮、`
+        + `或落在近 7 天窗口之外：后续轮次已覆盖其运行状态，无法再处理，只作复盘。`
+        + '逐条展开请查对应工单的 budget-ledger.jsonl。',
+      metrics: { 历史轮数: historyStepsRuns, 涉及工单数: historyStepsTickets.size },
     })
   }
   return findings
@@ -1784,7 +1831,7 @@ export const DIMENSION_META: Record<DimensionKey, { label: string; hint: string 
  * @param now 当前时间（毫秒），测试可注入。
  * @param options.ticket 只扫一个工单目录（验收取样/面板钻取）；默认全量。
  */
-export function govern(now = Date.now(), options: { ticket?: string } = {}): GovernanceReport {
+export function govern(now = Date.now(), options: { ticket?: string; dims?: DimensionKey[] } = {}): GovernanceReport {
   const scans = scanTickets(now, options.ticket)
   // 面板把每条 lane 当独立执行单元扫，但「工单数」必须按唯一工单目录去重，否则 headline 会虚增。
   const ticketCount = new Set(scans.map(scan => scan.name)).size
@@ -1802,7 +1849,17 @@ export function govern(now = Date.now(), options: { ticket?: string } = {}): Gov
   const liveness = livenessFindings(scans, now)
   const teamIssues = teamFindings(lanes, team, conflicts, scans, now)
 
+  // 维度过滤必须发生在汇总之前：overall/headline 由 findings 推出，
+  // 而 dimensions 的 issues/critical/warn 由分组推出。早先在路由层过滤只切了
+  // findings/dimensions 两个数组，汇总字段仍是全量的——实测 ?dims=team,cost
+  // 会回 overall=bad、headline「1 项需立刻处理」，但响应体里 critical=0、warn=0，
+  // 前端拿到的是一份自相矛盾的报告。dims 为空/未传时行为与全量完全一致。
+  const only = options.dims && options.dims.length > 0 ? new Set(options.dims) : null
+  const keep = (key: DimensionKey): boolean => !only || only.has(key)
+
+  // 过滤后的 findings 才是报告的唯一事实来源：排序、分组、overall/headline 全部基于它。
   const findings = [...teamIssues, ...handoff, ...executor, ...budget, ...cost, ...context, ...liveness]
+    .filter(item => !only || only.has(item.dimension))
   // 排序：先按严重度，再按维度固定顺序，最后按时间倒序，保证界面稳定不跳动。
   const severityRank: Record<Severity, number> = { critical: 0, warn: 1, info: 2 }
   const order: DimensionKey[] = ['team', 'handoff', 'executor', 'budget', 'cost', 'context', 'liveness']
@@ -1811,8 +1868,19 @@ export function govern(now = Date.now(), options: { ticket?: string } = {}): Gov
     || String(b.at ?? '').localeCompare(String(a.at ?? '')))
 
   const groups: Record<DimensionKey, Finding[]> = {
-    team: teamIssues, handoff, executor, budget, cost, context, liveness,
+    team: keep('team') ? teamIssues : [],
+    handoff: keep('handoff') ? handoff : [],
+    executor: keep('executor') ? executor : [],
+    budget: keep('budget') ? budget : [],
+    cost: keep('cost') ? cost : [],
+    context: keep('context') ? context : [],
+    liveness: keep('liveness') ? liveness : [],
   }
+  // 协作机制让一个工单目录下出现多个扫描单元（main + 多条 lane）。凡是「工单数」口径
+  // 都必须按目录名去重，lane 单元单独报；旧实现把两者混在一行里，出现过「108/100」
+  // 「119/100」这种分子大于分母的显示。每个工单目录内的扫描单元数（lane 执行单元）。
+  const laneUnitCount = scans.filter(scan => scan.lane).length
+  const distinctTickets = (list: TicketScan[]): number => new Set(list.map(item => item.name)).size
   const dimensionMetrics: Record<DimensionKey, Record<string, number | string | null>> = {
     // 没有任何 team/lane/shared 数据时保持空对象，前端判定为「无数据」而不是「正常」。
     team: team.present || conflicts.present || team.lanes > 0 ? {
@@ -1822,35 +1890,40 @@ export function govern(now = Date.now(), options: { ticket?: string } = {}): Gov
       失败: team.failed,
       进行中: team.running,
       未启动: team.pending,
-      团队总成本: team.totalCostUsd,
-      总轮次: team.totalRuns,
+      计划内lane成本: team.totalCostUsd,
+      lane轮次: team.totalRuns,
       峰值并行: team.peakParallelism,
       findings文件: conflicts.findingsFiles,
       冲突路径: conflicts.conflictPaths,
     } : {},
     handoff: {
-      有交接记录: scans.filter(scan => scan.handoff).length,
+      有交接工单: distinctTickets(scans.filter(scan => scan.handoff)),
       工单数: ticketCount,
+      有交接lane: scans.filter(scan => scan.lane && scan.handoff).length,
     },
     executor: {
-      有错误日志: scans.filter(scan => scan.stderr).length,
+      有错误工单: distinctTickets(scans.filter(scan => scan.stderr)),
       工单数: ticketCount,
+      有错误lane: scans.filter(scan => scan.lane && scan.stderr).length,
     },
     budget: {
       台账轮数: scans.reduce((sum, scan) => sum + scan.ledger.length, 0),
-      有预算状态: scans.filter(scan => scan.budget).length,
+      有预算状态工单: distinctTickets(scans.filter(scan => scan.budget)),
+      有预算状态lane: scans.filter(scan => scan.lane && scan.budget).length,
     },
     cost: costMetrics,
     context: {
       换会话合计: switchTotal,
-      有台账工单: scans.filter(scan => scan.ledger.length > 0).length,
+      有台账工单: distinctTickets(scans.filter(scan => scan.ledger.length > 0)),
+      有台账lane: scans.filter(scan => scan.lane && scan.ledger.length > 0).length,
     },
     liveness: {
-      有worker目录: scans.filter(scan => scan.workerDir).length,
+      有worker目录工单: distinctTickets(scans.filter(scan => scan.workerDir)),
+      有worker目录lane: scans.filter(scan => scan.lane && scan.workerDir).length,
     },
   }
 
-  const dimensions: DimensionSummary[] = order.map(key => {
+  const dimensions: DimensionSummary[] = order.filter(keep).map(key => {
     const list = groups[key]
     const critical = list.filter(item => item.severity === 'critical').length
     const warn = list.filter(item => item.severity === 'warn').length
@@ -1869,8 +1942,14 @@ export function govern(now = Date.now(), options: { ticket?: string } = {}): Gov
   const totalCritical = findings.filter(item => item.severity === 'critical').length
   const totalWarn = findings.filter(item => item.severity === 'warn').length
   const overall: GovernanceReport['overall'] = totalCritical > 0 ? 'bad' : totalWarn > 0 ? 'watch' : 'ok'
+  // 文案里的维度数必须跟着过滤走：?dims=team,cost 只返回 2 个维度时不能再写「七个维度」。
+  // 与 dimensions 同源（order.filter(keep)），全量或显式传满 7 个维度时保持原文案。
+  const scopeKeys = dimensions.map(item => item.key)
+  const scopeLabel = scopeKeys.length === order.length
+    ? '七个维度全绿'
+    : `${scopeKeys.map(key => DIMENSION_META[key].label).join('、')}（${scopeKeys.length} 个维度）全绿`
   const headline = overall === 'ok'
-    ? `七个维度全绿（${ticketCount} 个工单${team.present ? `，${team.workerLanes} 条 lane` : ''}，${costMetrics['近7天轮数'] ?? 0} 轮）`
+    ? `${scopeLabel}（${ticketCount} 个工单${team.present ? `，${laneUnitCount} 条 lane` : ''}，${costMetrics['近7天轮数'] ?? 0} 轮）`
     : `${totalCritical} 项需立刻处理，${totalWarn} 项值得看一眼`
 
   return {
@@ -1884,7 +1963,7 @@ export function govern(now = Date.now(), options: { ticket?: string } = {}): Gov
     conflicts,
     scanned: {
       tickets: ticketCount,
-      laneUnits: scans.filter(scan => scan.lane).length,
+      laneUnits: laneUnitCount,
       withWorkerDir: scans.filter(scan => scan.workerDir).length,
       withHandoffState: scans.filter(scan => scan.handoff).length,
       ledgerRuns: scans.reduce((sum, scan) => sum + scan.ledger.length, 0),

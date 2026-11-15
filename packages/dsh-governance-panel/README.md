@@ -58,7 +58,7 @@ systemctl --user restart dsh-superagent
 安装 / 卸载：
 
 ```bash
-dsh plugin --profile superagent add 'link:/home/szm/src/dsh-governance-panel'
+dsh plugin --profile superagent add "link:$PWD"
 dsh plugin --profile superagent remove dsh-governance-panel
 ```
 
@@ -78,7 +78,7 @@ dsh plugin --profile superagent remove dsh-governance-panel
 
   ```bash
   cd /tmp && node --experimental-strip-types --input-type=module -e "
-  const { govern } = await import('/home/szm/src/dsh-governance-panel/src/governance.ts');
+  const { govern } = await import('./src/governance.ts');
   const r = govern(Date.now(), { ticket: 'code-governance-team-sync-0b80349ab1d2' });
   console.log(JSON.stringify({ lanes: r.lanes, team: r.team, conflicts: r.conflicts }, null, 2));
   "

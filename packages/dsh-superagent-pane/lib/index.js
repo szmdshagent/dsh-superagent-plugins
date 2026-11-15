@@ -1,4 +1,3 @@
-import { o as teamStatus } from "./guard-C6Yt-xRB.js";
 import { n as logKey$1, t as appendLog$1 } from "./log-Co3EtYpg.js";
 import { randomUUID } from "node:crypto";
 import { closeSync, existsSync, openSync, readFileSync, readSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
@@ -188,7 +187,7 @@ function readTail(file) {
 		}
 	}
 	for (const [id, item] of cache) if (item !== entry && now - item.touched > CACHE_TTL_MS) cache.delete(id);
-	cache.set(file, entry);
+	cache.set(dir, entry);
 	return {
 		events: entry.tail,
 		mtime: stat.mtimeMs,
@@ -252,18 +251,6 @@ function stderrHint(dir) {
 		return;
 	}
 }
-/**
-* 没有 main 事件流时，用 team lanes 推导一个整体状态。
-*
-* 否则纯 team 运行（lead/ccwN 各自写 lanes/<lane>/log.jsonl）会被面板当成「未委托」整个藏起来。
-*/
-function teamState(team) {
-	if (!team.lanes.length) return team.plan.exists ? "thinking" : void 0;
-	if (team.lanes.some((lane) => lane.state === "running")) return "running";
-	if (team.lanes.some((lane) => lane.state === "failed")) return "error";
-	if (team.lanes.every((lane) => lane.state === "done")) return "done";
-	return "running";
-}
 /** 汇总一个工单目录的 CC 执行状态。 */
 function readCcStatus(dir) {
 	const empty = {
@@ -274,23 +261,15 @@ function readCcStatus(dir) {
 		alert: "none"
 	};
 	if (!dir) return empty;
-	const team = teamStatus(dir);
-	const derived = teamState(team);
-	const teamPresent = team.lanes.length > 0 || team.plan.exists;
 	const file = latestEventFile(dir);
 	if (!file) return {
 		...empty,
-		present: teamPresent,
-		state: derived ?? empty.state,
-		team,
 		interruptRequested: existsSync(interruptPath(dir))
 	};
-	const { events, mtime } = readTail(file);
+	const { events, mtime } = readTail(dir, file);
 	if (!events.length) return {
 		...empty,
 		present: true,
-		state: derived ?? empty.state,
-		team,
 		interruptRequested: existsSync(interruptPath(dir))
 	};
 	const described = describe(events);
@@ -326,7 +305,6 @@ function readCcStatus(dir) {
 		interruptRequested,
 		alert,
 		alertText,
-		team,
 		error: described.error ?? (state === "error" || alert === "critical" ? stderrHint(dir) : void 0)
 	};
 }
@@ -344,9 +322,6 @@ function probeExecutor(dir) {
 	if (file) try {
 		probe.atMs = statSync(file).mtimeMs;
 	} catch {}
-	const team = teamStatus(dir);
-	if (team.lanes.some((lane) => lane.state === "running")) probe.alive = true;
-	for (const lane of team.lanes) if (lane.atMs && (probe.atMs === void 0 || lane.atMs > probe.atMs)) probe.atMs = lane.atMs;
 	return probe;
 }
 /** 把时间戳（ISO 字符串或数字）解析成毫秒；解析不出来返回 undefined。 */
@@ -478,6 +453,143 @@ function nextOccurrence(spec, fromMs) {
 			return Number.isFinite(when) ? when : from;
 		}
 	}
+}
+// src/stuck.ts
+/**
+* 死锁自愈：被卡死在 evaluating 里的消息重新入队。
+*
+* 背景（2026-11-15 两次真实事故）：
+*  - 消息被并进活跃工单后 worker 判定「不是我的活」而 handback；
+*  - core/part.ts 的 handBack() 要求 !owners().length 才重新排队，而 model.ts:82 的
+*    followupOwners() 只要消息仍在 evaluating.triggerIds 里就返回空 —— 自指闭环，永不排队；
+*  - core/evals.ts:43 的超时又要求 evaluation.delivered 为真才生效，评估从未投递给
+*    router 时（delivered 缺省）deadline 永远不会到期。
+*  三者叠加即「Eval 空转、后续消息持续被吸入、界面无任何反应」，可从十几分钟挂到数小时。
+*
+* 本模块不改主包，只在插件层做外部自愈：扫 pane-log 的派活消息，凡是有 evalId 但
+* disposition.fanout 为空、且该 evalId 已超过阈值仍未产出 decision 的，调 engine.reevaluate
+* 重新入队。reevaluate 会标记 requeued，followupOwners 因此返回空，主 Session 的 accept
+* 不会再被 workerDecides 挡住。
+*/
+/** 扫描间隔；与其它自愈共用 30 秒节奏。 */
+const STUCK_SWEEP_MS = 3e4;
+/** 消息本身的最大回溯年龄；更老的条目不再救援，避免重启时批量重投陈年消息。 */
+const STUCK_MAX_AGE_MS = 864e5;
+/** 写回原对话的提示文案。 */
+const STUCK_RECOVERED_TEXT = "这条消息一直卡在评估队列里没有落地，已自动重新交给路由器分诊。";
+/** 判定一条派活消息是否卡死在 Eval 里；返回可救援时的时间戳，否则 undefined。 */
+function stuckSince(disposition, now) {
+	if (!disposition) return void 0;
+	if (disposition.decisionId || disposition.requeued || disposition.acked?.length) return void 0;
+	if (!disposition.evalId) return void 0;
+	if (Array.isArray(disposition.fanout) && disposition.fanout.length) return void 0;
+	const at = Date.parse(String(disposition.at ?? ""));
+	if (!Number.isFinite(at)) return void 0;
+	return now - at >= 3e5 ? at : void 0;
+}
+/** 一次扫描：把卡死的派活消息重新交给路由器。 */
+async function recoverStuck(host) {
+	const { source, store, engine, now, appendLog } = host;
+	if (!source?.state?.keys || typeof store?.triggers?.disposition !== "function" || typeof engine?.reevaluate !== "function") return 0;
+	const oldest = now - STUCK_MAX_AGE_MS;
+	let handled = 0;
+	const keys = [...source.state.keys("pane-log:") ?? []].slice(-100);
+	for (const logKey of keys) {
+		if (handled >= 5) break;
+		const entries = source.state.get(logKey) ?? [];
+		for (let i = entries.length - 1; i >= 0 && handled < 5; i--) {
+			const entry = entries[i];
+			try {
+				if (entry?.direction !== "in" || !["dispatch", "assign"].includes(String(entry.mode))) continue;
+				const sentAt = entry.at ? Date.parse(entry.at) : NaN;
+				if (!Number.isFinite(sentAt) || sentAt < oldest) continue;
+				if (stuckSince(store.triggers.disposition(entry.id), now) === void 0) continue;
+				handled += 1;
+				if (engine.reevaluate(entry.id) !== true) continue;
+				const address = (store.triggers.get?.(entry.id))?.channel?.address?.conversation;
+				const conversation = typeof address === "string" && address ? address : logKey.slice(9);
+				appendLog(source, conversation, {
+					id: `recovered-stuck:${entry.id}`,
+					direction: "out",
+					at: new Date(now).toISOString(),
+					text: STUCK_RECOVERED_TEXT,
+					kind: "recovered"
+				});
+				host.logger?.info?.("dsh-superagent-pane: 已救援卡死消息 %s（对话 %s）", entry.id, conversation);
+			} catch (error) {
+				host.logger?.warn?.("dsh-superagent-pane: 卡死消息检查失败 %s", String(error));
+			}
+		}
+	}
+	return handled;
+}
+// src/collab/types.ts
+/** 最新一次报告；没有 report 的 assignment 不算。 */
+function latestReport(ticket) {
+	const assignments = Array.isArray(ticket?.assignments) ? [...ticket.assignments].reverse() : [];
+	for (const assignment of assignments) if (assignment?.report) return assignment.report;
+}
+/** 工单是否仍活着（未结束）。 */
+function liveTicket(ticket) {
+	return !!ticket && !ticket.ended;
+}
+// src/collab/sync.ts
+/** 轮询间隔。 */
+const COLLAB_SYNC_MS = 15e3;
+/**
+* 自动组回收：全部成员已结束、超过 TTL、或组内有 dropped 且判为无关报告时解散。
+* 人工组（没有 auto 标记）一律不动。
+*/
+function dissolveDueGroups(host, all) {
+	const groups = /* @__PURE__ */ new Map();
+	for (const ticket of all) {
+		const name = ticket?.collab?.group;
+		if (!name) continue;
+		const list = groups.get(name) ?? [];
+		list.push(ticket);
+		groups.set(name, list);
+	}
+	let dissolved = 0;
+	for (const [, members] of groups) {
+		if (members.some((member) => !member.collab?.auto)) continue;
+		const expiry = members.flatMap((member) => member.collab?.expiresAt ? [Date.parse(member.collab.expiresAt)] : []).sort()[0];
+		const expired = expiry !== void 0 && Number.isFinite(expiry) && host.now >= expiry;
+		const allEnded = members.every((member) => !liveTicket(member));
+		if (!expired && !allEnded) continue;
+		for (const member of members) {
+			delete member.collab;
+			host.save(member);
+		}
+		dissolved += 1;
+	}
+	return dissolved;
+}
+/**
+* 终态广播：同组某成员产生新的 ready 报告时，给组内其他工单各补一条 note。
+* 按 ticketId+assignmentId+state 幂等，重复扫描不会重复投递。
+*/
+function shareReadyReports(host, all) {
+	let shared = 0;
+	for (const ticket of all) {
+		const group = ticket?.collab?.group;
+		if (!group) continue;
+		const assignments = Array.isArray(ticket.assignments) ? ticket.assignments : [];
+		const last = assignments[assignments.length - 1];
+		const report = latestReport(ticket);
+		if (!last || !report || report.state !== "ready") continue;
+		for (const member of all) {
+			if (member.id === ticket.id || member.collab?.group !== group) continue;
+			const text = "Group " + group + ": ticket " + ticket.id + " reported ready. Result: ticket/" + ticket.id + "/result.";
+			host.addNote(member.id, {
+				id: "collab-" + member.id + "-" + ticket.id + "-" + last.id + "-" + report.state,
+				text,
+				at: new Date(host.now).toISOString(),
+				from: ticket.id
+			});
+			shared += 1;
+		}
+	}
+	return shared;
 }
 // src/index.ts
 const name = "dsh-superagent-pane";
@@ -1220,9 +1332,15 @@ function selectBroadcastTargets(tickets, text, explicitKeyword) {
 		toMs = now.getTime();
 		timeLabel = "最近 12 小时";
 	}
+	const wokenAt = (ticket) => {
+		const assignments = Array.isArray(ticket?.assignments) ? ticket.assignments : [];
+		const last = assignments[assignments.length - 1];
+		const at = Date.parse(String(last?.createdAt ?? ""));
+		return Number.isNaN(at) ? Date.parse(String(ticket?.createdAt ?? "")) : at;
+	};
 	const inWindow = (ticket) => {
 		if (fromMs === void 0 || toMs === void 0) return true;
-		const at = Date.parse(String(ticket?.createdAt ?? ""));
+		const at = wokenAt(ticket);
 		return Number.isNaN(at) ? true : at >= fromMs && at < toMs;
 	};
 	const scoped = tickets.filter(inWindow);
@@ -2031,6 +2149,69 @@ function apply(ctx) {
 			clearInterval(timer);
 		};
 	}, "pane: stranded recovery");
+	ctx.effect(() => {
+		let busy = false;
+		const sweep = () => {
+			if (busy) return;
+			busy = true;
+			recoverStuck({
+				source: liveSource,
+				store: ctx.orchestrator?.store,
+				engine: ctx.orchestrator?.engine,
+				now: Date.now(),
+				appendLog: appendLog$1,
+				logger: ctx.logger
+			}).catch((error) => {
+				ctx.logger?.warn?.("dsh-superagent-pane: 死锁自愈检查失败 %s", String(error));
+			}).finally(() => {
+				busy = false;
+			});
+		};
+		const boot = setTimeout(sweep, 3e3);
+		const timer = setInterval(sweep, STUCK_SWEEP_MS);
+		return () => {
+			clearTimeout(boot);
+			clearInterval(timer);
+		};
+	}, "pane: stuck eval recovery");
+	ctx.effect(() => {
+		let busy = false;
+		const sweep = () => {
+			if (busy) return;
+			busy = true;
+			try {
+				const store = ctx.orchestrator?.store;
+				const engine = ctx.orchestrator?.engine;
+				if (typeof store?.tickets?.list === "function") {
+					const all = store.tickets.list();
+					const host = {
+						store,
+						now: Date.now(),
+						ticketThreads: (ticket) => [...(ticket.origin?.triggerIds ?? []).map((id) => store.triggers?.get?.(id)).filter(Boolean).flatMap((t) => (t.threads ?? []).map((r) => `${r.source}:${r.id}`)), ...(ticket.follows ?? []).map((f) => String(f.thread ?? ""))].filter(Boolean),
+						save: (ticket) => store.tickets.save?.(ticket),
+						addNote: (ticketId, note) => {
+							try {
+								engine?.note?.(ticketId, note.text);
+							} catch {}
+						},
+						logger: ctx.logger
+					};
+					dissolveDueGroups(host, all);
+					shareReadyReports(host, all);
+				}
+			} catch (error) {
+				ctx.logger?.warn?.("dsh-superagent-pane: 协作同步失败 %s", String(error));
+			} finally {
+				busy = false;
+			}
+		};
+		const boot = setTimeout(sweep, 5e3);
+		const timer = setInterval(sweep, COLLAB_SYNC_MS);
+		return () => {
+			clearTimeout(boot);
+			clearInterval(timer);
+		};
+	}, "pane: collab sync");
 	ctx.effect(() => {
 		let busy = false;
 		const sweep = () => {

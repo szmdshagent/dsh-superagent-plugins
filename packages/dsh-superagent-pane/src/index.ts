@@ -1,7 +1,7 @@
 /**
  * dsh-superagent-pane：在面板里派活给 superagent，并显示 worker 正在做什么。
  *
- * 这个包独立存在是有意为之：`/home/szm/src/dsh-superagent-prototype` 不是 git 检出，官方升级会整体覆盖目录。
+ * 这个包独立存在是有意为之：profile 里的 superagent 安装目录不是 git 检出，官方升级会整体覆盖目录。
  * 所以本包只依赖 dsh-superagent 公开导出的接口（`Trigger`、`key`）和 Cordis 服务（`orchestrator`、`webServer`、
  * `sessionPersistence`），路由与 Source 都自己注册，主包 `git pull && pnpm build` 不会碰它。
  */
@@ -15,6 +15,8 @@ import { readCcStatus, requestInterrupt, clearInterrupt, probeExecutor } from '.
 import { ticketHealth, type ExecutorSignals } from './health.ts'
 import { appendLog as appendLogShared, logKey as logKeyShared } from './log.ts'
 import { nextOccurrence, scheduleKey, SCHEDULE_PREFIX, type PaneSchedule, type ScheduleSpec } from './schedule.ts'
+import { recoverStuck, STUCK_SWEEP_MS } from './stuck.ts'
+import { COLLAB_SYNC_MS, dissolveDueGroups, shareReadyReports } from './collab/sync.ts'
 
 /**
  * 本插件挂接的 Cordis 服务。`orchestrator` 由 dsh-superagent 声明；`webServer` 与 `sessionPersistence` 是
@@ -727,11 +729,21 @@ function selectBroadcastTargets(tickets: any[], text: string, explicitKeyword: s
     toMs = now.getTime()
     timeLabel = '最近 12 小时'
   }
+  // 最后唤醒时间：owner 2026-11-15 明确「12 小时」指最近一次被唤醒，不是创建、也不是任意更新。
+  // 唤醒 = 引擎为工单开了新的 assignment（新回合），故取最新 assignment 的 createdAt；
+  // updatedAt 会被投递/收报告刷新，口径偏宽，故不用它。
+  const wokenAt = (ticket: any): number => {
+    const assignments: any[] = Array.isArray(ticket?.assignments) ? ticket.assignments : []
+    const last = assignments[assignments.length - 1]
+    const at = Date.parse(String(last?.createdAt ?? ''))
+    // 没有 assignment 记录的（如刚建未跑的）回落到创建时间，避免被误排除。
+    return Number.isNaN(at) ? Date.parse(String(ticket?.createdAt ?? '')) : at
+  }
   const inWindow = (ticket: any): boolean => {
     if (fromMs === undefined || toMs === undefined) return true
-    const at = Date.parse(String(ticket?.createdAt ?? ''))
+    const at = wokenAt(ticket)
     // 时间戳缺失或损坏时保守保留，宁可多投也不要静默漏掉。
-    return Number.isNaN(at) ? true : at >= fromMs && at < toMs
+    return Number.isNaN(at) ? true : at >= fromMs! && at < toMs!
   }
   const scoped = tickets.filter(inWindow)
   const contentOf = new Map<string, string>()
@@ -1521,6 +1533,59 @@ export function apply(ctx: Context): void {
     const timer = setInterval(sweep, STRANDED_SWEEP_MS)
     return () => { clearTimeout(boot); clearInterval(timer) }
   }, 'pane: stranded recovery')
+  // 死锁自愈：消息卡在 evaluating 里超过 5 分钟且无 decision 就重新入队。
+  // 覆盖 core/part.ts handBack + model.ts:82 followupOwners + evals.ts:43 超时三者叠加造成的空转。
+  ctx.effect(() => {
+    let busy = false
+    const sweep = () => {
+      if (busy) return
+      busy = true
+      void recoverStuck({
+        source: liveSource, store: ctx.orchestrator?.store, engine: ctx.orchestrator?.engine,
+        now: Date.now(), appendLog: appendLogShared, logger: (ctx as any).logger,
+      }).catch(error => {
+        ;(ctx as any).logger?.warn?.('dsh-superagent-pane: 死锁自愈检查失败 %s', String(error))
+      }).finally(() => { busy = false })
+    }
+    const boot = setTimeout(sweep, 3_000)
+    const timer = setInterval(sweep, STUCK_SWEEP_MS)
+    return () => { clearTimeout(boot); clearInterval(timer) }
+  }, 'pane: stuck eval recovery')
+  // 协作组同步：自动组回收 + 终态广播。写入受 collab/store.ts 的 COLLAB_WRITE 开关控制，
+  // 过渡期默认关闭（主包版仍在跑），主包协作实现摘除后再打开。
+  ctx.effect(() => {
+    let busy = false
+    const sweep = () => {
+      if (busy) return
+      busy = true
+      try {
+        const store = ctx.orchestrator?.store
+        const engine = (ctx.orchestrator as any)?.engine
+        if (typeof store?.tickets?.list === 'function') {
+          const all = store.tickets.list()
+          const host = {
+            store, now: Date.now(),
+            ticketThreads: (ticket: any) => [
+              ...(ticket.origin?.triggerIds ?? []).map((id: string) => store.triggers?.get?.(id))
+                .filter(Boolean).flatMap((t: any) => (t.threads ?? []).map((r: any) => `${r.source}:${r.id}`)),
+              ...(ticket.follows ?? []).map((f: any) => String(f.thread ?? '')),
+            ].filter(Boolean),
+            save: (ticket: any) => store.tickets.save?.(ticket),
+            // 用 engine.note（主包正式接口）写一条 note；已结束工单由主包自行处理唤醒策略。
+            addNote: (ticketId: string, note: any) => { try { engine?.note?.(ticketId, note.text) } catch { /* 已结束工单可能拒绝，忽略 */ } },
+            logger: (ctx as any).logger,
+          }
+          dissolveDueGroups(host as any, all)
+          shareReadyReports(host as any, all)
+        }
+      } catch (error) {
+        ;(ctx as any).logger?.warn?.('dsh-superagent-pane: 协作同步失败 %s', String(error))
+      } finally { busy = false }
+    }
+    const boot = setTimeout(sweep, 5_000)
+    const timer = setInterval(sweep, COLLAB_SYNC_MS)
+    return () => { clearTimeout(boot); clearInterval(timer) }
+  }, 'pane: collab sync')
   // 定时派活：每 20 秒扫一轮到点任务；启动后先等 2 秒让 Source 就绪，避免第一轮读不到 state。
   ctx.effect(() => {
     let busy = false

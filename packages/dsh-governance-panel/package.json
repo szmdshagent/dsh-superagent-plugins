@@ -1,7 +1,6 @@
 {
   "name": "dsh-governance-panel",
-  "version": "0.1.0",
-  "private": true,
+  "version": "0.2.0",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -13,7 +12,8 @@
     "./client": "./lib/client.js"
   },
   "files": [
-    "lib"
+    "lib",
+    "README.md"
   ],
   "dsh": {
     "bundle": {
@@ -48,5 +48,11 @@
     "react-dom": "18.3.1",
     "tsdown": "0.22.14",
     "typescript": "6.0.3"
-  }
+  },
+  "description": "给 dsh-superagent 一个完全独立的「治理」侧边栏：把执行层痕迹归纳成七个维度（交接/执行器/预算/成本/上下文/活性等），一眼看出哪里不对、下一步修什么。",
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin"
+  ]
 }
