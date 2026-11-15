@@ -279,6 +279,19 @@
       },
       "versions": [
         {
+          "version": "0.1.2",
+          "publishTimestamp": 1794759324,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/szmdshagent/dsh-superagent-plugins",
+            "commit": "f2f6a3a47945c5691f292324507a252abdd18702",
+            "path": "packages/dsh-cc-worker"
+          },
+          "engines": {
+            "dsh": ">=0.2.1-rc.3"
+          }
+        },
+        {
           "version": "0.1.1",
           "publishTimestamp": 1794759083,
           "source": {
