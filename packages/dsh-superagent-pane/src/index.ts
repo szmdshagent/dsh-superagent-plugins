@@ -1,7 +1,7 @@
 /**
  * dsh-superagent-pane：在面板里派活给 superagent，并显示 worker 正在做什么。
  *
- * 这个包独立存在是有意为之：`/home/szm/src/dsh-superagent-prototype` 不是 git 检出，官方升级会整体覆盖目录。
+ * 这个包独立存在是有意为之：profile 里的 superagent 安装目录不是 git 检出，官方升级会整体覆盖目录。
  * 所以本包只依赖 dsh-superagent 公开导出的接口（`Trigger`、`key`）和 Cordis 服务（`orchestrator`、`webServer`、
  * `sessionPersistence`），路由与 Source 都自己注册，主包 `git pull && pnpm build` 不会碰它。
  */

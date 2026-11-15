@@ -26,7 +26,9 @@ declare module '@deepseek-ai/cordis' {
             sessionId?: string;
             ended?: unknown;
           }[];
+          list?: () => any[];
           get?(id: string): any;
+          save?(ticket: any): any;
         };
         readonly threads?: {
           get?(key: string): any;
