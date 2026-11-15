@@ -1,6 +1,6 @@
 {
   "name": "dsh-cc-worker",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "给 dsh agent 一双能真正干活的手：把脚本、构建、测量、批量改动交给 Claude Code 执行。自带执行器，无需外部脚本即可运行。",
   "license": "MIT",
   "type": "module",
@@ -35,7 +35,8 @@
   },
   "scripts": {
     "build": "tsdown",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/*.test.mjs"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "*"
