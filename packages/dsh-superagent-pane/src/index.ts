@@ -444,12 +444,15 @@ function readLanes(dir: string): CrewLaneView[] {
       const cc = readCcStatus(dir, lane)
       if (!cc.present) return '没输出'
       const last = cc.current ?? cc.steps[cc.steps.length - 1]
-      if (state === 'running') {
+      // 只有真在跑（模型思考/执行中）才给实时步骤；进程活着但已出结果 = 等下一单，按空闲概括。
+      const active = state === 'running' && (cc.state === 'running' || cc.state === 'thinking')
+      if (active) {
         if (last) return clipText(`第 ${last.step} 步 · ${last.tool ?? '工具'}${last.detail ? `: ${last.detail}` : ''}`, 160)
         if (cc.state === 'error') return '执行报错'
         if (cc.state === 'done') return '已完成'
         return cc.state === 'running' ? '执行中' : '思考中'
       }
+      if (cc.state === 'error') return '执行报错'
       // 空闲但跑过：优先任务登记，其次最近一步的动作，压成一行短概括而不是「空闲」。
       const source = registeredTask(base) || last?.detail || last?.tool || ''
       return source ? clipText(source, 14) : '没输出'

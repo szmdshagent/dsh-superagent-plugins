@@ -975,12 +975,13 @@ function readLanes(dir) {
 			const cc = readCcStatus(dir, lane);
 			if (!cc.present) return "没输出";
 			const last = cc.current ?? cc.steps[cc.steps.length - 1];
-			if (state === "running") {
+			if (state === "running" && (cc.state === "running" || cc.state === "thinking")) {
 				if (last) return clipText(`第 ${last.step} 步 · ${last.tool ?? "工具"}${last.detail ? `: ${last.detail}` : ""}`, 160);
 				if (cc.state === "error") return "执行报错";
 				if (cc.state === "done") return "已完成";
 				return cc.state === "running" ? "执行中" : "思考中";
 			}
+			if (cc.state === "error") return "执行报错";
 			const source = registeredTask(base) || last?.detail || last?.tool || "";
 			return source ? clipText(source, 14) : "没输出";
 		} catch {
