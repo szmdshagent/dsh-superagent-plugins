@@ -597,7 +597,8 @@ const inject = [
 	"orchestrator",
 	"sessionPersistence",
 	"webServer",
-	"workspaceRegistry"
+	"workspaceRegistry",
+	"attachments"
 ];
 /** Source id；Thread 键为 `pane:<对话>`。 */
 const SOURCE = "pane";
@@ -922,16 +923,34 @@ async function collectExecutorSignals(ctx, ticket) {
 	} catch {}
 	return signals;
 }
-/**
-* 读一张工单目录下的协作 lane 状态。
-*
-* lane 布局（cc-worker --lane 引入，2026-11-11）：
-*   <dir>/.cc-worker/{lock,session_id,...}             → lane = main（传统单 worker）
-*   <dir>/.cc-worker/lanes/<name>/{lock,session_id,...} → lane = <name>（协作子 worker）
-*
-* 「在跑」的判据与面板其它地方一致：claude.pid 存在且该 pid 的命令行含 claude。
-* 只读目录，不改任何东西；读不到就当没有 lane。
-*/
+/** 本 lane 的会话谱系：session-lineage.jsonl + switch.log + 当前 session_id，去重后计数。 */
+function sessionChain(base) {
+	const ids = /* @__PURE__ */ new Set();
+	let current = "";
+	try {
+		current = readFileSync(join(base, "session_id"), "utf8").trim();
+	} catch {}
+	if (current) ids.add(current);
+	try {
+		for (const line of readFileSync(join(base, "session-lineage.jsonl"), "utf8").split("\n")) {
+			if (!line.trim()) continue;
+			try {
+				const rec = JSON.parse(line);
+				for (const key of ["from", "to"]) if (typeof rec?.[key] === "string" && rec[key]) ids.add(rec[key]);
+			} catch {}
+		}
+	} catch {}
+	try {
+		for (const line of readFileSync(join(base, "switch.log"), "utf8").split("\n")) {
+			const hit = /\bswitch to ([0-9a-fA-F-]{8,64})\b/.exec(line);
+			if (hit) ids.add(hit[1]);
+		}
+	} catch {}
+	return {
+		sessionId: current || void 0,
+		sessions: ids.size
+	};
+}
 function readLanes(dir) {
 	if (!dir) return [];
 	const out = [];
@@ -952,24 +971,42 @@ function readLanes(dir) {
 			return;
 		}
 	};
+	const workerIdOf = (base, lane) => {
+		try {
+			const text = readFileSync(join(base, "worker-id"), "utf8").trim();
+			if (text) return text;
+		} catch {}
+		return `${dir}#${lane}`;
+	};
+	const view = (base, lane, state) => ({
+		lane,
+		state,
+		task: taskOf(base),
+		workerId: workerIdOf(base, lane),
+		...sessionChain(base)
+	});
 	try {
 		const root = join(dir, ".cc-worker");
-		if (alive(root)) out.push({
-			lane: "main",
-			state: "running",
-			task: taskOf(root)
-		});
+		if (alive(root)) out.push(view(root, "main", "running"));
 		for (const name of readdirSync(join(root, "lanes"), { withFileTypes: true })) {
 			if (!name.isDirectory()) continue;
 			const base = join(root, "lanes", name.name);
-			out.push({
-				lane: name.name,
-				state: alive(base) ? "running" : "idle",
-				task: taskOf(base)
-			});
+			out.push(view(base, name.name, alive(base) ? "running" : "idle"));
 		}
 	} catch {}
-	return out;
+	const byWorker = /* @__PURE__ */ new Map();
+	for (const lane of out) {
+		const prev = byWorker.get(lane.workerId);
+		if (!prev) {
+			byWorker.set(lane.workerId, lane);
+			continue;
+		}
+		if (lane.state === "running") prev.state = "running";
+		prev.sessions = Math.max(prev.sessions, lane.sessions);
+		prev.sessionId = lane.sessionId ?? prev.sessionId;
+		prev.task = prev.task ?? lane.task;
+	}
+	return [...byWorker.values()];
 }
 /** 按 id 找工单（含已结束的）；读不到就返回 undefined。 */
 function findTicket(ctx, ticketId) {
@@ -1044,6 +1081,90 @@ function composeText(mode, text) {
 	if (mode === "note" || mode === "broadcast") return text;
 	if (mode === "chat") return "【对话模式：只回答这个问题，不要新建工单、不要 attach 工单、不要派 worker、不要改代码。能直接答就直接答；需要动代码或长期工作的事，建议我用「派活」重发。重要：如果我重复问了同一个问题，说明我没看到你上次的回答——请把答案简短再说一遍，不要因为「已答过」而忽略。】\n" + text;
 	return "【派活模式：这是我明确要你去做的任务。若它是本对话进行中工单的补充/追问/修正，就 attach 给那张工单的 worker 继续做；若要动代码、要交付结果、且没有可接手的工单，就新建工单并派给 worker。只答疑、不动代码的问题请直接回答，不必建单。】\n" + text;
+}
+/** 文件名清洗：与 DSH 附件存储同规则（去掉路径、控制字符与 Windows 非法字符）。 */
+function paneFileName(value) {
+	if (typeof value !== "string") return "file";
+	const clean = value.slice(Math.max(value.lastIndexOf("/"), value.lastIndexOf("\\")) + 1).replace(/[\u0000-\u001f\u007f]/g, "").replace(/[<>:"|?*]/g, "_").trim().replace(/[. ]+$/u, "").slice(0, 200);
+	return clean === "" || clean === "." || clean === ".." ? "file" : clean;
+}
+/** 回读附件时的 content-type：只按扩展名给图片/文本，其余一律 octet-stream（不猜、不放行 HTML）。 */
+function fileContentType(name) {
+	return {
+		png: "image/png",
+		jpg: "image/jpeg",
+		jpeg: "image/jpeg",
+		gif: "image/gif",
+		webp: "image/webp",
+		txt: "text/plain; charset=utf-8",
+		md: "text/plain; charset=utf-8",
+		log: "text/plain; charset=utf-8",
+		json: "application/json; charset=utf-8",
+		csv: "text/plain; charset=utf-8"
+	}[(/\.([a-z0-9]+)$/i.exec(name)?.[1] ?? "").toLowerCase()] ?? "application/octet-stream";
+}
+/** 附件引用校验：只接受 `sha256:<hex>` + 名字 + 字节数，且存储后端确实能给出宿主机路径。 */
+const AttachmentSchema = z.object({
+	attachmentId: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+	name: z.string().min(1).max(200),
+	bytes: z.number().int().positive()
+}).strict();
+/**
+* 把面板上传的字节交给 DSH 附件存储落盘。
+*
+* 为什么不用 DSH 的 `fileUpload.upload()`：那条路按 **Agent Session** 绑定暂存凭证，凭证只在 prompt 准入时
+* 解析；面板消息走的是 superagent 的 Trigger，不经过 prompt 准入，凭证永远不会被消费。存储层
+* （`ctx.attachments`，内容寻址 + 原样字节）与面板需求完全一致，所以只复用这一层。
+*/
+async function savePaneUpload(ctx, req, name) {
+	const store = ctx?.attachments;
+	if (!store || typeof store.saveFileStream !== "function") throw new PaneRefusal(503, "宿主没有提供附件存储（attachments）");
+	const ref = await store.saveFileStream({
+		data: req,
+		name: paneFileName(name)
+	});
+	const path = typeof store.fileHostPath === "function" ? store.fileHostPath(ref) : void 0;
+	return {
+		attachmentId: String(ref.attachmentId),
+		name: String(ref.name),
+		bytes: Number(ref.bytes),
+		...path ? { path } : {}
+	};
+}
+/** 把客户端回传的附件引用补上宿主机路径；引用不合法或对象不在盘上就拒绝整条消息。 */
+function resolvePaneAttachments(ctx, input) {
+	if (!Array.isArray(input) || input.length === 0) return [];
+	if (input.length > 20) throw new PaneRefusal(400, "一条消息最多 20 个附件");
+	const store = ctx?.attachments;
+	const resolved = [];
+	for (const raw of input) {
+		const ref = AttachmentSchema.parse(raw);
+		let path;
+		try {
+			path = store?.fileHostPath?.(ref);
+		} catch {
+			path = void 0;
+		}
+		if (!path || !existsSync(path)) throw new PaneRefusal(400, `附件「${ref.name}」不存在或已失效，请重新上传`);
+		resolved.push({
+			attachmentId: ref.attachmentId,
+			name: ref.name,
+			bytes: ref.bytes,
+			path
+		});
+	}
+	return resolved;
+}
+/**
+* 附件清单正文：拼在用户原话之后交给 worker。
+*
+* worker（cc-worker / DSH 执行器）与宿主同机，正文里的绝对路径可以直接用 Read / Bash 打开；
+* 同时保留 `attachmentId`，与 DSH 会话历史里的引用格式一致，便于追溯同一份字节。
+*/
+function attachmentNote(attachments) {
+	if (attachments.length === 0) return "";
+	const lines = attachments.map((item, index) => `${index + 1}. ${item.name}（${item.bytes} 字节，attachmentId ${item.attachmentId}）\n   路径：${item.path ?? "（存储后端未提供宿主机路径）"}`);
+	return `\n\n【附件 ${attachments.length} 个：已保存在本机 DSH 附件存储，可直接按下面的路径读取，不要重新索要文件】\n${lines.join("\n")}`;
 }
 /**
 * 面板路由。
@@ -1380,7 +1501,7 @@ function selectBroadcastTargets(tickets, text, explicitKeyword) {
 * `orchestrator_route attach` 走同一条路径，不经过 Eval、不依赖模型分诊。`channel` 仍指回用户发消息
 * 的原对话，worker 的回复会显示在那里。
 */
-async function broadcastByTitle(ctx, conversation, keyword, text) {
+async function broadcastByTitle(ctx, conversation, keyword, text, note = "") {
 	const store = ctx?.orchestrator?.store;
 	const engine = ctx?.orchestrator?.engine;
 	if (typeof store?.tickets?.list !== "function" || typeof store?.triggers?.save !== "function" || typeof engine?.attach !== "function") throw new Error("宿主未提供广播所需的工单/引擎接口");
@@ -1392,7 +1513,7 @@ async function broadcastByTitle(ctx, conversation, keyword, text) {
 	for (const ticket of targets) {
 		const title = String(ticket.title).trim();
 		const trigger = paneTrigger(conversation, `【广播给工单「${title}」(${ticket.id})：这条消息按${scope}筛选后同时投给了多张工单，请按本工单的上下文处理，不要新建工单】
-${text}`, OWNER, "note", { thread: `t${ticket.id}` });
+${text}${note}`, OWNER, "note", { thread: `t${ticket.id}` });
 		try {
 			store.triggers.save(trigger);
 			engine.attach(ticket.id, trigger.id, `面板广播（${scope}）`);
@@ -1446,6 +1567,8 @@ function deleteSchedule(state, id) {
 */
 async function dispatchPaneMessage(ctx, body, origin = "panel") {
 	const mode = body.mode === "dispatch" ? "assign" : body.mode;
+	const attachments = resolvePaneAttachments(ctx, body.attachments);
+	const withAttachments = (text) => `${text}${attachmentNote(attachments)}`;
 	const source = ctx.orchestrator.context({
 		kind: SOURCE,
 		health: ["pane"]
@@ -1456,7 +1579,7 @@ async function dispatchPaneMessage(ctx, body, origin = "panel") {
 		const content = (matched ? matched[2] : body.text).trim();
 		if (mode === "assign" && !keyword) throw new Error("广播关键词不能为空：请写成 @广播[关键词] 正文");
 		if (!content) throw new Error(mode === "broadcast" ? "广播内容不能为空" : "广播内容不能为空：请写成 @广播[关键词] 正文");
-		const result = await broadcastByTitle(ctx, body.conversation, keyword, content);
+		const result = await broadcastByTitle(ctx, body.conversation, keyword, content, attachmentNote(attachments));
 		const at = (/* @__PURE__ */ new Date()).toISOString();
 		const basis = [result.criteria.timeLabel ? `时间窗「${result.criteria.timeLabel}」` : "", result.criteria.tokens.length ? `关键词「${result.criteria.tokens.join("、")}」` : ""].filter(Boolean).join(" + ");
 		const notice = result.delivered.length ? `已广播给 ${result.delivered.length} 张工单：${result.delivered.map((item) => `「${item.title}」`).join("、")}` + (result.criteria.mode === "all" ? "（范围内全部工单）" : basis ? `（筛选依据：${basis}）` : "") + (result.autoAll ? `（${basis || "默认范围"}内全部工单，含已结束可唤醒的）` : "") + (result.stopped ? `；另有 ${result.stopped} 张已被人停止、无法唤醒，未投递` : "") + (result.ended ? `；另有 ${result.ended} 张不符合条件，未投递` : "") + (result.overLimit ? `；超过单次上限 ${result.overLimit} 张未投递` : "") + (result.failed.length ? `；投递失败 ${result.failed.length} 张：${result.failed.map((item) => `「${item.title}」`).join("、")}` : "") : result.noMatch ? `没有工单匹配${basis ? `（${basis}）` : ""}，未广播` : result.matched ? `范围内的 ${result.matched} 张工单都已结束且无法唤醒${result.stopped ? `（其中 ${result.stopped} 张被人停止）` : ""}，未广播` : `${basis || "最近 12 小时"}内没有符合条件的工单，未广播`;
@@ -1466,6 +1589,7 @@ async function dispatchPaneMessage(ctx, body, origin = "panel") {
 			at,
 			text: body.text,
 			mode: "broadcast",
+			...attachments.length ? { attachments } : {},
 			...origin === "schedule" ? { status: "scheduled" } : {}
 		});
 		appendLog(source, body.conversation, {
@@ -1486,13 +1610,14 @@ async function dispatchPaneMessage(ctx, body, origin = "panel") {
 	const conversation = body.conversation;
 	const diverted = mode === "assign" ? await divertDispatch(ctx, conversation) : void 0;
 	await wakeThreadSessions(ctx, conversation);
-	const trigger = paneTrigger(conversation, composeText(mode, body.text), OWNER, mode, diverted ? { thread: diverted.thread } : {});
+	const trigger = paneTrigger(conversation, withAttachments(composeText(mode, body.text)), OWNER, mode, diverted ? { thread: diverted.thread } : {});
 	appendLog(source, conversation, {
 		id: trigger.id,
 		direction: "in",
 		at: trigger.at,
 		text: body.text,
 		mode,
+		...attachments.length ? { attachments } : {},
 		...origin === "schedule" ? { status: "scheduled" } : {}
 	});
 	const received = await source.receive(trigger);
@@ -1562,8 +1687,50 @@ function paneHandler(ctx) {
 						"broadcast",
 						"assign",
 						"note"
-					]).default("dispatch")
+					]).default("dispatch"),
+					attachments: z.array(AttachmentSchema).max(20).optional()
 				}).parse(await readJson(req)), "panel"));
+				return;
+			}
+			if (req.method === "POST" && url.pathname === "/orchestrator/api/pane/upload") {
+				const rawName = url.searchParams.get("name") || req.headers["x-pane-filename"] || "";
+				let name = "file";
+				try {
+					name = decodeURIComponent(String(rawName));
+				} catch {
+					name = String(rawName);
+				}
+				sendJson(res, 200, await savePaneUpload(ctx, req, name));
+				return;
+			}
+			if (req.method === "GET" && url.pathname === "/orchestrator/api/pane/file") {
+				const id = String(url.searchParams.get("id") ?? "");
+				const name = paneFileName(url.searchParams.get("name") ?? "");
+				const store = ctx.attachments;
+				const located = AttachmentSchema.parse({
+					attachmentId: id,
+					name,
+					bytes: 1
+				});
+				const path = store?.fileHostPath?.(located);
+				if (!path || !existsSync(path)) {
+					sendJson(res, 404, { error: "附件不存在或已失效" });
+					return;
+				}
+				const ref = {
+					...located,
+					bytes: statSync(path).size
+				};
+				const chunks = [];
+				for await (const chunk of store.readFileStream(ref)) chunks.push(Buffer.from(chunk));
+				const bytes = Buffer.concat(chunks);
+				res.writeHead(200, {
+					"content-type": fileContentType(name),
+					"content-length": String(bytes.length),
+					"cache-control": "private, max-age=3600",
+					"x-content-type-options": "nosniff"
+				});
+				res.end(bytes);
 				return;
 			}
 			const activityMatch = /^\/orchestrator\/api\/pane\/activity\/([A-Za-z0-9_-]+)$/.exec(url.pathname);
@@ -1710,12 +1877,14 @@ function paneHandler(ctx) {
 					}
 				} catch {}
 				const active = live.filter((item) => item.working).length;
-				const workers = live.reduce((sum, item) => sum + item.lanes.filter((lane) => lane.state === "running").length, 0);
+				const workers = new Set(live.flatMap((item) => item.lanes.filter((lane) => lane.state === "running").map((lane) => lane.workerId ?? `${item.ticketId}#${lane.lane}`))).size;
+				const sessions = new Set(live.flatMap((item) => item.lanes.filter((lane) => lane.state === "running" && lane.sessionId).map((lane) => lane.sessionId))).size;
 				sendJson(res, 200, {
 					tickets: live.length,
 					active,
 					queued: live.filter((item) => item.assignment === "pending").length,
 					workers,
+					sessions,
 					items: live.sort((a, b) => Number(b.working) - Number(a.working))
 				});
 				return;
@@ -2232,4 +2401,4 @@ function apply(ctx) {
 		};
 	}, "pane: scheduled dispatch");
 }
-export { apply, inject, name, paneTrigger };
+export { apply, inject, name, paneTrigger, readLanes };

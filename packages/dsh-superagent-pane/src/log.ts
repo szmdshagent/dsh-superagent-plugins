@@ -18,6 +18,23 @@ export type LogEntry = {
   mode?: string
   /** 投递/处理状态标记。 */
   status?: string
+  /** 随消息一起发送的附件引用（入站条目才有）：只存引用，字节在 DSH 的附件存储里。 */
+  attachments?: PaneAttachment[]
+}
+
+/**
+ * 面板消息的附件引用。字段与 DSH 自带 `FileAttachmentRef` 对齐（内容寻址的 sha256 + 展示名 + 字节数），
+ * 额外带上宿主机绝对路径：worker（cc-worker / DSH 执行器）都在同机，拿到路径就能直接读文件。
+ */
+export type PaneAttachment = {
+  /** `sha256:<hex>`，就是文件字节的摘要，与 DSH 会话历史里的引用格式一致。 */
+  attachmentId: string
+  /** 清洗后的展示文件名。 */
+  name: string
+  /** 精确字节数。 */
+  bytes: number
+  /** 宿主机绝对路径；存储后端不落到宿主机文件时缺省。 */
+  path?: string
 }
 
 /** 每个对话保留的条数上限与字符总预算；超出后从最旧的开始丢弃。 */

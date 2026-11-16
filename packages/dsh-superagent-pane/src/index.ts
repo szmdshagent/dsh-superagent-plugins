@@ -7,13 +7,13 @@
  */
 import type { Context } from '@deepseek-ai/cordis'
 import { randomUUID } from 'node:crypto'
-import { readFileSync, readdirSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { z } from 'zod'
 import { key, type Trigger } from 'dsh-superagent'
 import { readCcStatus, requestInterrupt, clearInterrupt, probeExecutor } from './ccvis.ts'
 import { ticketHealth, type ExecutorSignals } from './health.ts'
-import { appendLog as appendLogShared, logKey as logKeyShared } from './log.ts'
+import { appendLog as appendLogShared, logKey as logKeyShared, type PaneAttachment } from './log.ts'
 import { nextOccurrence, scheduleKey, SCHEDULE_PREFIX, type PaneSchedule, type ScheduleSpec } from './schedule.ts'
 import { recoverStuck, STUCK_SWEEP_MS } from './stuck.ts'
 import { COLLAB_SYNC_MS, dissolveDueGroups, shareReadyReports } from './collab/sync.ts'
@@ -73,14 +73,26 @@ declare module '@deepseek-ai/cordis' {
         close(): Promise<void>
       }>
     }
+    /**
+     * DSH 自带的附件存储（`@deepseek-ai/dsh-attachment-local` 提供）。面板复用它保存消息附件：
+     * 内容寻址、按字节原样落盘，`fileHostPath` 给出宿主机绝对路径，worker 直接按路径读取。
+     */
+    attachments: {
+      saveFileStream(input: { data: AsyncIterable<Uint8Array>; name?: string; signal?: AbortSignal }): Promise<PaneFileRef>
+      readFileStream(ref: PaneFileRef, signal?: AbortSignal): AsyncIterable<Uint8Array>
+      fileHostPath(ref: PaneFileRef): string | undefined
+    }
   }
 }
+
+/** DSH 附件引用（与 `@deepseek-ai/dsh-attachment` 的 FileAttachmentRef 同形）。 */
+type PaneFileRef = { attachmentId: string; name: string; bytes: number }
 
 /** 只读消费的会话事件形状；只关心 `type`/`time`/`data`，其余字段不理会。 */
 type PaneSessionEvent = { type?: string; time?: number; data?: any }
 
 export const name = 'dsh-superagent-pane'
-export const inject = ['orchestrator', 'sessionPersistence', 'webServer', 'workspaceRegistry']
+export const inject = ['orchestrator', 'sessionPersistence', 'webServer', 'workspaceRegistry', 'attachments']
 
 /** Source id；Thread 键为 `pane:<对话>`。 */
 const SOURCE = 'pane'
@@ -378,9 +390,46 @@ async function collectExecutorSignals(ctx: any, ticket: any): Promise<ExecutorSi
  * 「在跑」的判据与面板其它地方一致：claude.pid 存在且该 pid 的命令行含 claude。
  * 只读目录，不改任何东西；读不到就当没有 lane。
  */
-function readLanes(dir: string): { lane: string; state: 'running' | 'idle'; task?: string }[] {
+export type CrewLaneView = {
+  lane: string
+  state: 'running' | 'idle'
+  task?: string
+  /** 逻辑 cc worker id：handoff 换会话保持不变（cc-worker 写的 worker-id，旧数据回退到「目录#lane」）。 */
+  workerId: string
+  /** 本 lane 当前的 Claude Code 会话 id。 */
+  sessionId?: string
+  /** 本 lane 用过的会话数；>1 说明中间发生过 handoff 换会话，但仍是一个 cc worker。 */
+  sessions: number
+}
+
+/** 本 lane 的会话谱系：session-lineage.jsonl + switch.log + 当前 session_id，去重后计数。 */
+function sessionChain(base: string): { sessionId?: string; sessions: number } {
+  const ids = new Set<string>()
+  let current = ''
+  try { current = readFileSync(join(base, 'session_id'), 'utf8').trim() } catch { /* 从未跑过 */ }
+  if (current) ids.add(current)
+  try {
+    for (const line of readFileSync(join(base, 'session-lineage.jsonl'), 'utf8').split('\n')) {
+      if (!line.trim()) continue
+      try {
+        const rec: any = JSON.parse(line)
+        for (const key of ['from', 'to']) if (typeof rec?.[key] === 'string' && rec[key]) ids.add(rec[key])
+      } catch { /* 半行，跳过 */ }
+    }
+  } catch { /* 旧数据没有谱系文件 */ }
+  try {
+    // 旧数据兜底：switch.log 里每次换会话都留了 "cctrim [trim then] switch to <sid>"。
+    for (const line of readFileSync(join(base, 'switch.log'), 'utf8').split('\n')) {
+      const hit = /\bswitch to ([0-9a-fA-F-]{8,64})\b/.exec(line)
+      if (hit) ids.add(hit[1]!)
+    }
+  } catch { /* 没有 switch.log */ }
+  return { sessionId: current || undefined, sessions: ids.size }
+}
+
+export function readLanes(dir: string): CrewLaneView[] {
   if (!dir) return []
-  const out: { lane: string; state: 'running' | 'idle'; task?: string }[] = []
+  const out: CrewLaneView[] = []
   const alive = (base: string): boolean => {
     try {
       const pid = Number(readFileSync(join(base, 'claude.pid'), 'utf8').trim())
@@ -396,16 +445,36 @@ function readLanes(dir: string): { lane: string; state: 'running' | 'idle'; task
       return text ? text.slice(0, 160) : undefined
     } catch { return undefined }
   }
+  const workerIdOf = (base: string, lane: string): string => {
+    try {
+      const text = readFileSync(join(base, 'worker-id'), 'utf8').trim()
+      if (text) return text
+    } catch { /* 旧数据没有 worker-id */ }
+    // 旧数据回退：目录 + lane 是稳定的逻辑 worker 键，与用过几个会话无关。
+    return `${dir}#${lane}`
+  }
+  const view = (base: string, lane: string, state: 'running' | 'idle'): CrewLaneView =>
+    ({ lane, state, task: taskOf(base), workerId: workerIdOf(base, lane), ...sessionChain(base) })
   try {
     const root = join(dir, '.cc-worker')
-    if (alive(root)) out.push({ lane: 'main', state: 'running', task: taskOf(root) })
+    if (alive(root)) out.push(view(root, 'main', 'running'))
     for (const name of readdirSync(join(root, 'lanes'), { withFileTypes: true })) {
       if (!name.isDirectory()) continue
       const base = join(root, 'lanes', name.name)
-      out.push({ lane: name.name, state: alive(base) ? 'running' : 'idle', task: taskOf(base) })
+      out.push(view(base, name.name, alive(base) ? 'running' : 'idle'))
     }
   } catch { /* 目录不存在或不可读：没有 lane */ }
-  return out
+  // 计数键是 workerId（= 逻辑 cc worker），不是 session：handoff 换会话不会多出一条。
+  const byWorker = new Map<string, CrewLaneView>()
+  for (const lane of out) {
+    const prev = byWorker.get(lane.workerId)
+    if (!prev) { byWorker.set(lane.workerId, lane); continue }
+    if (lane.state === 'running') prev.state = 'running'
+    prev.sessions = Math.max(prev.sessions, lane.sessions)
+    prev.sessionId = lane.sessionId ?? prev.sessionId
+    prev.task = prev.task ?? lane.task
+  }
+  return [...byWorker.values()]
 }
 
 /** 按 id 找工单（含已结束的）；读不到就返回 undefined。 */
@@ -501,6 +570,78 @@ function composeText(mode: PaneMode, text: string): string {
   return "【派活模式：这是我明确要你去做的任务。若它是本对话进行中工单的补充/追问/修正，"
     + "就 attach 给那张工单的 worker 继续做；若要动代码、要交付结果、且没有可接手的工单，"
     + "就新建工单并派给 worker。只答疑、不动代码的问题请直接回答，不必建单。】\n" + text
+}
+
+// ——— 消息附件：复用 DSH 自带的附件存储 ———
+
+/** 文件名清洗：与 DSH 附件存储同规则（去掉路径、控制字符与 Windows 非法字符）。 */
+function paneFileName(value: unknown): string {
+  if (typeof value !== 'string') return 'file'
+  const clean = value.slice(Math.max(value.lastIndexOf('/'), value.lastIndexOf('\\')) + 1)
+    .replace(/[\u0000-\u001f\u007f]/g, '').replace(/[<>:"|?*]/g, '_').trim().replace(/[. ]+$/u, '').slice(0, 200)
+  return clean === '' || clean === '.' || clean === '..' ? 'file' : clean
+}
+
+/** 回读附件时的 content-type：只按扩展名给图片/文本，其余一律 octet-stream（不猜、不放行 HTML）。 */
+function fileContentType(name: string): string {
+  const ext = (/\.([a-z0-9]+)$/i.exec(name)?.[1] ?? '').toLowerCase()
+  const known: Record<string, string> = {
+    png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp',
+    txt: 'text/plain; charset=utf-8', md: 'text/plain; charset=utf-8', log: 'text/plain; charset=utf-8',
+    json: 'application/json; charset=utf-8', csv: 'text/plain; charset=utf-8',
+  }
+  return known[ext] ?? 'application/octet-stream'
+}
+
+/** 附件引用校验：只接受 `sha256:<hex>` + 名字 + 字节数，且存储后端确实能给出宿主机路径。 */
+const AttachmentSchema = z.object({
+  attachmentId: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+  name: z.string().min(1).max(200),
+  bytes: z.number().int().positive(),
+}).strict()
+
+/**
+ * 把面板上传的字节交给 DSH 附件存储落盘。
+ *
+ * 为什么不用 DSH 的 `fileUpload.upload()`：那条路按 **Agent Session** 绑定暂存凭证，凭证只在 prompt 准入时
+ * 解析；面板消息走的是 superagent 的 Trigger，不经过 prompt 准入，凭证永远不会被消费。存储层
+ * （`ctx.attachments`，内容寻址 + 原样字节）与面板需求完全一致，所以只复用这一层。
+ */
+async function savePaneUpload(ctx: any, req: any, name: string): Promise<PaneAttachment> {
+  const store = ctx?.attachments
+  if (!store || typeof store.saveFileStream !== 'function') throw new PaneRefusal(503, '宿主没有提供附件存储（attachments）')
+  const ref = await store.saveFileStream({ data: req as AsyncIterable<Uint8Array>, name: paneFileName(name) })
+  const path = typeof store.fileHostPath === 'function' ? store.fileHostPath(ref) : undefined
+  return { attachmentId: String(ref.attachmentId), name: String(ref.name), bytes: Number(ref.bytes), ...(path ? { path } : {}) }
+}
+
+/** 把客户端回传的附件引用补上宿主机路径；引用不合法或对象不在盘上就拒绝整条消息。 */
+function resolvePaneAttachments(ctx: any, input: unknown): PaneAttachment[] {
+  if (!Array.isArray(input) || input.length === 0) return []
+  if (input.length > 20) throw new PaneRefusal(400, '一条消息最多 20 个附件')
+  const store = ctx?.attachments
+  const resolved: PaneAttachment[] = []
+  for (const raw of input) {
+    const ref = AttachmentSchema.parse(raw)
+    let path: string | undefined
+    try { path = store?.fileHostPath?.(ref) } catch { path = undefined }
+    if (!path || !existsSync(path)) throw new PaneRefusal(400, `附件「${ref.name}」不存在或已失效，请重新上传`)
+    resolved.push({ attachmentId: ref.attachmentId, name: ref.name, bytes: ref.bytes, path })
+  }
+  return resolved
+}
+
+/**
+ * 附件清单正文：拼在用户原话之后交给 worker。
+ *
+ * worker（cc-worker / DSH 执行器）与宿主同机，正文里的绝对路径可以直接用 Read / Bash 打开；
+ * 同时保留 `attachmentId`，与 DSH 会话历史里的引用格式一致，便于追溯同一份字节。
+ */
+function attachmentNote(attachments: PaneAttachment[]): string {
+  if (attachments.length === 0) return ''
+  const lines = attachments.map((item, index) =>
+    `${index + 1}. ${item.name}（${item.bytes} 字节，attachmentId ${item.attachmentId}）\n   路径：${item.path ?? '（存储后端未提供宿主机路径）'}`)
+  return `\n\n【附件 ${attachments.length} 个：已保存在本机 DSH 附件存储，可直接按下面的路径读取，不要重新索要文件】\n${lines.join('\n')}`
 }
 
 /**
@@ -792,7 +933,7 @@ function selectBroadcastTargets(tickets: any[], text: string, explicitKeyword: s
  * `orchestrator_route attach` 走同一条路径，不经过 Eval、不依赖模型分诊。`channel` 仍指回用户发消息
  * 的原对话，worker 的回复会显示在那里。
  */
-async function broadcastByTitle(ctx: any, conversation: string, keyword: string, text: string): Promise<BroadcastResult> {
+async function broadcastByTitle(ctx: any, conversation: string, keyword: string, text: string, note = ''): Promise<BroadcastResult> {
   const store = ctx?.orchestrator?.store
   const engine = ctx?.orchestrator?.engine
   if (typeof store?.tickets?.list !== 'function' || typeof store?.triggers?.save !== 'function'
@@ -818,7 +959,7 @@ async function broadcastByTitle(ctx: any, conversation: string, keyword: string,
     const title = String(ticket.title).trim()
     const composed = `【广播给工单「${title}」(${ticket.id})：这条消息按${scope}筛选后同时投给了多张工单，`
       + `请按本工单的上下文处理，不要新建工单】
-${text}`
+${text}${note}`
     // 独立 Trigger + 每单一条：共享线程会被 ambiguous 吃掉，同一条 Trigger 也不能 attach 给多张工单。
     // note：正文已自带「广播给工单 X」前缀，不能再叠一层模式约束。
     const trigger = paneTrigger(conversation, composed, OWNER, 'note', { thread: `t${ticket.id}` })
@@ -870,10 +1011,13 @@ function deleteSchedule(state: any, id: string): void { state.set(scheduleKey(id
  *
  * 定时来源会在入站日志上标 `status: 'scheduled'`，面板据此显示「定时」徽标。
  */
-async function dispatchPaneMessage(ctx: any, body: { conversation: string; text: string; mode: PaneMode | 'dispatch' },
+async function dispatchPaneMessage(ctx: any, body: { conversation: string; text: string; mode: PaneMode | 'dispatch'; attachments?: PaneAttachment[] },
   origin: 'panel' | 'schedule' = 'panel'): Promise<any> {
   // 旧客户端仍发 `dispatch`，语义就是「路由器分配」。
   const mode: PaneMode = body.mode === 'dispatch' ? 'assign' : body.mode
+  // 附件先解析成带宿主机路径的引用，再拼进正文；正文对 worker 有 600 字截断，所以只放清单不放字节。
+  const attachments = resolvePaneAttachments(ctx, body.attachments)
+  const withAttachments = (text: string) => `${text}${attachmentNote(attachments)}`
   const source = ctx.orchestrator.context({ kind: SOURCE, health: ['pane'] })
   // 广播有两条入口：
   //   1) 派活模式下写 `@广播[关键词] 正文`（显式指定关键词，多个用逗号分隔，只投给匹配的工单）；
@@ -886,7 +1030,7 @@ async function dispatchPaneMessage(ctx: any, body: { conversation: string; text:
       const content = (matched ? matched[2]! : body.text).trim()
       if (mode === 'assign' && !keyword) throw new Error('广播关键词不能为空：请写成 @广播[关键词] 正文')
       if (!content) throw new Error(mode === 'broadcast' ? '广播内容不能为空' : '广播内容不能为空：请写成 @广播[关键词] 正文')
-      const result = await broadcastByTitle(ctx, body.conversation, keyword, content)
+      const result = await broadcastByTitle(ctx, body.conversation, keyword, content, attachmentNote(attachments))
       const at = new Date().toISOString()
       const basis = [
         result.criteria.timeLabel ? `时间窗「${result.criteria.timeLabel}」` : '',
@@ -906,7 +1050,8 @@ async function dispatchPaneMessage(ctx: any, body: { conversation: string; text:
                 ? `范围内的 ${result.matched} 张工单都已结束且无法唤醒${result.stopped ? `（其中 ${result.stopped} 张被人停止）` : ''}，未广播`
                 : `${basis || '最近 12 小时'}内没有符合条件的工单，未广播`))
       appendLog(source, body.conversation, { id: `broadcast-${randomUUID()}`, direction: 'in', at,
-        text: body.text, mode: 'broadcast', ...(origin === 'schedule' ? { status: 'scheduled' } : {}) })
+        text: body.text, mode: 'broadcast', ...(attachments.length ? { attachments } : {}),
+        ...(origin === 'schedule' ? { status: 'scheduled' } : {}) })
       appendLog(source, body.conversation, { id: `broadcast-notice-${randomUUID()}`, direction: 'out', at, text: notice, kind: 'broadcast' })
       return { broadcast: true, thread: `${SOURCE}:${body.conversation}`,
         received: result.delivered.length ? 'stored' : 'none', notice, ...result }
@@ -921,11 +1066,11 @@ async function dispatchPaneMessage(ctx: any, body: { conversation: string; text:
   // 投递前先手解档：跟进可能唤醒已结束的工单，而它的 worker 会话可能已被收尾归档
   // （被归档的会话跑不了回合，投递只会秒 blocked、消息丢失）。详见 wakeThreadSessions。
   await wakeThreadSessions(ctx, conversation)
-  const trigger = paneTrigger(conversation, composeText(mode, body.text), OWNER, mode,
+  const trigger = paneTrigger(conversation, withAttachments(composeText(mode, body.text)), OWNER, mode,
     diverted ? { thread: diverted.thread } : {})
-  // 日志里存用户原话（不含约束前缀），面板显示才干净。
+  // 日志里存用户原话（不含约束前缀与附件清单），面板显示才干净；附件引用单独存一份供消息流渲染。
   appendLog(source, conversation, { id: trigger.id, direction: 'in', at: trigger.at, text: body.text,
-    mode, ...(origin === 'schedule' ? { status: 'scheduled' } : {}) })
+    mode, ...(attachments.length ? { attachments } : {}), ...(origin === 'schedule' ? { status: 'scheduled' } : {}) })
   const received = await source.receive(trigger)
   return { triggerId: trigger.id, thread: `${SOURCE}:${trigger.threads[0]!.id}`, received, mode,
     ...(diverted ? { diverted: diverted.reason } : {}) }
@@ -973,8 +1118,42 @@ function paneHandler(ctx: any) {
       // POST /orchestrator/api/pane/message —— 派出一条消息（默认派活；mode=chat 交给 router）。
       if (req.method === 'POST' && url.pathname === '/orchestrator/api/pane/message') {
         const body = z.object({ conversation: ConversationSchema, text: TextSchema,
-          mode: z.enum(['dispatch', 'chat', 'broadcast', 'assign', 'note']).default('dispatch') }).parse(await readJson(req))
+          mode: z.enum(['dispatch', 'chat', 'broadcast', 'assign', 'note']).default('dispatch'),
+          attachments: z.array(AttachmentSchema).max(20).optional() }).parse(await readJson(req))
         sendJson(res, 200, await dispatchPaneMessage(ctx, body, 'panel'))
+        return
+      }
+      // POST /orchestrator/api/pane/upload —— 上传一个消息附件，落到 DSH 附件存储。
+      // 请求体是文件原始字节（不做 multipart，避免额外解析依赖）；文件名走 `x-pane-filename`（URL 编码）。
+      if (req.method === 'POST' && url.pathname === '/orchestrator/api/pane/upload') {
+        const rawName = url.searchParams.get('name') || req.headers['x-pane-filename'] || ''
+        let name = 'file'
+        try { name = decodeURIComponent(String(rawName)) } catch { name = String(rawName) }
+        sendJson(res, 200, await savePaneUpload(ctx, req, name))
+        return
+      }
+      // GET /orchestrator/api/pane/file?id=<sha256:...>&name=<name> —— 按引用回读附件原字节。
+      // 消息流里的图片缩略图与「查看原图」都走这里，权限与面板其它路由一致（同源头 + 页面令牌）。
+      if (req.method === 'GET' && url.pathname === '/orchestrator/api/pane/file') {
+        const id = String(url.searchParams.get('id') ?? '')
+        const name = paneFileName(url.searchParams.get('name') ?? '')
+        const store = ctx.attachments
+        // 先只用 id+name 定位对象，再按磁盘上的真实大小构造引用：`readFileStream` 会校验字节数与摘要，
+        // 客户端自报的字节数不可信，所以这里以 stat 为准（摘要不匹配时仍然会被它拒掉）。
+        const located = AttachmentSchema.parse({ attachmentId: id, name, bytes: 1 })
+        const path = store?.fileHostPath?.(located)
+        if (!path || !existsSync(path)) { sendJson(res, 404, { error: '附件不存在或已失效' }); return }
+        const ref = { ...located, bytes: statSync(path).size }
+        const chunks: Buffer[] = []
+        for await (const chunk of store.readFileStream(ref)) chunks.push(Buffer.from(chunk))
+        const bytes = Buffer.concat(chunks)
+        res.writeHead(200, {
+          'content-type': fileContentType(name),
+          'content-length': String(bytes.length),
+          'cache-control': 'private, max-age=3600',
+          'x-content-type-options': 'nosniff',
+        })
+        res.end(bytes)
         return
       }
       // GET /orchestrator/api/pane/activity/<会话 id> —— worker 当前在做什么。
@@ -1130,13 +1309,20 @@ function paneHandler(ctx: any) {
         } catch { /* 宿主内部变动：按没有工单上报 */ }
         // 真实并发的 Claude 会话数：只有 running 的 assignment 才真的在消耗模型额度。
         const active = live.filter(item => item.working).length
-        // 实际在跑的 cc-worker 数：按 lane 计，而不是按进程数（一张工单会拉起 5 个进程）。
-        const workers = live.reduce((sum, item) => sum + item.lanes.filter((lane: any) => lane.state === 'running').length, 0)
+        // 实际在跑的 cc-worker 数：按逻辑 worker（workerId）计，既不按进程数（一张工单会拉起 5 个进程），
+        // 也不按 Claude Code 会话数——上下文到上限后 handoff 激活的新会话仍属于同一个 cc worker。
+        const workers = new Set(live.flatMap((item: any) => item.lanes
+          .filter((lane: any) => lane.state === 'running')
+          .map((lane: any) => lane.workerId ?? `${item.ticketId}#${lane.lane}`))).size
+        // 会话数单独上报，仅供展示「一个 worker 跨了几个 handoff 会话」，不参与 worker 计数。
+        const sessions = new Set(live.flatMap((item: any) => item.lanes
+          .filter((lane: any) => lane.state === 'running' && lane.sessionId).map((lane: any) => lane.sessionId))).size
         sendJson(res, 200, {
           tickets: live.length,
           active,
           queued: live.filter(item => item.assignment === 'pending').length,
           workers,
+          sessions,
           items: live.sort((a, b) => Number(b.working) - Number(a.working)),
         })
         return

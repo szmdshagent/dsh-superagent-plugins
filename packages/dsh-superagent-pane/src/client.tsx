@@ -314,6 +314,15 @@ const zh = {
   usageCacheWriteUnreported: '—',
   usageCacheWriteZeroHint: '当前上游通道不返回缓存写入计数（DeepSeek 无缓存写入计费）',
   usageHitRate: '命中',
+  attachAdd: '添加附件（也可拖拽到输入框或直接粘贴图片）',
+  attachUploading: '上传中 {pct}%',
+  attachFailed: '附件上传失败：{error}',
+  attachRemove: '移除附件',
+  attachDrop: '松开即添加到这条消息',
+  attachLimit: '一条消息最多 {n} 个附件',
+  attachOpen: '查看原图',
+  attachDownload: '下载附件',
+  attachBytes: '{size}',
 }
 const en = {
   panel: 'Dispatch',
@@ -454,6 +463,15 @@ const en = {
   usageCacheWriteUnreported: '—',
   usageCacheWriteZeroHint: 'The current upstream channel does not report cache writes (DeepSeek has no cache-write billing)',
   usageHitRate: 'hit',
+  attachAdd: 'Add files (you can also drop them here or paste an image)',
+  attachUploading: 'Uploading {pct}%',
+  attachFailed: 'Attachment upload failed: {error}',
+  attachRemove: 'Remove attachment',
+  attachDrop: 'Release to attach to this message',
+  attachLimit: 'At most {n} files per message',
+  attachOpen: 'View original',
+  attachDownload: 'Download attachment',
+  attachBytes: '{size}',
 }
 
 /** 工单上"收到却没被读"的条数；由服务端按 inputs 的 readAt 算出后随列表下发。 */
@@ -477,6 +495,8 @@ function decisionBadge(item: Item): string {
 }
 
 type Item = { id: string; direction: 'in' | 'out'; at: string; text: string; kind?: string; mode?: string; status?: string
+  /** 随这条消息发送的附件（服务端只存引用；图片按引用回读显示）。 */
+  attachments?: PaneAttachment[]
   /** 服务端补上的裁决信息：kind 为 ignore/accept/stop/evaluating 等；reason 是给人看的理由。 */
   decision?: { kind?: string; reason?: string }
   /** 该消息对应工单的当前状态（ended/completed/working 等）。 */
@@ -495,7 +515,13 @@ type Ticket = {
 }
 type Activity = { state?: string; kind?: string | null; tool?: string; text?: string; at?: number; ageMs?: number }
 /** 协作规模：未结束工单数、真正在跑的 worker 数、排队数，以及每张工单的状态。 */
-type CrewLane = { lane: string; state: 'running' | 'idle'; task?: string }
+type CrewLane = { lane: string; state: 'running' | 'idle'; task?: string
+  /** 逻辑 cc worker id（handoff 换会话不变）；面板计数按它而不是按会话。 */
+  workerId?: string
+  /** 本 lane 当前会话。 */
+  sessionId?: string
+  /** 本 lane 用过的会话数；>1 表示中间 handoff 换过会话，但仍是同一个 cc worker。 */
+  sessions?: number }
 
 /**
  * lane 的显示名：统一叫 ccwN。
@@ -515,6 +541,264 @@ type Crew = {
   items: { ticketId: string; title: string; assignment: string; working: boolean; sessionId?: string; lanes?: CrewLane[] }[]
 }
 type Translate = (key: keyof typeof zh, values?: Record<string, string>) => string
+
+// ——— 消息附件 ———
+//
+// 复用 DSH 自带的附件存储：文件字节交给宿主的 `/orchestrator/api/pane/upload`，由它调用
+// `ctx.attachments.saveFileStream` 按内容寻址落盘；这里只保存引用（sha256 + 名字 + 字节数 + 宿主机路径）。
+// 消息流里的图片缩略图与下载都按引用回读 `/orchestrator/api/pane/file`，刷新后仍能看。
+
+/** 与宿主侧 `PaneAttachment` 同形；`path` 是宿主机绝对路径，worker 直接按它读文件。 */
+type PaneAttachment = { attachmentId: string; name: string; bytes: number; path?: string }
+/** 草稿栏里的一条：上传中/成功/失败，成功后才能随消息发送。 */
+type DraftAttachment = PaneAttachment & { draftId: string; state: 'uploading' | 'done' | 'error'; pct?: number; error?: string }
+/** 一条消息最多带多少附件（宿主侧同样限制 20）。 */
+const ATTACH_LIMIT = 20
+
+/** 人类可读的字节数。 */
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B'
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+}
+
+/** 已取回的附件 blob URL：按 attachmentId+name 缓存，同一附件只拉一次（刷新页面自然重取）。 */
+const blobUrls = new Map<string, string>()
+
+/**
+ * 按引用取回附件字节并转成 blob URL。
+ *
+ * 为什么不用 `<img src="...">` / `<a href>` 直接指向路由：面板路由要求同源管理头
+ * （`x-orchestrator-request`），img/a 发不出自定义头；所以统一带头发取，再交给 blob URL。
+ */
+async function attachmentBlobUrl(item: PaneAttachment): Promise<string> {
+  const cacheKey = `${item.attachmentId}/${item.name}`
+  const cached = blobUrls.get(cacheKey)
+  if (cached) return cached
+  const value = token()
+  const query = new URLSearchParams({ id: item.attachmentId, name: item.name })
+  if (value) query.set('token', value)
+  const response = await fetch(`${API}/file?${query.toString()}`, {
+    headers: { 'x-orchestrator-request': '1' }, credentials: 'same-origin', cache: 'no-store',
+  })
+  if (!response.ok) throw new Error(`HTTP ${response.status}`)
+  const url = URL.createObjectURL(await response.blob())
+  blobUrls.set(cacheKey, url)
+  return url
+}
+
+/** 一张图片附件：取回字节后显示缩略图，点击用 blob URL 打开原图。 */
+function AttachmentImage({ item, t }: { item: PaneAttachment; t: Translate }) {
+  const [url, setUrl] = useState('')
+  const [failed, setFailed] = useState(false)
+  useEffect(() => {
+    let live = true
+    void attachmentBlobUrl(item).then(value => { if (live) setUrl(value) })
+      .catch(() => { if (live) setFailed(true) })
+    return () => { live = false }
+  }, [item.attachmentId, item.name])
+  if (failed) return <span data-pane-message-image-failed={item.name} title={item.name}
+    style={{ fontSize: 11, opacity: 0.7 }}>🖼 {item.name}</span>
+  if (!url) return <span data-pane-message-image-loading={item.name}
+    style={{ display: 'inline-block', height: 64, width: 64, borderRadius: 6, background: 'rgba(0,0,0,.2)' }} />
+  return <a href={url} target="_blank" rel="noreferrer" data-pane-message-image={item.name}
+    title={`${t('attachOpen')}：${item.name}`} style={{ display: 'block' }}>
+    <img src={url} alt={item.name} style={{ height: 64, maxWidth: 240, objectFit: 'cover',
+      borderRadius: 6, border: '1px solid rgba(255,255,255,.2)', background: 'rgba(0,0,0,.2)' }} />
+  </a>
+}
+
+/** 一个文件附件：取回字节后以下载链接呈现（docx/txt 等浏览器不能内嵌预览的类型）。 */
+function AttachmentFile({ item, t }: { item: PaneAttachment; t: Translate }) {
+  const [url, setUrl] = useState('')
+  useEffect(() => {
+    let live = true
+    void attachmentBlobUrl(item).then(value => { if (live) setUrl(value) }).catch(() => { /* 失败时仍显示名字与大小 */ })
+    return () => { live = false }
+  }, [item.attachmentId, item.name])
+  return <a {...(url ? { href: url, download: item.name } : {})} data-pane-message-file={item.name}
+    title={`${t('attachDownload')}：${item.name}`}
+    style={{ display: 'flex', alignItems: 'center', gap: 6, maxWidth: 240, height: 40, padding: '0 8px',
+      borderRadius: 6, fontSize: 11, textDecoration: 'none', color: 'inherit', cursor: url ? 'pointer' : 'default',
+      border: '1px solid rgba(255,255,255,.25)', background: 'rgba(0,0,0,.18)' }}>
+    <span style={{ flexShrink: 0 }}>📄</span>
+    <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{item.name}</span>
+    <span style={{ flexShrink: 0, opacity: 0.7 }}>{formatBytes(item.bytes)}</span>
+  </a>
+}
+
+/** 图片类附件按扩展名判断：只有这些在消息流里渲染缩略图。 */
+function isImageAttachment(name: string): boolean {
+  return /\.(png|jpe?g|gif|webp|bmp)$/i.test(name)
+}
+
+/**
+ * 上传一个文件并返回附件引用。用 XHR 而不是 fetch：需要上传进度（大文件、Word/图片都有感）。
+ * 字节直接作为请求体发送，文件名走查询参数（服务端会做与 DSH 附件存储一致的清洗）。
+ */
+function uploadPaneFile(file: File, onProgress: (pct?: number) => void, signal: AbortSignal): Promise<PaneAttachment> {
+  return new Promise((resolve, reject) => {
+    const value = token()
+    const query = new URLSearchParams({ name: file.name || 'file' })
+    if (value) query.set('token', value)
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', `${API}/upload?${query.toString()}`)
+    xhr.setRequestHeader('x-orchestrator-request', '1')
+    xhr.setRequestHeader('content-type', 'application/octet-stream')
+    xhr.upload.onprogress = event => { if (event.lengthComputable) onProgress(Math.round((event.loaded / event.total) * 100)) }
+    xhr.onerror = () => reject(new Error('网络错误'))
+    xhr.onabort = () => reject(new Error('已取消'))
+    xhr.onload = () => {
+      let body: any = {}
+      try { body = JSON.parse(xhr.responseText) } catch { body = {} }
+      if (xhr.status >= 200 && xhr.status < 300 && typeof body?.attachmentId === 'string') resolve(body as PaneAttachment)
+      else reject(new Error(body?.error ?? `HTTP ${xhr.status}`))
+    }
+    signal.addEventListener('abort', () => xhr.abort(), { once: true })
+    xhr.send(file)
+  })
+}
+
+/** 展示用文件名：只留叶子名（浏览器不会给完整路径，这里只是防御）。 */
+function paneLocalName(file: File): string {
+  return (file.name || 'file').replace(/\\/g, '/').split('/').pop() || 'file'
+}
+
+/** 粘贴板里的文件：截图走 `clipboardData.files`，部分浏览器只有 items，两路都取。 */
+function clipboardFiles(data: DataTransfer | null): File[] {
+  if (!data) return []
+  const files = Array.from(data.files ?? [])
+  if (files.length > 0) return files
+  return Array.from(data.items ?? [])
+    .filter(item => item.kind === 'file')
+    .map(item => item.getAsFile())
+    .filter((file): file is File => !!file)
+}
+
+/** 给粘贴进来的图片起个带时间戳的名字：浏览器给的 clipboard 文件常叫 image.png，会互相覆盖展示名。 */
+function namePastedFile(file: File): File {
+  if (file.name && file.name !== 'image.png' && file.name !== 'blob') return file
+  const ext = file.type === 'image/jpeg' ? 'jpg' : file.type === 'image/gif' ? 'gif'
+    : file.type === 'image/webp' ? 'webp' : 'png'
+  const now = new Date()
+  const pad = (value: number) => String(value).padStart(2, '0')
+  const name = `粘贴图片-${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}.${ext}`
+  return new File([file], name, { type: file.type })
+}
+
+const EMPTY_ATTACHMENTS: DraftAttachment[] = []
+
+/** 草稿附件状态：选择/拖拽/粘贴共用，上传完成才允许发送。 */
+function useAttachmentDrafts(t: Translate) {
+  const [items, setItems] = useState<DraftAttachment[]>(EMPTY_ATTACHMENTS)
+  const [error, setError] = useState('')
+  const abortRef = useRef<AbortController | null>(null)
+  /** 当前草稿的快照：连续两次选择/粘贴时也要算准剩余名额（不能依赖异步的 state）。 */
+  const itemsRef = useRef<DraftAttachment[]>(EMPTY_ATTACHMENTS)
+  useEffect(() => () => { abortRef.current?.abort() }, [])
+
+  const update = useCallback((draftId: string, patch: Partial<DraftAttachment>) => {
+    setItems(previous => previous.map(item => item.draftId === draftId ? { ...item, ...patch } : item))
+  }, [])
+
+  const add = useCallback(async (incoming: File[] | FileList) => {
+    const files = Array.from(incoming)
+    if (files.length === 0) return
+    setError('')
+    const controller = abortRef.current ?? new AbortController()
+    abortRef.current = controller
+    // 同一个文件重复选中（拖拽/粘贴/选择框叠加）不要重复入列：按「名字 + 字节数」去重。
+    const seen = new Set(itemsRef.current.filter(item => item.state !== 'error').map(item => `${item.name}/${item.bytes}`))
+    const fresh = files.filter(file => {
+      const identity = `${paneLocalName(file)}/${file.size}`
+      if (seen.has(identity)) return false
+      seen.add(identity)
+      return true
+    })
+    const room = ATTACH_LIMIT - itemsRef.current.length
+    if (fresh.length > room) setError(fill(t('attachLimit'), { n: String(ATTACH_LIMIT) }))
+    const accepted: DraftAttachment[] = fresh.slice(0, Math.max(0, room)).map(file => ({
+      draftId: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      attachmentId: '', name: paneLocalName(file), bytes: file.size, state: 'uploading', pct: undefined,
+    }))
+    if (accepted.length === 0) return
+    itemsRef.current = [...itemsRef.current, ...accepted]
+    setItems(itemsRef.current)
+    // 上传是副作用，放在状态更新之外；每个文件独立成败，失败只影响自己那一条。
+    for (const [index, draft] of accepted.entries()) {
+      void uploadPaneFile(fresh[index]!, pct => update(draft.draftId, { pct }), controller.signal)
+        .then(ref => update(draft.draftId, { ...ref, state: 'done', pct: 100 }))
+        .catch(failure => update(draft.draftId, { state: 'error', error: failure instanceof Error ? failure.message : String(failure) }))
+    }
+  }, [t, update])
+
+  const remove = useCallback((draftId: string) => {
+    itemsRef.current = itemsRef.current.filter(item => item.draftId !== draftId)
+    setItems(itemsRef.current)
+  }, [])
+
+  const clear = useCallback(() => { itemsRef.current = EMPTY_ATTACHMENTS; setItems(EMPTY_ATTACHMENTS); setError('') }, [])
+  /** 已上传完成、可以随消息发送的引用。 */
+  // 只回传存储引用本身（宿主机路径由服务端按引用现算，客户端不能自报路径）。
+  const ready: PaneAttachment[] = items.filter(item => item.state === 'done')
+    .map(item => ({ attachmentId: item.attachmentId, name: item.name, bytes: item.bytes }))
+  return { items, add, remove, clear, ready, error, setError }
+}
+
+/** 草稿附件栏：横向排列的文件卡，上传中显示进度，失败显示原因，悬停放大移除按钮。 */
+function AttachmentRail({ items, onRemove, t }: { items: DraftAttachment[]; onRemove: (draftId: string) => void; t: Translate }) {
+  if (items.length === 0) return null
+  return <div data-pane-attachment-rail="" style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+    {items.map(item => {
+      const failed = item.state === 'error'
+      return <div key={item.draftId} data-pane-attachment-draft={item.name}
+        title={failed ? fill(t('attachFailed'), { error: item.error ?? '' }) : item.path ?? item.name}
+        style={{ display: 'flex', alignItems: 'center', gap: 6, maxWidth: 240, padding: '3px 6px', borderRadius: 6,
+          fontSize: 11, border: `1px solid ${failed ? '#e53e3e' : 'var(--dt-border, #333)'}`,
+          background: 'var(--dt-surface, #2d2d2d)', opacity: item.state === 'uploading' ? 0.75 : 1 }}>
+        <span style={{ flexShrink: 0 }}>{failed ? '⚠' : isImageAttachment(item.name) ? '🖼' : '📄'}</span>
+        <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{item.name}</span>
+        <span style={{ flexShrink: 0, opacity: 0.6 }}>
+          {item.state === 'uploading'
+            ? fill(t('attachUploading'), { pct: String(item.pct ?? 0) })
+            : formatBytes(item.bytes)}
+        </span>
+        <button type="button" data-pane-attachment-remove={item.name} aria-label={t('attachRemove')} title={t('attachRemove')}
+          onClick={() => onRemove(item.draftId)}
+          style={{ flexShrink: 0, background: 'none', border: 'none', cursor: 'pointer', padding: 0, fontSize: 12, color: 'inherit', opacity: 0.6 }}>×</button>
+      </div>
+    })}
+  </div>
+}
+
+/** 消息流里的附件：图片显示缩略图（点击看原图），其它文件显示可下载的文件卡。 */
+function MessageAttachments({ items, t }: { items: PaneAttachment[]; t: Translate }) {
+  if (items.length === 0) return null
+  return <div data-pane-message-attachments="" style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 6 }}>
+    {items.map(item => isImageAttachment(item.name)
+      ? <AttachmentImage key={item.attachmentId + item.name} item={item} t={t} />
+      : <AttachmentFile key={item.attachmentId + item.name} item={item} t={t} />)}
+  </div>
+}
+
+/** 附件按钮 + 隐藏的文件选择框：主输入区与工单意见框共用。 */
+function AttachButton({ disabled, onFiles, t }: { disabled?: boolean; onFiles: (files: FileList) => void; t: Translate }) {
+  const inputRef = useRef<HTMLInputElement | null>(null)
+  return <>
+    <input ref={inputRef} type="file" multiple data-pane-attach-input="" style={{ display: 'none' }}
+      onChange={event => { const files = event.target.files; if (files && files.length) onFiles(files) }} />
+    <button type="button" data-pane-attach="" aria-label={t('attachAdd')} title={t('attachAdd')} disabled={disabled}
+      onClick={() => {
+        // 清空要在「打开选择框之前」：选中后立刻把 value 置空会让刚拿到的 File 失去底层数据，
+        // 上传会永远停在 0%（Firefox 实测）。放在点击前既允许重选同一个文件，也不影响正在上传的 File。
+        if (inputRef.current) inputRef.current.value = ''
+        inputRef.current?.click()
+      }}
+      style={{ height: 24, padding: '0 8px', fontSize: 12, lineHeight: 1, flexShrink: 0,
+        opacity: disabled ? 0.4 : 0.8, cursor: disabled ? 'not-allowed' : 'pointer' }}>📎</button>
+  </>
+}
 
 /** 工具名到文案键的映射；未知工具直接显示原名。 */
 const TOOL_KEYS: Record<string, keyof typeof zh> = {
@@ -635,7 +919,7 @@ function TicketBar({ ticket, activity, t, ccStatus, ccExpanded, onToggleCc, onIn
   ccStatus: CcStatus | null; ccExpanded: boolean
   onToggleCc: () => void; onInterrupt: () => void; onClear: () => void; ccBusy: boolean
   health?: Health | null; confirmStop: boolean; onClose: () => void
-  onComment?: (ticket: Ticket, text: string) => Promise<void>
+  onComment?: (ticket: Ticket, text: string, attachments: PaneAttachment[]) => Promise<void>
   onOpenComment?: (ticket: Ticket) => void
 }) {
   const [open, setOpen] = useState(false)
@@ -671,14 +955,19 @@ function TicketBar({ ticket, activity, t, ccStatus, ccExpanded, onToggleCc, onIn
   const [commentDraft, setCommentDraft] = useState('')
   const [commentState, setCommentState] = useState<'idle' | 'busy' | 'ok' | 'error'>('idle')
   const [commentError, setCommentError] = useState('')
+  const [commentDrop, setCommentDrop] = useState(false)
   const commentRef = useRef<HTMLTextAreaElement | null>(null)
+  // 工单意见框的附件：与主输入区同一套草稿状态，只影响这张卡。
+  const commentFiles = useAttachmentDrafts(t)
   const submitComment = async () => {
     const text = commentDraft.trim()
-    if (!text || commentState === 'busy' || !onComment) return
+    if ((!text && commentFiles.ready.length === 0) || commentState === 'busy' || !onComment) return
+    if (commentFiles.items.some(item => item.state === 'uploading')) { commentFiles.setError(fill(t('attachUploading'), { pct: '…' })); return }
     setCommentState('busy'); setCommentError('')
     try {
-      await onComment(ticket, text)
+      await onComment(ticket, text, commentFiles.ready)
       setCommentDraft('')
+      commentFiles.clear()
       setCommentState('ok')
     } catch (failure) {
       setCommentState('error')
@@ -702,7 +991,9 @@ function TicketBar({ ticket, activity, t, ccStatus, ccExpanded, onToggleCc, onIn
         const running = lanes.filter(lane => lane.state === 'running').length
         return <span data-pane-ticket-crew={ticket.id}
           title={`这张工单下有 ${lanes.length} 个 cc-worker（${running} 个在跑）：`
-            + lanes.map(lane => `${laneLabel(lane.lane)} ${lane.state === 'running' ? '运行中' : '空闲'}${lane.task ? ' — ' + lane.task : ''}`).join('；')}
+            + lanes.map(lane => `${laneLabel(lane.lane)} ${lane.state === 'running' ? '运行中' : '空闲'}`
+              + `${(lane.sessions ?? 0) > 1 ? `（${lane.sessions} 个 handoff 会话，同一个 worker）` : ''}`
+              + `${lane.task ? ' — ' + lane.task : ''}`).join('；')}
           style={{ fontSize: 11, fontWeight: 700, padding: '1px 8px', borderRadius: 10, flexShrink: 0,
             letterSpacing: 0.3, lineHeight: 1.5,
             border: running > 0 ? '1px solid #4a9eff' : '1px solid #555',
@@ -754,6 +1045,11 @@ function TicketBar({ ticket, activity, t, ccStatus, ccExpanded, onToggleCc, onIn
             color: lane.state === 'running' ? '#9ae6b4' : '#999' }}>
             {lane.state === 'running' ? '运行中' : '空闲'}
           </span>
+          {(lane.sessions ?? 0) > 1 && <span data-pane-lane-sessions={lane.lane}
+            title={`这个 cc-worker 用了 ${lane.sessions} 个会话（上下文到上限时由 handoff 换会话），计数仍为 1 个 worker`}
+            style={{ flexShrink: 0, fontSize: 10, padding: '0 5px', borderRadius: 3, background: '#2c3e50', color: '#9fb3c8' }}>
+            {lane.sessions} 个 handoff 会话 · 同一 worker
+          </span>}
           <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: '#ddd' }}
             title={lane.task ?? '该 lane 没有登记任务'}>
             {lane.task ?? <span style={{ opacity: 0.45 }}>未登记任务</span>}
@@ -780,27 +1076,44 @@ function TicketBar({ ticket, activity, t, ccStatus, ccExpanded, onToggleCc, onIn
       whiteSpace: 'normal', overflowWrap: 'anywhere', maxHeight: 260, overflowY: 'auto',
       overscrollBehavior: 'contain', scrollbarWidth: 'thin' }}>{summary}</div>}
     {expanded && <div data-pane-ticket-comment-box={ticket.id}
-      style={{ display: 'flex', flexDirection: 'column', gap: 4, borderTop: '1px solid var(--dt-border, #333)', paddingTop: 5 }}>
+      onDragOver={event => { if (Array.from(event.dataTransfer?.types ?? []).includes('Files')) { event.preventDefault(); setCommentDrop(true) } }}
+      onDragLeave={() => setCommentDrop(false)}
+      onDrop={event => {
+        const files = Array.from(event.dataTransfer?.files ?? [])
+        if (files.length === 0) return
+        event.preventDefault(); setCommentDrop(false); void commentFiles.add(files)
+      }}
+      style={{ display: 'flex', flexDirection: 'column', gap: 4, borderTop: '1px solid var(--dt-border, #333)', paddingTop: 5,
+        outline: commentDrop ? '1px dashed var(--dt-accent, #2b6cb0)' : 'none', outlineOffset: 2 }}>
       <div style={{ display: 'flex', gap: 4, alignItems: 'flex-end' }}>
         <textarea ref={commentRef} data-pane-ticket-comment-input={ticket.id}
           value={commentDraft} rows={1} placeholder={t('commentPlaceholder')} aria-label={t('commentPlaceholder')}
           disabled={commentState === 'busy'}
           onChange={event => { setCommentDraft(event.target.value); if (commentState === 'ok' || commentState === 'error') setCommentState('idle') }}
           onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void submitComment() } }}
+          onPaste={event => {
+            const files = clipboardFiles(event.clipboardData)
+            if (files.length === 0) return
+            event.preventDefault()
+            void commentFiles.add(files.map(namePastedFile))
+          }}
           style={{ flex: '1 1 0', minWidth: 0, minHeight: 26, maxHeight: 110, resize: 'vertical', fontSize: 12, padding: '3px 6px',
             border: '1px solid var(--dt-border, #333)', borderRadius: 6, background: 'var(--dt-surface, #2d2d2d)', color: 'inherit' }} />
+        <AttachButton disabled={commentState === 'busy'} onFiles={files => { void commentFiles.add(files) }} t={t} />
         <button type="button" data-pane-ticket-comment-send={ticket.id}
           aria-label={t('commentSend')} title={t('commentSend')}
-          disabled={commentState === 'busy' || !commentDraft.trim()}
+          disabled={commentState === 'busy' || (!commentDraft.trim() && commentFiles.ready.length === 0)}
           onClick={event => { event.stopPropagation(); void submitComment() }}
           style={{ flexShrink: 0, height: 26, padding: '0 8px', fontSize: 12, lineHeight: 1, borderRadius: 6,
             border: '1px solid var(--dt-border, #333)',
-            background: commentState === 'busy' || !commentDraft.trim() ? 'transparent' : 'var(--dt-accent, #2b6cb0)',
-            color: commentState === 'busy' || !commentDraft.trim() ? 'inherit' : '#fff',
-            cursor: commentState === 'busy' || !commentDraft.trim() ? 'not-allowed' : 'pointer' }}>
+            background: commentState === 'busy' || (!commentDraft.trim() && commentFiles.ready.length === 0) ? 'transparent' : 'var(--dt-accent, #2b6cb0)',
+            color: commentState === 'busy' || (!commentDraft.trim() && commentFiles.ready.length === 0) ? 'inherit' : '#fff',
+            cursor: commentState === 'busy' || (!commentDraft.trim() && commentFiles.ready.length === 0) ? 'not-allowed' : 'pointer' }}>
           {commentState === 'busy' ? t('commentSending') : t('commentSend')}
         </button>
       </div>
+      <AttachmentRail items={commentFiles.items} onRemove={commentFiles.remove} t={t} />
+      {commentFiles.error && <span style={{ fontSize: 11, color: '#e53e3e' }}>{commentFiles.error}</span>}
       {commentState === 'ok' && <span data-pane-ticket-comment-status={ticket.id} style={{ fontSize: 11, color: '#38a169', display: 'flex', gap: 6, alignItems: 'baseline' }}>
         {t('commentSent')}
         <button type="button" data-pane-ticket-comment-open={ticket.id}
@@ -1264,6 +1577,10 @@ function PanePanel({ t }: { t: Translate }) {
   const [mode, setMode] = useState<'assign' | 'chat' | 'broadcast'>('assign')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  /** 主输入区的附件草稿（选择/拖拽/粘贴共用一套）。 */
+  const draftFiles = useAttachmentDrafts(t)
+  /** 拖拽文件悬停在主输入区时的提示态。 */
+  const [draftDrop, setDraftDrop] = useState(false)
   /** 每张工单的协作 lane 明细（/crew）：直接显示在各自工单卡上，不再走右上角汇总。 */
   const [crew, setCrew] = useState<Crew | null>(null)
   const [tickets, setTickets] = useState<Ticket[]>([])
@@ -1569,11 +1886,15 @@ function PanePanel({ t }: { t: Translate }) {
 
   const send = async () => {
     const text = draft.trim()
-    if (!text || busy) return
+    const attachments = draftFiles.ready
+    if ((!text && attachments.length === 0) || busy) return
+    if (draftFiles.items.some(item => item.state === 'uploading')) { setError(fill(t('attachUploading'), { pct: '…' })); return }
     setBusy(true); setError(null)
     try {
-      const sent = await call('/message', { method: 'POST', body: JSON.stringify({ conversation, text, mode }) })
+      const sent = await call('/message', { method: 'POST', body: JSON.stringify({ conversation, text, mode,
+        ...(attachments.length ? { attachments } : {}) }) })
       setDraft('')
+      draftFiles.clear()
       // 服务端只在会话线程的工单卡死时把派活消息改投子线程，如实提示一次；没分流则清掉上次的提示。
       setDivertedNotice(typeof sent?.diverted === 'string' ? sent.diverted : '')
       // 自己刚发的消息必须能看见：重新钉回底部，让下面的 load() 跟随到底。
@@ -1588,9 +1909,10 @@ function PanePanel({ t }: { t: Translate }) {
 
   /** 把「给某张工单的意见」发到这张工单专属的意见会话 t<id>：该线程没有工单订阅，消息不会广播给同对话其它工单，
    *  只走 Eval → 路由器按文本里的工单 id 挂到那一张。 */
-  const commentOnTicket = useCallback(async (ticket: Ticket, text: string) => {
+  const commentOnTicket = useCallback(async (ticket: Ticket, text: string, attachments: PaneAttachment[] = []) => {
     const composed = `【给工单「${ticket.title}」(${ticket.id}) 的意见，请交给该工单的 worker，不要新建工单】\n${text}`
-    const sent = await call('/message', { method: 'POST', body: JSON.stringify({ conversation: commentConversation(ticket.id), text: composed, mode: 'note' }) })
+    const sent = await call('/message', { method: 'POST', body: JSON.stringify({ conversation: commentConversation(ticket.id), text: composed, mode: 'note',
+      ...(attachments.length ? { attachments } : {}) }) })
     setDivertedNotice(typeof sent?.diverted === 'string' ? sent.diverted : '')
     pinnedRef.current = true
     await load()
@@ -1681,6 +2003,7 @@ function PanePanel({ t }: { t: Translate }) {
             )}
           </div>
           {item.text}
+          <MessageAttachments items={item.attachments ?? []} t={t} />
         </div>
       ))}
     </div>
@@ -1695,14 +2018,31 @@ function PanePanel({ t }: { t: Translate }) {
         return working ? fill(t('waitingBusy'), { time }) : fill(t('waitingReply'), { n: String(pending.length), time })
       })()}
     </div>}
-    <div style={{ display: 'flex', gap: 8, alignItems: 'stretch' }}>
-      <textarea value={draft} onChange={event => setDraft(event.target.value)}
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}
+      onDragOver={event => { if (Array.from(event.dataTransfer?.types ?? []).includes('Files')) { event.preventDefault(); setDraftDrop(true) } }}
+      onDragLeave={() => setDraftDrop(false)}
+      onDrop={event => {
+        const files = Array.from(event.dataTransfer?.files ?? [])
+        if (files.length === 0) return
+        event.preventDefault(); setDraftDrop(false); void draftFiles.add(files)
+      }}>
+      <AttachmentRail items={draftFiles.items} onRemove={draftFiles.remove} t={t} />
+      {draftFiles.error && <div role="alert" style={{ fontSize: 11, color: '#e53e3e' }}>{draftFiles.error}</div>}
+      <div style={{ display: 'flex', gap: 8, alignItems: 'stretch' }}>
+      <textarea data-pane-draft="" value={draft} onChange={event => setDraft(event.target.value)}
         placeholder={mode === 'chat' ? t('placeholderChat')
           : mode === 'broadcast' ? t('placeholderBroadcast') : t('placeholder')} rows={3}
         onKeyDown={event => {
           if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void send() }
         }}
-        style={{ flex: 1, resize: 'vertical', padding: 8 }} />
+        onPaste={event => {
+          const files = clipboardFiles(event.clipboardData)
+          if (files.length === 0) return
+          event.preventDefault()
+          void draftFiles.add(files.map(namePastedFile))
+        }}
+        style={{ flex: 1, resize: 'vertical', padding: 8,
+          outline: draftDrop ? '1px dashed var(--dt-accent, #2b6cb0)' : 'none', outlineOffset: 2 }} />
       <div style={{ display: 'flex', flexDirection: 'column', gap: 6, justifyContent: 'space-between' }}>
         <div style={{ display: 'flex', border: '1px solid var(--dt-border, #333)', borderRadius: 6, overflow: 'hidden' }}>
           {(['assign', 'broadcast', 'chat'] as const).map(item => (
@@ -1714,10 +2054,15 @@ function PanePanel({ t }: { t: Translate }) {
             </button>
           ))}
         </div>
-        <button type="button" style={{ padding: '6px 12px' }} disabled={busy || !draft.trim()} onClick={() => { void send() }}>
-          {busy ? t('sending') : t('send')}
-        </button>
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+          <AttachButton disabled={busy} onFiles={files => { void draftFiles.add(files) }} t={t} />
+          <button type="button" data-pane-send="" style={{ padding: '6px 12px', flex: 1 }}
+            disabled={busy || (!draft.trim() && draftFiles.ready.length === 0)} onClick={() => { void send() }}>
+            {busy ? t('sending') : t('send')}
+          </button>
+        </div>
       </div>
+    </div>
     </div>
     {mode === 'chat' && <div style={{ fontSize: 11, opacity: 0.6 }}>{t('chatBusyHint')}</div>}
     {mode === 'broadcast' && <div style={{ fontSize: 11, opacity: 0.6 }}>{t('broadcastHint')}</div>}
