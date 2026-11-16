@@ -426,33 +426,37 @@ function readLanes(dir: string): CrewLaneView[] {
       return readFileSync(`/proc/${pid}/cmdline`, 'utf8').includes('claude')
     } catch { return false }
   }
-  // 没有任务登记时，用这条 lane 自己的执行日志概括「现在在干什么」：
-  //   当前步 / 最近一步 →「第 N 步 · Bash: <命令>」；从没跑过任何一轮才算「空闲」。
-  // 日志读取复用 ccvis（runs/<时间戳>.jsonl 增量尾部缓存），单条 lane 只读一次，
-  // 轮询时跟着面板刷新，所以行内文字是实时动作而不是静态计划标签。
-  const liveTask = (lane: string): string => {
-    const clip = (text: string) => text.replace(/\s+/g, ' ').trim().slice(0, 160)
+  // 行内任务文本分三种情况（owner 口径）：
+  //   在跑 → 实时当前步「第 N 步 · 工具: 详情」；
+  //   空闲但跑过 → 最近任务的一行短概括（约 14 个汉字，超出加省略号）；
+  //   从没跑过 / 没有任何输出 → 「没输出」。
+  // 日志读取复用 ccvis（runs/<时间戳>.jsonl 增量尾部缓存），轮询时跟着面板刷新。
+  const clipText = (text: string, max: number): string => {
+    const one = text.replace(/\s+/g, ' ').trim()
+    return one.length > max ? `${one.slice(0, max)}…` : one
+  }
+  // team 派活时 cc-worker 写入 lanes/<name>/task.txt，是「它负责什么」的静态登记。
+  const registeredTask = (base: string): string => {
+    try { return readFileSync(join(base, 'task.txt'), 'utf8') } catch { return '' }
+  }
+  const taskOf = (base: string, lane: string, state: 'running' | 'idle'): string => {
     try {
       const cc = readCcStatus(dir, lane)
-      if (!cc.present) return '空闲'
-      const step = cc.current ?? cc.steps[cc.steps.length - 1]
-      if (step) return clip(`第 ${step.step} 步 · ${step.tool ?? '工具'}${step.detail ? `: ${step.detail}` : ''}`)
-      if (cc.state === 'error') return '执行报错'
-      if (cc.state === 'done') return '已完成'
-      return cc.state === 'running' ? '执行中' : '思考中'
-    } catch { return '空闲' }
-  }
-  // 任务一句话：优先 team 派活时 cc-worker 写入的 lanes/<name>/task.txt（任务登记）；
-  // 没有登记就退回这条 lane 的实时执行动作，不再一律显示「未登记任务」。
-  const taskOf = (base: string, lane: string): string => {
-    try {
-      const text = readFileSync(join(base, 'task.txt'), 'utf8').replace(/\s+/g, ' ').trim()
-      if (text) return text.slice(0, 160)
-    } catch { /* 没有任务登记：看执行实况 */ }
-    return liveTask(lane)
+      if (!cc.present) return '没输出'
+      const last = cc.current ?? cc.steps[cc.steps.length - 1]
+      if (state === 'running') {
+        if (last) return clipText(`第 ${last.step} 步 · ${last.tool ?? '工具'}${last.detail ? `: ${last.detail}` : ''}`, 160)
+        if (cc.state === 'error') return '执行报错'
+        if (cc.state === 'done') return '已完成'
+        return cc.state === 'running' ? '执行中' : '思考中'
+      }
+      // 空闲但跑过：优先任务登记，其次最近一步的动作，压成一行短概括而不是「空闲」。
+      const source = registeredTask(base) || last?.detail || last?.tool || ''
+      return source ? clipText(source, 14) : '没输出'
+    } catch { return '没输出' }
   }
   const view = (base: string, lane: string, state: 'running' | 'idle', role: LaneRole, leader?: string): CrewLaneView =>
-    ({ lane, state, task: taskOf(base, lane), role, ...(role === 'worker' && leader ? { leader } : {}) })
+    ({ lane, state, task: taskOf(base, lane, state), role, ...(role === 'worker' && leader ? { leader } : {}) })
   try {
     const plan = planned()
     const leaderOf = (lane: string): string | undefined => {

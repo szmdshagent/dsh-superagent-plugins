@@ -959,31 +959,38 @@ function readLanes(dir) {
 			return false;
 		}
 	};
-	const liveTask = (lane) => {
-		const clip = (text) => text.replace(/\s+/g, " ").trim().slice(0, 160);
+	const clipText = (text, max) => {
+		const one = text.replace(/\s+/g, " ").trim();
+		return one.length > max ? `${one.slice(0, max)}…` : one;
+	};
+	const registeredTask = (base) => {
 		try {
-			const cc = readCcStatus(dir, lane);
-			if (!cc.present) return "空闲";
-			const step = cc.current ?? cc.steps[cc.steps.length - 1];
-			if (step) return clip(`第 ${step.step} 步 · ${step.tool ?? "工具"}${step.detail ? `: ${step.detail}` : ""}`);
-			if (cc.state === "error") return "执行报错";
-			if (cc.state === "done") return "已完成";
-			return cc.state === "running" ? "执行中" : "思考中";
+			return readFileSync(join(base, "task.txt"), "utf8");
 		} catch {
-			return "空闲";
+			return "";
 		}
 	};
-	const taskOf = (base, lane) => {
+	const taskOf = (base, lane, state) => {
 		try {
-			const text = readFileSync(join(base, "task.txt"), "utf8").replace(/\s+/g, " ").trim();
-			if (text) return text.slice(0, 160);
-		} catch {}
-		return liveTask(lane);
+			const cc = readCcStatus(dir, lane);
+			if (!cc.present) return "没输出";
+			const last = cc.current ?? cc.steps[cc.steps.length - 1];
+			if (state === "running") {
+				if (last) return clipText(`第 ${last.step} 步 · ${last.tool ?? "工具"}${last.detail ? `: ${last.detail}` : ""}`, 160);
+				if (cc.state === "error") return "执行报错";
+				if (cc.state === "done") return "已完成";
+				return cc.state === "running" ? "执行中" : "思考中";
+			}
+			const source = registeredTask(base) || last?.detail || last?.tool || "";
+			return source ? clipText(source, 14) : "没输出";
+		} catch {
+			return "没输出";
+		}
 	};
 	const view = (base, lane, state, role, leader) => ({
 		lane,
 		state,
-		task: taskOf(base, lane),
+		task: taskOf(base, lane, state),
 		role,
 		...role === "worker" && leader ? { leader } : {}
 	});

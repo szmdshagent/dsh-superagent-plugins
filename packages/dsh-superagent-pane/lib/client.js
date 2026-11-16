@@ -1230,10 +1230,10 @@ window.__ModuleLoader__.load({
 												whiteSpace: "nowrap",
 												color: "#ddd"
 											},
-											title: lane.task ?? "空闲",
-											children: lane.task ?? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											title: lane.task || "没输出",
+											children: lane.task || /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 												style: { opacity: .45 },
-												children: "空闲"
+												children: "没输出"
 											})
 										})
 									]
