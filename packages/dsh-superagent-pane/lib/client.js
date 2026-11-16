@@ -1243,7 +1243,8 @@ window.__ModuleLoader__.load({
 								const picked = (crew ?? []).find((lane) => lane.lane === lanePick);
 								if (!picked) return null;
 								const label = crewLabels(crew ?? []).get(picked.lane) ?? laneLabel(picked.lane);
-								const detail = laneStatus ?? null;
+								const detail = laneStatus && laneStatus.lane === picked.lane ? laneStatus : null;
+								const foreign = !!laneStatus && laneStatus.lane !== picked.lane;
 								return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 									"data-pane-lane-detail": `${ticket.id}:${picked.lane}`,
 									style: {
@@ -1275,7 +1276,7 @@ window.__ModuleLoader__.load({
 												title: "这条 lane 的 Claude Code 会话 id",
 												children: ["会话 ", detail.sessionId]
 											}),
-											!detail && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											!laneStatus && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 												style: { opacity: .6 },
 												children: "读取中…"
 											}),
@@ -1303,7 +1304,13 @@ window.__ModuleLoader__.load({
 												children: "再点该行返回工单级进度"
 											})
 										]
-									}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)(CcPanel, {
+									}), foreign ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+										style: {
+											opacity: .6,
+											fontSize: 11.5
+										},
+										children: "该 worker 暂无独立输出"
+									}) : /* @__PURE__ */ (0, react_jsx_runtime.jsx)(CcPanel, {
 										status: detail,
 										expanded: true,
 										busy: false
@@ -2410,7 +2417,10 @@ window.__ModuleLoader__.load({
 						if (!live) return;
 						if (info?.cc) setLaneStatuses((prev) => ({
 							...prev,
-							[`${ticketId}:${lane}`]: info.cc
+							[`${ticketId}:${lane}`]: {
+								...info.cc,
+								lane: typeof info?.lane === "string" ? info.lane : void 0
+							}
 						}));
 					} catch {}
 				};

@@ -21,6 +21,8 @@ export type CcStatus = {
   alert: 'none' | 'warn' | 'critical'
   alertText?: string
   error?: string
+  /** 该状态实际属于哪条 lane（服务端 ?lane= 请求的回执）；旧服务端忽略 lane 参数时没有这个字段。 */
+  lane?: string
 }
 
 const STATE_TEXT: Record<CcStatus['state'], string> = {

@@ -892,7 +892,10 @@ function TicketBar({ ticket, activity, t, ccStatus, ccExpanded, onToggleCc, onIn
         const picked = (crew ?? []).find(lane => lane.lane === lanePick)
         if (!picked) return null
         const label = crewLabels(crew ?? []).get(picked.lane) ?? laneLabel(picked.lane)
-        const detail = laneStatus ?? null
+        // 只有响应自报的 lane 与选中 lane 一致，才把它当这条 lane 自己的进度；
+        // 旧服务端忽略 ?lane= 返回 main lane（工单级）状态，绝不能拿来顶替别的 lane。
+        const detail = laneStatus && laneStatus.lane === picked.lane ? laneStatus : null
+        const foreign = !!laneStatus && laneStatus.lane !== picked.lane
         return <div data-pane-lane-detail={`${ticket.id}:${picked.lane}`}
           style={{ marginTop: 3, paddingTop: 4, borderTop: '1px dashed rgba(74,158,255,.55)',
             display: 'flex', flexDirection: 'column', gap: 3 }}>
@@ -900,13 +903,15 @@ function TicketBar({ ticket, activity, t, ccStatus, ccExpanded, onToggleCc, onIn
             <strong style={{ color: '#9ae6b4' }}>{label} 的实时进度</strong>
             {detail?.sessionId && <span style={{ fontFamily: 'monospace', opacity: 0.7 }}
               title="这条 lane 的 Claude Code 会话 id">会话 {detail.sessionId}</span>}
-            {!detail && <span style={{ opacity: 0.6 }}>读取中…</span>}
+            {!laneStatus && <span style={{ opacity: 0.6 }}>读取中…</span>}
             {detail && !detail.present && <span style={{ opacity: 0.6 }}>这条 lane 还没有执行记录</span>}
             {detail?.log && <span style={{ fontFamily: 'monospace', opacity: 0.5, minWidth: 0,
               overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={detail.log}>{detail.log}</span>}
             <span style={{ marginLeft: 'auto', opacity: 0.55 }}>再点该行返回工单级进度</span>
           </div>
-          <CcPanel status={detail} expanded busy={false} />
+          {foreign
+            ? <div style={{ opacity: 0.6, fontSize: 11.5 }}>该 worker 暂无独立输出</div>
+            : <CcPanel status={detail} expanded busy={false} />}
         </div>
       })()}
     </div>}
@@ -1711,7 +1716,11 @@ function PanePanel({ t }: { t: Translate }) {
         try {
           const info = await request(`${API}/cc/${encodeURIComponent(ticketId)}?lane=${encodeURIComponent(lane)}`)
           if (!live) return
-          if (info?.cc) setLaneStatuses(prev => ({ ...prev, [`${ticketId}:${lane}`]: info.cc as CcStatus }))
+          // 把响应自报的 lane 附到状态上：旧服务端忽略 ?lane= 时不带该字段，渲染端据此拒绝拿工单级状态冒充 lane。
+          if (info?.cc) setLaneStatuses(prev => ({
+            ...prev,
+            [`${ticketId}:${lane}`]: { ...(info.cc as CcStatus), lane: typeof info?.lane === 'string' ? info.lane : undefined },
+          }))
         } catch { /* 单个 lane 读不到就保持上一轮，不打扰用户 */ }
       }
     }
