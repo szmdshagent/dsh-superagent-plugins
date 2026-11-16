@@ -512,6 +512,25 @@ function laneLabel(name: string): string {
 }
 
 /**
+ * lane 目录名 → 显示名：leader1/leader2…、ccw 跨 leader 连续编号、散户 main/main1…
+ * 先排 leader1 管辖的 ccw，再排 leader2 的；不受管辖的散户按 lane 顺序叫 main、main1、main2…
+ */
+function crewLabels(lanes: CrewLane[]): Map<string, string> {
+  const labels = new Map<string, string>()
+  const leaders = lanes.filter(lane => lane.role === 'lead')
+  const workerOrder: string[] = []
+  for (const leader of leaders) {
+    for (const lane of lanes) if (lane.role === 'worker' && lane.leader === leader.lane) workerOrder.push(lane.lane)
+  }
+  for (const lane of lanes) if (lane.role === 'worker' && !workerOrder.includes(lane.lane)) workerOrder.push(lane.lane)
+  leaders.forEach((lane, index) => labels.set(lane.lane, `leader${index + 1}`))
+  workerOrder.forEach((lane, index) => labels.set(lane, `ccw${index + 1}`))
+  const standalone = lanes.filter(lane => lane.role !== 'lead' && lane.role !== 'worker')
+  standalone.forEach((lane, index) => labels.set(lane.lane, index === 0 ? 'main' : `main${index}`))
+  return labels
+}
+
+/**
  * 按 leader 把 lane 报成「1-n」：每个 leader 一组，n 是它管辖的 cc-worker 数；
  * 不受任何 leader 管辖的 lane 单独计数。多 leader 时组间用逗号连，
  * 例如 1-3,1-2,4 = 两个 leader 各带 3/2 个，另有 4 个不受管辖。
@@ -532,7 +551,7 @@ function crewScale(lanes: CrewLane[]) {
     group.count += 1
   }
   return { groups, leaders: leads.length, managed,
-    unmanaged: lanes.filter(lane => lane.role !== 'lead' && lane.role !== 'worker' && lane.lane !== 'main').length }
+    unmanaged: lanes.filter(lane => lane.role !== 'lead' && lane.role !== 'worker').length }
 }
 type Crew = {
   tickets: number
@@ -765,22 +784,23 @@ function TicketBar({ ticket, activity, t, ccStatus, ccExpanded, onToggleCc, onIn
         const lanes = crew ?? []
         if (lanes.length === 0) return null
         const running = lanes.filter(lane => lane.state === 'running').length
-        // 有 leader 时胶囊按 leader 逐组报「1-受管辖 cc 数」，组间逗号连，末尾补不受管辖数
-        // （如 1-4,1；多 leader 如 1-3,1-2,4）；没有 leader 的历史单沿用「协作 N · M 在跑」。
+        // 有 leader 时胶囊按 leader 逐组报「1-受管辖 cc 数」，组间逗号连，末尾补散户数
+        // （如 1-4,1；多 leader 如 1-3,1-2,4）；整单只有散户时只报散户数量，在跑数量只进悬浮标题。
         const scale = crewScale(lanes)
+        const labels = crewLabels(lanes)
         const team = scale.leaders > 0 || scale.managed > 0
         const caption = team
           ? `👥 协作 ${scale.groups.map(group => `1-${group.count}`).join(',')}`
             + `${scale.unmanaged > 0 ? `,${scale.unmanaged}` : ''}`
-          : `👥 协作 ${lanes.length}${running > 0 ? ` · ${running} 在跑` : ''}`
+          : `👥 协作 ${scale.unmanaged}`
         const summary = team
-          ? `这张工单下 ${scale.groups.map(group => `${group.leader} 带 ${group.count} 个 cc-worker`).join('，')}`
+          ? `这张工单下 ${scale.groups.map(group => `${labels.get(group.leader) ?? group.leader} 带 ${group.count} 个 cc-worker`).join('，')}`
             + `${scale.unmanaged > 0 ? `，另有 ${scale.unmanaged} 个 cc-worker 不受 leader 管辖` : ''}（${running} 个在跑）：`
-          : `这张工单下有 ${lanes.length} 个 cc-worker（${running} 个在跑）：`
+          : `这张工单下有 ${scale.unmanaged} 个 cc-worker（${running} 个在跑）：`
         return <span data-pane-ticket-crew={ticket.id}
           title={summary
-            + lanes.map(lane => `${laneLabel(lane.lane)} ${lane.state === 'running' ? '运行中' : '空闲'}`
-              + `${lane.role === 'lead' ? '（leader）' : lane.leader ? `（受 ${lane.leader} 管辖）` : ''}`
+            + lanes.map(lane => `${labels.get(lane.lane) ?? laneLabel(lane.lane)} ${lane.state === 'running' ? '运行中' : '空闲'}`
+              + `${lane.role === 'lead' ? `（${labels.get(lane.lane)}）` : lane.leader ? `（受 ${labels.get(lane.leader) ?? lane.leader} 管辖）` : ''}`
               + `${lane.task ? ' — ' + lane.task : ''}`).join('；')}
           style={{ fontSize: 11, fontWeight: 700, padding: '1px 8px', borderRadius: 10, flexShrink: 0,
             letterSpacing: 0.3, lineHeight: 1.5,
@@ -822,26 +842,29 @@ function TicketBar({ ticket, activity, t, ccStatus, ccExpanded, onToggleCc, onIn
         {(() => {
           const lanes = crew ?? []
           const scale = crewScale(lanes)
+          const labels = crewLabels(lanes)
           if (scale.leaders === 0 && scale.managed === 0) return <>👥 协作分工 · {lanes.length} 个 cc-worker</>
-          return <>👥 协作分工 · {scale.groups.map(group => `${group.leader} 带 ${group.count} 个`).join('，')}
+          return <>👥 协作分工 · {scale.groups.map(group => `${labels.get(group.leader) ?? group.leader} 带 ${group.count} 个`).join('，')}
             {scale.unmanaged > 0 ? `（另 ${scale.unmanaged} 个不受管辖）` : ''}</>
         })()}
       </div>
-      {(crew ?? []).map(lane => (
+      {(() => {
+        const labels = crewLabels(crew ?? [])
+        return (crew ?? []).map(lane => (
         <div key={lane.lane} style={{ display: 'flex', gap: 6, alignItems: 'baseline', fontSize: 11.5, minWidth: 0 }}>
           <span style={{ flexShrink: 0, fontSize: 9, color: lane.state === 'running' ? '#38a169' : '#777' }}>●</span>
           {(lane.role === 'lead' || lane.leader) && <span data-pane-lane-leader={lane.lane}
-            title={lane.role === 'lead' ? '这条 lane 是 leader（统筹），管辖受管辖的 cc-worker' : `这条 cc-worker 归 ${lane.leader} 管辖`}
+            title={lane.role === 'lead' ? '这条 lane 是 leader（统筹），管辖受管辖的 cc-worker' : `这条 cc-worker 归 ${labels.get(lane.leader ?? '') ?? lane.leader} 管辖`}
             style={{ flexShrink: 0, fontSize: 9.5, padding: '0 5px', borderRadius: 3, lineHeight: 1.5,
               background: lane.role === 'lead' ? '#5c4600' : '#3d4a1f',
               color: lane.role === 'lead' ? '#ffd96a' : '#c8e08a',
               border: '1px solid ' + (lane.role === 'lead' ? '#8a6a00' : '#5e7030') }}>
-            👑 {lane.role === 'lead' ? 'leader' : `${lane.leader} 管辖`}
+            👑 {lane.role === 'lead' ? labels.get(lane.lane) ?? 'leader' : `${labels.get(lane.leader ?? '') ?? lane.leader} 管辖`}
           </span>}
           <span style={{ flexShrink: 0, width: 58, fontWeight: 600, fontFamily: 'monospace',
             overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
             color: lane.state === 'running' ? '#9ae6b4' : '#aaa' }}
-            title={lane.lane}>{laneLabel(lane.lane)}</span>
+            title={lane.lane}>{labels.get(lane.lane) ?? laneLabel(lane.lane)}</span>
           <span style={{ flexShrink: 0, fontSize: 10, padding: '0 5px', borderRadius: 3,
             background: lane.state === 'running' ? '#1f4d33' : '#333',
             color: lane.state === 'running' ? '#9ae6b4' : '#999' }}>
@@ -852,7 +875,8 @@ function TicketBar({ ticket, activity, t, ccStatus, ccExpanded, onToggleCc, onIn
             {lane.task ?? <span style={{ opacity: 0.45 }}>未登记任务</span>}
           </span>
         </div>
-      ))}
+        ))
+      })()}
     </div>}
     {expanded && work && <div style={{ opacity: 0.88 }}>
       {work.phrase}{work.detail ? `（${work.detail}）` : ''}

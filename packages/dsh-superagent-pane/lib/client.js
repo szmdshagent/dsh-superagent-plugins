@@ -675,6 +675,21 @@ window.__ModuleLoader__.load({
 			return match ? `ccw${match[1]}` : name;
 		}
 		/**
+		* lane 目录名 → 显示名：leader1/leader2…、ccw 跨 leader 连续编号、散户 main/main1…
+		* 先排 leader1 管辖的 ccw，再排 leader2 的；不受管辖的散户按 lane 顺序叫 main、main1、main2…
+		*/
+		function crewLabels(lanes) {
+			const labels = /* @__PURE__ */ new Map();
+			const leaders = lanes.filter((lane) => lane.role === "lead");
+			const workerOrder = [];
+			for (const leader of leaders) for (const lane of lanes) if (lane.role === "worker" && lane.leader === leader.lane) workerOrder.push(lane.lane);
+			for (const lane of lanes) if (lane.role === "worker" && !workerOrder.includes(lane.lane)) workerOrder.push(lane.lane);
+			leaders.forEach((lane, index) => labels.set(lane.lane, `leader${index + 1}`));
+			workerOrder.forEach((lane, index) => labels.set(lane, `ccw${index + 1}`));
+			lanes.filter((lane) => lane.role !== "lead" && lane.role !== "worker").forEach((lane, index) => labels.set(lane.lane, index === 0 ? "main" : `main${index}`));
+			return labels;
+		}
+		/**
 		* 按 leader 把 lane 报成「1-n」：每个 leader 一组，n 是它管辖的 cc-worker 数；
 		* 不受任何 leader 管辖的 lane 单独计数。多 leader 时组间用逗号连，
 		* 例如 1-3,1-2,4 = 两个 leader 各带 3/2 个，另有 4 个不受管辖。
@@ -704,7 +719,7 @@ window.__ModuleLoader__.load({
 				groups,
 				leaders: leads.length,
 				managed,
-				unmanaged: lanes.filter((lane) => lane.role !== "lead" && lane.role !== "worker" && lane.lane !== "main").length
+				unmanaged: lanes.filter((lane) => lane.role !== "lead" && lane.role !== "worker").length
 			};
 		}
 		let governanceRoles = null;
@@ -1002,12 +1017,13 @@ window.__ModuleLoader__.load({
 								if (lanes.length === 0) return null;
 								const running = lanes.filter((lane) => lane.state === "running").length;
 								const scale = crewScale(lanes);
+								const labels = crewLabels(lanes);
 								const team = scale.leaders > 0 || scale.managed > 0;
-								const caption = team ? `👥 协作 ${scale.groups.map((group) => `1-${group.count}`).join(",")}${scale.unmanaged > 0 ? `,${scale.unmanaged}` : ""}` : `👥 协作 ${lanes.length}${running > 0 ? ` · ${running} 在跑` : ""}`;
-								const summary = team ? `这张工单下 ${scale.groups.map((group) => `${group.leader} 带 ${group.count} 个 cc-worker`).join("，")}${scale.unmanaged > 0 ? `，另有 ${scale.unmanaged} 个 cc-worker 不受 leader 管辖` : ""}（${running} 个在跑）：` : `这张工单下有 ${lanes.length} 个 cc-worker（${running} 个在跑）：`;
+								const caption = team ? `👥 协作 ${scale.groups.map((group) => `1-${group.count}`).join(",")}${scale.unmanaged > 0 ? `,${scale.unmanaged}` : ""}` : `👥 协作 ${scale.unmanaged}`;
+								const summary = team ? `这张工单下 ${scale.groups.map((group) => `${labels.get(group.leader) ?? group.leader} 带 ${group.count} 个 cc-worker`).join("，")}${scale.unmanaged > 0 ? `，另有 ${scale.unmanaged} 个 cc-worker 不受 leader 管辖` : ""}（${running} 个在跑）：` : `这张工单下有 ${scale.unmanaged} 个 cc-worker（${running} 个在跑）：`;
 								return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 									"data-pane-ticket-crew": ticket.id,
-									title: summary + lanes.map((lane) => `${laneLabel(lane.lane)} ${lane.state === "running" ? "运行中" : "空闲"}${lane.role === "lead" ? "（leader）" : lane.leader ? `（受 ${lane.leader} 管辖）` : ""}${lane.task ? " — " + lane.task : ""}`).join("；"),
+									title: summary + lanes.map((lane) => `${labels.get(lane.lane) ?? laneLabel(lane.lane)} ${lane.state === "running" ? "运行中" : "空闲"}${lane.role === "lead" ? `（${labels.get(lane.lane)}）` : lane.leader ? `（受 ${labels.get(lane.leader) ?? lane.leader} 管辖）` : ""}${lane.task ? " — " + lane.task : ""}`).join("；"),
 									style: {
 										fontSize: 11,
 										fontWeight: 700,
@@ -1127,6 +1143,7 @@ window.__ModuleLoader__.load({
 							children: (() => {
 								const lanes = crew ?? [];
 								const scale = crewScale(lanes);
+								const labels = crewLabels(lanes);
 								if (scale.leaders === 0 && scale.managed === 0) return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [
 									"👥 协作分工 · ",
 									lanes.length,
@@ -1134,83 +1151,86 @@ window.__ModuleLoader__.load({
 								] });
 								return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [
 									"👥 协作分工 · ",
-									scale.groups.map((group) => `${group.leader} 带 ${group.count} 个`).join("，"),
+									scale.groups.map((group) => `${labels.get(group.leader) ?? group.leader} 带 ${group.count} 个`).join("，"),
 									scale.unmanaged > 0 ? `（另 ${scale.unmanaged} 个不受管辖）` : ""
 								] });
 							})()
-						}), (crew ?? []).map((lane) => /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
-							style: {
-								display: "flex",
-								gap: 6,
-								alignItems: "baseline",
-								fontSize: 11.5,
-								minWidth: 0
-							},
-							children: [
-								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-									style: {
-										flexShrink: 0,
-										fontSize: 9,
-										color: lane.state === "running" ? "#38a169" : "#777"
-									},
-									children: "●"
-								}),
-								(lane.role === "lead" || lane.leader) && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
-									"data-pane-lane-leader": lane.lane,
-									title: lane.role === "lead" ? "这条 lane 是 leader（统筹），管辖受管辖的 cc-worker" : `这条 cc-worker 归 ${lane.leader} 管辖`,
-									style: {
-										flexShrink: 0,
-										fontSize: 9.5,
-										padding: "0 5px",
-										borderRadius: 3,
-										lineHeight: 1.5,
-										background: lane.role === "lead" ? "#5c4600" : "#3d4a1f",
-										color: lane.role === "lead" ? "#ffd96a" : "#c8e08a",
-										border: "1px solid " + (lane.role === "lead" ? "#8a6a00" : "#5e7030")
-									},
-									children: ["👑 ", lane.role === "lead" ? "leader" : `${lane.leader} 管辖`]
-								}),
-								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-									style: {
-										flexShrink: 0,
-										width: 58,
-										fontWeight: 600,
-										fontFamily: "monospace",
-										overflow: "hidden",
-										textOverflow: "ellipsis",
-										whiteSpace: "nowrap",
-										color: lane.state === "running" ? "#9ae6b4" : "#aaa"
-									},
-									title: lane.lane,
-									children: laneLabel(lane.lane)
-								}),
-								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-									style: {
-										flexShrink: 0,
-										fontSize: 10,
-										padding: "0 5px",
-										borderRadius: 3,
-										background: lane.state === "running" ? "#1f4d33" : "#333",
-										color: lane.state === "running" ? "#9ae6b4" : "#999"
-									},
-									children: lane.state === "running" ? "运行中" : "空闲"
-								}),
-								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-									style: {
-										minWidth: 0,
-										overflow: "hidden",
-										textOverflow: "ellipsis",
-										whiteSpace: "nowrap",
-										color: "#ddd"
-									},
-									title: lane.task ?? "该 lane 没有登记任务",
-									children: lane.task ?? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-										style: { opacity: .45 },
-										children: "未登记任务"
+						}), (() => {
+							const labels = crewLabels(crew ?? []);
+							return (crew ?? []).map((lane) => /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+								style: {
+									display: "flex",
+									gap: 6,
+									alignItems: "baseline",
+									fontSize: 11.5,
+									minWidth: 0
+								},
+								children: [
+									/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+										style: {
+											flexShrink: 0,
+											fontSize: 9,
+											color: lane.state === "running" ? "#38a169" : "#777"
+										},
+										children: "●"
+									}),
+									(lane.role === "lead" || lane.leader) && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+										"data-pane-lane-leader": lane.lane,
+										title: lane.role === "lead" ? "这条 lane 是 leader（统筹），管辖受管辖的 cc-worker" : `这条 cc-worker 归 ${labels.get(lane.leader ?? "") ?? lane.leader} 管辖`,
+										style: {
+											flexShrink: 0,
+											fontSize: 9.5,
+											padding: "0 5px",
+											borderRadius: 3,
+											lineHeight: 1.5,
+											background: lane.role === "lead" ? "#5c4600" : "#3d4a1f",
+											color: lane.role === "lead" ? "#ffd96a" : "#c8e08a",
+											border: "1px solid " + (lane.role === "lead" ? "#8a6a00" : "#5e7030")
+										},
+										children: ["👑 ", lane.role === "lead" ? labels.get(lane.lane) ?? "leader" : `${labels.get(lane.leader ?? "") ?? lane.leader} 管辖`]
+									}),
+									/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+										style: {
+											flexShrink: 0,
+											width: 58,
+											fontWeight: 600,
+											fontFamily: "monospace",
+											overflow: "hidden",
+											textOverflow: "ellipsis",
+											whiteSpace: "nowrap",
+											color: lane.state === "running" ? "#9ae6b4" : "#aaa"
+										},
+										title: lane.lane,
+										children: labels.get(lane.lane) ?? laneLabel(lane.lane)
+									}),
+									/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+										style: {
+											flexShrink: 0,
+											fontSize: 10,
+											padding: "0 5px",
+											borderRadius: 3,
+											background: lane.state === "running" ? "#1f4d33" : "#333",
+											color: lane.state === "running" ? "#9ae6b4" : "#999"
+										},
+										children: lane.state === "running" ? "运行中" : "空闲"
+									}),
+									/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+										style: {
+											minWidth: 0,
+											overflow: "hidden",
+											textOverflow: "ellipsis",
+											whiteSpace: "nowrap",
+											color: "#ddd"
+										},
+										title: lane.task ?? "该 lane 没有登记任务",
+										children: lane.task ?? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											style: { opacity: .45 },
+											children: "未登记任务"
+										})
 									})
-								})
-							]
-						}, lane.lane))]
+								]
+							}, lane.lane));
+						})()]
 					}),
 					expanded && work && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 						style: { opacity: .88 },
