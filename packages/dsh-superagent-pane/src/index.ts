@@ -395,16 +395,29 @@ function readLanes(dir: string): CrewLaneView[] {
   if (!dir) return []
   const out: CrewLaneView[] = []
   const root = join(dir, '.cc-worker')
-  // team 模式由 cc-worker 的阶段 1 写出 team-plan.json，列出的 lane 就是 lead 统领的子任务。
+  // team 模式由 cc-worker 的阶段 1 写出 team-plan.json。两种写法都认，都是「leader lane → 它管辖的 lane」：
+  //   数组 [{lane,task}]       → 这些 lane 全归名为 lead 的统筹 lane 管（旧格式，单 leader）
+  //   对象 {lead1:[ccw1,…]}    → 每个键都是一个 leader lane，值归它管（多 leader）
   // 计划文件不存在（历史单/非 team 单）时所有 lane 都算 other，面板上不显示 leader。
-  const planned = (): Set<string> => {
+  const planned = (): Map<string, string[]> => {
+    const map = new Map<string, string[]>()
     try {
       const data: any = JSON.parse(readFileSync(join(root, 'team-plan.json'), 'utf8'))
-      if (!Array.isArray(data)) return new Set()
-      return new Set(data.map(item => (typeof item?.lane === 'string' ? item.lane.trim() : '')).filter(Boolean))
-    } catch { return new Set() }
+      if (Array.isArray(data)) {
+        const lanes = data.map(item => (typeof item?.lane === 'string' ? item.lane.trim() : '')).filter(Boolean)
+        if (lanes.length > 0) map.set('lead', lanes)
+        return map
+      }
+      if (data && typeof data === 'object') {
+        for (const [key, members] of Object.entries(data)) {
+          const leader = key.trim()
+          if (!leader || !Array.isArray(members)) continue
+          map.set(leader, members.filter((lane): lane is string => typeof lane === 'string').map(lane => lane.trim()).filter(Boolean))
+        }
+      }
+    } catch { /* 没有或坏文件：当作没有计划 */ }
+    return map
   }
-  const leaderLane = 'lead'
   const alive = (base: string): boolean => {
     try {
       const pid = Number(readFileSync(join(base, 'claude.pid'), 'utf8').trim())
@@ -420,16 +433,22 @@ function readLanes(dir: string): CrewLaneView[] {
       return text ? text.slice(0, 160) : undefined
     } catch { return undefined }
   }
-  const view = (base: string, lane: string, state: 'running' | 'idle', role: LaneRole): CrewLaneView =>
-    ({ lane, state, task: taskOf(base), role, ...(role === 'worker' ? { leader: leaderLane } : {}) })
+  const view = (base: string, lane: string, state: 'running' | 'idle', role: LaneRole, leader?: string): CrewLaneView =>
+    ({ lane, state, task: taskOf(base), role, ...(role === 'worker' && leader ? { leader } : {}) })
   try {
     const plan = planned()
+    const leaderOf = (lane: string): string | undefined => {
+      for (const [leader, members] of plan) if (members.includes(lane)) return leader
+      return undefined
+    }
     if (alive(root)) out.push(view(root, 'main', 'running', 'other'))
     for (const name of readdirSync(join(root, 'lanes'), { withFileTypes: true })) {
       if (!name.isDirectory()) continue
       const base = join(root, 'lanes', name.name)
-      const role: LaneRole = name.name === leaderLane ? 'lead' : plan.has(name.name) ? 'worker' : 'other'
-      out.push(view(base, name.name, alive(base) ? 'running' : 'idle', role))
+      // 名为 lead 的 lane 仍是历史约定里的统筹 lane，即使没有 team-plan 也按 leader 显示。
+      const leader = leaderOf(name.name)
+      const role: LaneRole = name.name === 'lead' || plan.has(name.name) ? 'lead' : leader ? 'worker' : 'other'
+      out.push(view(base, name.name, alive(base) ? 'running' : 'idle', role, leader))
     }
   } catch { /* 目录不存在或不可读：没有 lane */ }
   return out

@@ -927,15 +927,22 @@ function readLanes(dir) {
 	const out = [];
 	const root = join(dir, ".cc-worker");
 	const planned = () => {
+		const map = /* @__PURE__ */ new Map();
 		try {
 			const data = JSON.parse(readFileSync(join(root, "team-plan.json"), "utf8"));
-			if (!Array.isArray(data)) return /* @__PURE__ */ new Set();
-			return new Set(data.map((item) => typeof item?.lane === "string" ? item.lane.trim() : "").filter(Boolean));
-		} catch {
-			return /* @__PURE__ */ new Set();
-		}
+			if (Array.isArray(data)) {
+				const lanes = data.map((item) => typeof item?.lane === "string" ? item.lane.trim() : "").filter(Boolean);
+				if (lanes.length > 0) map.set("lead", lanes);
+				return map;
+			}
+			if (data && typeof data === "object") for (const [key, members] of Object.entries(data)) {
+				const leader = key.trim();
+				if (!leader || !Array.isArray(members)) continue;
+				map.set(leader, members.filter((lane) => typeof lane === "string").map((lane) => lane.trim()).filter(Boolean));
+			}
+		} catch {}
+		return map;
 	};
-	const leaderLane = "lead";
 	const alive = (base) => {
 		try {
 			const pid = Number(readFileSync(join(base, "claude.pid"), "utf8").trim());
@@ -953,21 +960,25 @@ function readLanes(dir) {
 			return;
 		}
 	};
-	const view = (base, lane, state, role) => ({
+	const view = (base, lane, state, role, leader) => ({
 		lane,
 		state,
 		task: taskOf(base),
 		role,
-		...role === "worker" ? { leader: leaderLane } : {}
+		...role === "worker" && leader ? { leader } : {}
 	});
 	try {
 		const plan = planned();
+		const leaderOf = (lane) => {
+			for (const [leader, members] of plan) if (members.includes(lane)) return leader;
+		};
 		if (alive(root)) out.push(view(root, "main", "running", "other"));
 		for (const name of readdirSync(join(root, "lanes"), { withFileTypes: true })) {
 			if (!name.isDirectory()) continue;
 			const base = join(root, "lanes", name.name);
-			const role = name.name === leaderLane ? "lead" : plan.has(name.name) ? "worker" : "other";
-			out.push(view(base, name.name, alive(base) ? "running" : "idle", role));
+			const leader = leaderOf(name.name);
+			const role = name.name === "lead" || plan.has(name.name) ? "lead" : leader ? "worker" : "other";
+			out.push(view(base, name.name, alive(base) ? "running" : "idle", role, leader));
 		}
 	} catch {}
 	return out;

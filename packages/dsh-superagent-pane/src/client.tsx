@@ -510,6 +510,30 @@ function laneLabel(name: string): string {
   const match = /^w(\d+)$/.exec(name)
   return match ? `ccw${match[1]}` : name
 }
+
+/**
+ * 按 leader 把 lane 报成「1-n」：每个 leader 一组，n 是它管辖的 cc-worker 数；
+ * 不受任何 leader 管辖的 lane 单独计数。多 leader 时组间用逗号连，
+ * 例如 1-3,1-2,4 = 两个 leader 各带 3/2 个，另有 4 个不受管辖。
+ * main 是工单自己的主 worker，不是团队 lane，不计进「不受管辖」。
+ */
+function crewScale(lanes: CrewLane[]) {
+  const leads = lanes.filter(lane => lane.role === 'lead')
+  const groups = leads.map(lane => ({ leader: lane.lane, count: 0 }))
+  let managed = 0
+  for (const lane of lanes) {
+    if (lane.role !== 'worker') continue
+    managed += 1
+    let group = groups.find(item => item.leader === lane.leader)
+    if (!group) {
+      group = { leader: lane.leader ?? 'lead', count: 0 }
+      groups.push(group)
+    }
+    group.count += 1
+  }
+  return { groups, leaders: leads.length, managed,
+    unmanaged: lanes.filter(lane => lane.role !== 'lead' && lane.role !== 'worker' && lane.lane !== 'main').length }
+}
 type Crew = {
   tickets: number
   active: number
@@ -741,18 +765,17 @@ function TicketBar({ ticket, activity, t, ccStatus, ccExpanded, onToggleCc, onIn
         const lanes = crew ?? []
         if (lanes.length === 0) return null
         const running = lanes.filter(lane => lane.state === 'running').length
-        // 有 leader 时胶囊改报「leader 数-受管辖 cc 数,不受管辖 cc 数」（如 1-4,1）；
-        // 没有 leader 的历史单沿用「协作 N · M 在跑」。
-        const leaders = lanes.filter(lane => lane.role === 'lead').length
-        const managed = lanes.filter(lane => lane.role === 'worker').length
-        const unmanaged = lanes.length - leaders - managed
-        const team = leaders > 0 || managed > 0
+        // 有 leader 时胶囊按 leader 逐组报「1-受管辖 cc 数」，组间逗号连，末尾补不受管辖数
+        // （如 1-4,1；多 leader 如 1-3,1-2,4）；没有 leader 的历史单沿用「协作 N · M 在跑」。
+        const scale = crewScale(lanes)
+        const team = scale.leaders > 0 || scale.managed > 0
         const caption = team
-          ? `👥 协作 ${leaders}-${managed}${unmanaged > 0 ? `,${unmanaged}` : ''}`
+          ? `👥 协作 ${scale.groups.map(group => `1-${group.count}`).join(',')}`
+            + `${scale.unmanaged > 0 ? `,${scale.unmanaged}` : ''}`
           : `👥 协作 ${lanes.length}${running > 0 ? ` · ${running} 在跑` : ''}`
         const summary = team
-          ? `这张工单下有 ${leaders} 个 leader 带 ${managed} 个 cc-worker`
-            + `${unmanaged > 0 ? `，另有 ${unmanaged} 个 cc-worker 不受 leader 管辖` : ''}（${running} 个在跑）：`
+          ? `这张工单下 ${scale.groups.map(group => `${group.leader} 带 ${group.count} 个 cc-worker`).join('，')}`
+            + `${scale.unmanaged > 0 ? `，另有 ${scale.unmanaged} 个 cc-worker 不受 leader 管辖` : ''}（${running} 个在跑）：`
           : `这张工单下有 ${lanes.length} 个 cc-worker（${running} 个在跑）：`
         return <span data-pane-ticket-crew={ticket.id}
           title={summary
@@ -798,12 +821,10 @@ function TicketBar({ ticket, activity, t, ccStatus, ccExpanded, onToggleCc, onIn
       <div style={{ fontSize: 12, fontWeight: 700, color: '#7cb8ff', letterSpacing: 0.2 }}>
         {(() => {
           const lanes = crew ?? []
-          const leaders = lanes.filter(lane => lane.role === 'lead').length
-          const managed = lanes.filter(lane => lane.role === 'worker').length
-          const unmanaged = lanes.length - leaders - managed
-          if (leaders === 0 && managed === 0) return <>👥 协作分工 · {lanes.length} 个 cc-worker</>
-          return <>👥 协作分工 · {leaders} 个 leader 带 {managed} 个 cc-worker
-            {unmanaged > 0 ? `（另 ${unmanaged} 个不受管辖）` : ''}</>
+          const scale = crewScale(lanes)
+          if (scale.leaders === 0 && scale.managed === 0) return <>👥 协作分工 · {lanes.length} 个 cc-worker</>
+          return <>👥 协作分工 · {scale.groups.map(group => `${group.leader} 带 ${group.count} 个`).join('，')}
+            {scale.unmanaged > 0 ? `（另 ${scale.unmanaged} 个不受管辖）` : ''}</>
         })()}
       </div>
       {(crew ?? []).map(lane => (
