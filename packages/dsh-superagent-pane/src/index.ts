@@ -11,7 +11,7 @@ import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { z } from 'zod'
 import { key, type Trigger } from 'dsh-superagent'
-import { readCcStatus, requestInterrupt, clearInterrupt, probeExecutor } from './ccvis.ts'
+import { readCcStatus, requestInterrupt, clearInterrupt, probeExecutor, normalizeLane } from './ccvis.ts'
 import { ticketHealth, type ExecutorSignals } from './health.ts'
 import { appendLog as appendLogShared, logKey as logKeyShared } from './log.ts'
 import { nextOccurrence, scheduleKey, SCHEDULE_PREFIX, type PaneSchedule, type ScheduleSpec } from './schedule.ts'
@@ -1207,12 +1207,23 @@ function paneHandler(ctx: any) {
         return
       }
       // GET /orchestrator/api/pane/cc/<工单 id> —— 该工单交给 Claude Code 的执行实况（只读）。
+      // 带 ?lane=<lane> 时只看这一条 lane 的实况：main → .cc-worker，其它 → .cc-worker/lanes/<lane>。
+      // 不带 lane 时行为与以前完全一致（工单级聚合）。
       const ccMatch = /^\/orchestrator\/api\/pane\/cc\/([A-Za-z0-9_-]+)$/.exec(url.pathname)
       if (req.method === 'GET' && ccMatch) {
         const ticketId = ccMatch[1]!
         const ticket = findTicket(ctx, ticketId)
         if (!ticket) { sendJson(res, 404, { error: 'ticket not found' }); return }
         const dir = String(ticket.execution?.directory ?? '')
+        const laneParam = url.searchParams.get('lane')
+        if (laneParam) {
+          const lane = normalizeLane(laneParam)
+          if (!dir) { sendJson(res, 200, { ticketId, directory: '', lane, sessionId: undefined,
+            cc: { present: false, state: 'none', steps: [], interruptRequested: false, alert: 'none' } }); return }
+          const cc = readCcStatus(dir, lane)
+          sendJson(res, 200, { ticketId, directory: dir, lane, sessionId: cc.sessionId, cc })
+          return
+        }
         if (!dir) { sendJson(res, 200, { ticketId, directory: '', cc: { present: false, state: 'none', steps: [], interruptRequested: false, alert: 'none' } }); return }
         sendJson(res, 200, { ticketId, directory: dir, cc: readCcStatus(dir) })
         return

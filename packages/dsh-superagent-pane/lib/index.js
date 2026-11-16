@@ -229,9 +229,9 @@ function clearInterrupt(dir) {
 	} catch {}
 	return false;
 }
-/** 读 cc-worker 的 stderr.log 最后一条有意义的内容。 */
-function stderrHint(dir) {
-	const path = join(dir, ".cc-worker", "stderr.log");
+/** 读 cc-worker 的 stderr.log 最后一条有意义的内容；入参是 lane 的工作根（workerDir）。 */
+function stderrHint(base) {
+	const path = join(base, "stderr.log");
 	try {
 		const stat = statSync(path);
 		const length = Math.min(stat.size, 4096);
@@ -251,8 +251,13 @@ function stderrHint(dir) {
 		return;
 	}
 }
-/** 汇总一个工单目录的 CC 执行状态。 */
-function readCcStatus(dir) {
+/**
+* 汇总一个工单目录的 CC 执行状态。
+*
+* `lane` 省略 / 'main' 时读 `.cc-worker`（与旧行为完全一致）；其它 lane 读 `.cc-worker/lanes/<lane>`，
+* 这样面板可以单独查看某个 worker 的执行实况。
+*/
+function readCcStatus(dir, lane) {
 	const empty = {
 		present: false,
 		state: "none",
@@ -261,20 +266,22 @@ function readCcStatus(dir) {
 		alert: "none"
 	};
 	if (!dir) return empty;
-	const file = latestEventFile(dir);
+	const base = workerDir(dir, lane);
+	const interrupt = join(base, "interrupt");
+	const file = latestEventFile(dir, lane);
 	if (!file) return {
 		...empty,
-		interruptRequested: existsSync(interruptPath(dir))
+		interruptRequested: existsSync(interrupt)
 	};
 	const { events, mtime } = readTail(file);
 	if (!events.length) return {
 		...empty,
 		present: true,
-		interruptRequested: existsSync(interruptPath(dir))
+		interruptRequested: existsSync(interrupt)
 	};
 	const described = describe(events);
 	const ageMs = Math.max(0, Date.now() - mtime);
-	const interruptRequested = existsSync(interruptPath(dir));
+	const interruptRequested = existsSync(interrupt);
 	let state = described.state;
 	let alert = "none";
 	let alertText;
@@ -305,7 +312,7 @@ function readCcStatus(dir) {
 		interruptRequested,
 		alert,
 		alertText,
-		error: described.error ?? (state === "error" || alert === "critical" ? stderrHint(dir) : void 0)
+		error: described.error ?? (state === "error" || alert === "critical" ? stderrHint(base) : void 0)
 	};
 }
 /** 探测一个工单目录的执行活跃度；目录缺失/无产物时返回空对象（不编造信号）。 */
@@ -1766,6 +1773,35 @@ function paneHandler(ctx) {
 					return;
 				}
 				const dir = String(ticket.execution?.directory ?? "");
+				const laneParam = url.searchParams.get("lane");
+				if (laneParam) {
+					const lane = normalizeLane(laneParam);
+					if (!dir) {
+						sendJson(res, 200, {
+							ticketId,
+							directory: "",
+							lane,
+							sessionId: void 0,
+							cc: {
+								present: false,
+								state: "none",
+								steps: [],
+								interruptRequested: false,
+								alert: "none"
+							}
+						});
+						return;
+					}
+					const cc = readCcStatus(dir, lane);
+					sendJson(res, 200, {
+						ticketId,
+						directory: dir,
+						lane,
+						sessionId: cc.sessionId,
+						cc
+					});
+					return;
+				}
 				if (!dir) {
 					sendJson(res, 200, {
 						ticketId,

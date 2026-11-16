@@ -271,9 +271,9 @@ export function clearInterrupt(dir: string): boolean {
   return false
 }
 
-/** 读 cc-worker 的 stderr.log 最后一条有意义的内容。 */
-function stderrHint(dir: string): string | undefined {
-  const path = join(dir, '.cc-worker', 'stderr.log')
+/** 读 cc-worker 的 stderr.log 最后一条有意义的内容；入参是 lane 的工作根（workerDir）。 */
+function stderrHint(base: string): string | undefined {
+  const path = join(base, 'stderr.log')
   try {
     const stat = statSync(path)
     const length = Math.min(stat.size, 4096)
@@ -292,18 +292,25 @@ function stderrHint(dir: string): string | undefined {
   } catch { return undefined }
 }
 
-/** 汇总一个工单目录的 CC 执行状态。 */
-export function readCcStatus(dir: string): CcStatus {
+/**
+ * 汇总一个工单目录的 CC 执行状态。
+ *
+ * `lane` 省略 / 'main' 时读 `.cc-worker`（与旧行为完全一致）；其它 lane 读 `.cc-worker/lanes/<lane>`，
+ * 这样面板可以单独查看某个 worker 的执行实况。
+ */
+export function readCcStatus(dir: string, lane?: string | null): CcStatus {
   const empty: CcStatus = { present: false, state: 'none', steps: [], interruptRequested: false, alert: 'none' }
   if (!dir) return empty
-  const file = latestEventFile(dir)
-  if (!file) return { ...empty, interruptRequested: existsSync(interruptPath(dir)) }
+  const base = workerDir(dir, lane)
+  const interrupt = join(base, 'interrupt')
+  const file = latestEventFile(dir, lane)
+  if (!file) return { ...empty, interruptRequested: existsSync(interrupt) }
   const { events, mtime } = readTail(file)
-  if (!events.length) return { ...empty, present: true, interruptRequested: existsSync(interruptPath(dir)) }
+  if (!events.length) return { ...empty, present: true, interruptRequested: existsSync(interrupt) }
   const described = describe(events)
   const now = Date.now()
   const ageMs = Math.max(0, now - mtime)
-  const interruptRequested = existsSync(interruptPath(dir))
+  const interruptRequested = existsSync(interrupt)
 
   let state = described.state
   let alert: CcStatus['alert'] = 'none'
@@ -336,7 +343,7 @@ export function readCcStatus(dir: string): CcStatus {
     interruptRequested,
     alert,
     alertText,
-    error: described.error ?? (state === 'error' || alert === 'critical' ? stderrHint(dir) : undefined),
+    error: described.error ?? (state === 'error' || alert === 'critical' ? stderrHint(base) : undefined),
   }
 }
 

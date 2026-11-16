@@ -84,7 +84,7 @@ window.__ModuleLoader__.load({
 									"前有动作"
 								]
 							}),
-							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+							onToggle && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
 								type: "button",
 								onClick: onToggle,
 								style: {
@@ -167,7 +167,7 @@ window.__ModuleLoader__.load({
 							]
 						}, step.step))
 					}),
-					running && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", { children: [status.interruptRequested ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+					running && onInterrupt && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", { children: [status.interruptRequested ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 						style: { color: "#dd6b20" },
 						children: "已请求中止，等待 cc-worker 响应…"
 					}) : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
@@ -180,7 +180,7 @@ window.__ModuleLoader__.load({
 							cursor: busy ? "wait" : "pointer"
 						},
 						children: "中止执行"
-					}), status.interruptRequested && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+					}), status.interruptRequested && onClear && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
 						type: "button",
 						disabled: busy,
 						onClick: onClear,
@@ -914,7 +914,7 @@ window.__ModuleLoader__.load({
 		/** 状态条里的圆点：运行中呼吸闪烁，其余静态。 */
 		const DOT_STYLE = `.dsh-pane-dot-running{animation:dsh-pane-pulse 1.6s ease-in-out infinite}@keyframes dsh-pane-pulse{0%,100%{opacity:1}50%{opacity:.35}}`;
 		/** 对话上方的一条工单状态条：哪个工单、到哪一步、worker 此刻在做什么（说人话，详情可展开原始命令）。 */
-		function TicketBar({ ticket, activity, t, ccStatus, ccExpanded, onToggleCc, onInterrupt, onClear, ccBusy, health, confirmStop, onClose, onComment, onOpenComment, crew }) {
+		function TicketBar({ ticket, activity, t, ccStatus, ccExpanded, onToggleCc, onInterrupt, onClear, ccBusy, health, confirmStop, onClose, onComment, onOpenComment, crew, lanePick, laneStatus, onPickLane }) {
 			const [open, setOpen] = (0, react.useState)(false);
 			const stage = ticket.stage ?? "ended";
 			const zombie = health?.health === "zombie";
@@ -1133,104 +1133,195 @@ window.__ModuleLoader__.load({
 							flexDirection: "column",
 							gap: 3
 						},
-						children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
-							style: {
-								fontSize: 12,
-								fontWeight: 700,
-								color: "#7cb8ff",
-								letterSpacing: .2
-							},
-							children: (() => {
-								const lanes = crew ?? [];
-								const scale = crewScale(lanes);
-								const labels = crewLabels(lanes);
-								if (scale.leaders === 0 && scale.managed === 0) return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [
-									"👥 协作分工 · ",
-									lanes.length,
-									" 个 cc-worker"
-								] });
-								return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [
-									"👥 协作分工 · ",
-									scale.groups.map((group) => `${labels.get(group.leader) ?? group.leader} 带 ${group.count} 个`).join("，"),
-									scale.unmanaged > 0 ? `（另 ${scale.unmanaged} 个不受管辖）` : ""
-								] });
-							})()
-						}), (() => {
-							const labels = crewLabels(crew ?? []);
-							return (crew ?? []).map((lane) => /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+						children: [
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
 								style: {
-									display: "flex",
-									gap: 6,
-									alignItems: "baseline",
-									fontSize: 11.5,
-									minWidth: 0
+									fontSize: 12,
+									fontWeight: 700,
+									color: "#7cb8ff",
+									letterSpacing: .2
 								},
-								children: [
-									/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-										style: {
-											flexShrink: 0,
-											fontSize: 9,
-											color: lane.state === "running" ? "#38a169" : "#777"
-										},
-										children: "●"
-									}),
-									(lane.role === "lead" || lane.leader) && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
-										"data-pane-lane-leader": lane.lane,
-										title: lane.role === "lead" ? "这条 lane 是 leader（统筹），管辖受管辖的 cc-worker" : `这条 cc-worker 归 ${labels.get(lane.leader ?? "") ?? lane.leader} 管辖`,
-										style: {
-											flexShrink: 0,
-											fontSize: 9.5,
-											padding: "0 5px",
-											borderRadius: 3,
-											lineHeight: 1.5,
-											background: lane.role === "lead" ? "#5c4600" : "#3d4a1f",
-											color: lane.role === "lead" ? "#ffd96a" : "#c8e08a",
-											border: "1px solid " + (lane.role === "lead" ? "#8a6a00" : "#5e7030")
-										},
-										children: ["👑 ", lane.role === "lead" ? labels.get(lane.lane) ?? "leader" : `${labels.get(lane.leader ?? "") ?? lane.leader} 管辖`]
-									}),
-									/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-										style: {
-											flexShrink: 0,
-											width: 58,
-											fontWeight: 600,
-											fontFamily: "monospace",
-											overflow: "hidden",
-											textOverflow: "ellipsis",
-											whiteSpace: "nowrap",
-											color: lane.state === "running" ? "#9ae6b4" : "#aaa"
-										},
-										title: lane.lane,
-										children: labels.get(lane.lane) ?? laneLabel(lane.lane)
-									}),
-									/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-										style: {
-											flexShrink: 0,
-											fontSize: 10,
-											padding: "0 5px",
-											borderRadius: 3,
-											background: lane.state === "running" ? "#1f4d33" : "#333",
-											color: lane.state === "running" ? "#9ae6b4" : "#999"
-										},
-										children: lane.state === "running" ? "运行中" : "空闲"
-									}),
-									/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-										style: {
-											minWidth: 0,
-											overflow: "hidden",
-											textOverflow: "ellipsis",
-											whiteSpace: "nowrap",
-											color: "#ddd"
-										},
-										title: lane.task ?? "该 lane 没有登记任务",
-										children: lane.task ?? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-											style: { opacity: .45 },
-											children: "未登记任务"
+								children: (() => {
+									const lanes = crew ?? [];
+									const scale = crewScale(lanes);
+									const labels = crewLabels(lanes);
+									if (scale.leaders === 0 && scale.managed === 0) return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [
+										"👥 协作分工 · ",
+										lanes.length,
+										" 个 cc-worker"
+									] });
+									return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [
+										"👥 协作分工 · ",
+										scale.groups.map((group) => `${labels.get(group.leader) ?? group.leader} 带 ${group.count} 个`).join("，"),
+										scale.unmanaged > 0 ? `（另 ${scale.unmanaged} 个不受管辖）` : ""
+									] });
+								})()
+							}),
+							(() => {
+								const labels = crewLabels(crew ?? []);
+								return (crew ?? []).map((lane) => /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
+									type: "button",
+									"data-pane-lane-pick": lane.lane,
+									"aria-pressed": lanePick === lane.lane,
+									title: lanePick === lane.lane ? "再点一次取消选择，回到工单级进度" : "点击查看这条 lane 自己的实时进度",
+									onClick: (event) => {
+										event.stopPropagation();
+										onPickLane?.(lane.lane);
+									},
+									style: {
+										display: "flex",
+										gap: 6,
+										alignItems: "baseline",
+										fontSize: 11.5,
+										minWidth: 0,
+										width: "100%",
+										textAlign: "left",
+										font: "inherit",
+										color: "inherit",
+										padding: "1px 3px",
+										borderRadius: 4,
+										cursor: onPickLane ? "pointer" : "default",
+										border: lanePick === lane.lane ? "1px solid #4a9eff" : "1px solid transparent",
+										background: lanePick === lane.lane ? "rgba(74,158,255,.32)" : "transparent"
+									},
+									children: [
+										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											style: {
+												flexShrink: 0,
+												fontSize: 9,
+												color: lane.state === "running" ? "#38a169" : "#777"
+											},
+											children: "●"
+										}),
+										(lane.role === "lead" || lane.leader) && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+											"data-pane-lane-leader": lane.lane,
+											title: lane.role === "lead" ? "这条 lane 是 leader（统筹），管辖受管辖的 cc-worker" : `这条 cc-worker 归 ${labels.get(lane.leader ?? "") ?? lane.leader} 管辖`,
+											style: {
+												flexShrink: 0,
+												fontSize: 9.5,
+												padding: "0 5px",
+												borderRadius: 3,
+												lineHeight: 1.5,
+												background: lane.role === "lead" ? "#5c4600" : "#3d4a1f",
+												color: lane.role === "lead" ? "#ffd96a" : "#c8e08a",
+												border: "1px solid " + (lane.role === "lead" ? "#8a6a00" : "#5e7030")
+											},
+											children: ["👑 ", lane.role === "lead" ? labels.get(lane.lane) ?? "leader" : `${labels.get(lane.leader ?? "") ?? lane.leader} 管辖`]
+										}),
+										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											style: {
+												flexShrink: 0,
+												width: 58,
+												fontWeight: 600,
+												fontFamily: "monospace",
+												overflow: "hidden",
+												textOverflow: "ellipsis",
+												whiteSpace: "nowrap",
+												color: lane.state === "running" ? "#9ae6b4" : "#aaa"
+											},
+											title: lane.lane,
+											children: labels.get(lane.lane) ?? laneLabel(lane.lane)
+										}),
+										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											style: {
+												flexShrink: 0,
+												fontSize: 10,
+												padding: "0 5px",
+												borderRadius: 3,
+												background: lane.state === "running" ? "#1f4d33" : "#333",
+												color: lane.state === "running" ? "#9ae6b4" : "#999"
+											},
+											children: lane.state === "running" ? "运行中" : "空闲"
+										}),
+										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											style: {
+												minWidth: 0,
+												overflow: "hidden",
+												textOverflow: "ellipsis",
+												whiteSpace: "nowrap",
+												color: "#ddd"
+											},
+											title: lane.task ?? "该 lane 没有登记任务",
+											children: lane.task ?? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+												style: { opacity: .45 },
+												children: "未登记任务"
+											})
 										})
-									})
-								]
-							}, lane.lane));
-						})()]
+									]
+								}, lane.lane));
+							})(),
+							(() => {
+								const picked = (crew ?? []).find((lane) => lane.lane === lanePick);
+								if (!picked) return null;
+								const label = crewLabels(crew ?? []).get(picked.lane) ?? laneLabel(picked.lane);
+								const detail = laneStatus ?? null;
+								return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+									"data-pane-lane-detail": `${ticket.id}:${picked.lane}`,
+									style: {
+										marginTop: 3,
+										paddingTop: 4,
+										borderTop: "1px dashed rgba(74,158,255,.55)",
+										display: "flex",
+										flexDirection: "column",
+										gap: 3
+									},
+									children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+										style: {
+											display: "flex",
+											gap: 6,
+											alignItems: "baseline",
+											flexWrap: "wrap",
+											fontSize: 11.5
+										},
+										children: [
+											/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("strong", {
+												style: { color: "#9ae6b4" },
+												children: [label, " 的实时进度"]
+											}),
+											detail?.sessionId && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+												style: {
+													fontFamily: "monospace",
+													opacity: .7
+												},
+												title: "这条 lane 的 Claude Code 会话 id",
+												children: ["会话 ", detail.sessionId]
+											}),
+											!detail && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+												style: { opacity: .6 },
+												children: "读取中…"
+											}),
+											detail && !detail.present && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+												style: { opacity: .6 },
+												children: "这条 lane 还没有执行记录"
+											}),
+											detail?.log && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+												style: {
+													fontFamily: "monospace",
+													opacity: .5,
+													minWidth: 0,
+													overflow: "hidden",
+													textOverflow: "ellipsis",
+													whiteSpace: "nowrap"
+												},
+												title: detail.log,
+												children: detail.log
+											}),
+											/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+												style: {
+													marginLeft: "auto",
+													opacity: .55
+												},
+												children: "再点该行返回工单级进度"
+											})
+										]
+									}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)(CcPanel, {
+										status: detail,
+										expanded: true,
+										busy: false
+									})]
+								});
+							})()
+						]
 					}),
 					expanded && work && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 						style: { opacity: .88 },
@@ -2050,6 +2141,10 @@ window.__ModuleLoader__.load({
 			const [ccStatuses, setCcStatuses] = (0, react.useState)({});
 			const [ccExpanded, setCcExpanded] = (0, react.useState)(false);
 			const [ccBusy, setCcBusy] = (0, react.useState)(false);
+			/** 每张工单在协作分工里选中查看的 lane（点行选中，再点同一行取消）。 */
+			const [lanePicks, setLanePicks] = (0, react.useState)({});
+			/** 被选中 lane 的实况，键是「工单 id:lane」，与工单级聚合互不影响。 */
+			const [laneStatuses, setLaneStatuses] = (0, react.useState)({});
 			const [healths, setHealths] = (0, react.useState)({});
 			/** 用户在面板里删掉（只是从下拉隐藏）的对话名，持久在 localStorage。 */
 			const [removedConversations, setRemovedConversations] = (0, react.useState)(() => rememberedRemovedConversations());
@@ -2301,6 +2396,44 @@ window.__ModuleLoader__.load({
 				const element = scrollRef.current;
 				if (element && pinnedRef.current) element.scrollTop = element.scrollHeight;
 			}, [items]);
+			/** 协作分工的行被点击：选中该 lane；再点同一行则取消，回到工单级聚合视图。 */
+			const pickLane = (0, react.useCallback)((ticketId, lane) => {
+				setLanePicks((prev) => {
+					if (prev[ticketId] === lane) {
+						const next = { ...prev };
+						delete next[ticketId];
+						return next;
+					}
+					return {
+						...prev,
+						[ticketId]: lane
+					};
+				});
+			}, []);
+			const laneKey = Object.entries(lanePicks).map(([id, lane]) => `${id}:${lane}`).sort().join("|");
+			(0, react.useEffect)(() => {
+				const picks = Object.entries(lanePicks);
+				if (picks.length === 0) return;
+				let live = true;
+				const read = async () => {
+					for (const [ticketId, lane] of picks) try {
+						const info = await request(`${API}/cc/${encodeURIComponent(ticketId)}?lane=${encodeURIComponent(lane)}`);
+						if (!live) return;
+						if (info?.cc) setLaneStatuses((prev) => ({
+							...prev,
+							[`${ticketId}:${lane}`]: info.cc
+						}));
+					} catch {}
+				};
+				read();
+				const timer = setInterval(() => {
+					if (live) read();
+				}, 2500);
+				return () => {
+					live = false;
+					clearInterval(timer);
+				};
+			}, [laneKey]);
 			/** 中止请求：写 interrupt 标记并立刻刷新一次。 */
 			const ccCommand = (0, react.useCallback)(async (ticketId, action) => {
 				setCcBusy(true);
@@ -2536,6 +2669,9 @@ window.__ModuleLoader__.load({
 							t,
 							ccStatus: ccStatuses[ticket.id] ?? null,
 							ccExpanded,
+							lanePick: lanePicks[ticket.id],
+							laneStatus: lanePicks[ticket.id] ? laneStatuses[`${ticket.id}:${lanePicks[ticket.id]}`] ?? null : null,
+							onPickLane: (lane) => pickLane(ticket.id, lane),
 							health: healths[ticket.id] ?? null,
 							onToggleCc: () => setCcExpanded((value) => !value),
 							ccBusy,

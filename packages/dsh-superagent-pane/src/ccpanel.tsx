@@ -51,9 +51,11 @@ export function formatAge(ms: number | undefined): string {
 type Props = {
   status: CcStatus | null
   expanded: boolean
-  onToggle: () => void
-  onInterrupt: () => void
-  onClear: () => void
+  /** 省略时不显示「展开/收起」链接（lane 详情里步骤默认全展开）。 */
+  onToggle?: () => void
+  /** 省略时不显示中止按钮：单 lane 视图不支持中断，避免误中止 main。 */
+  onInterrupt?: () => void
+  onClear?: () => void
   busy: boolean
 }
 
@@ -71,10 +73,10 @@ export function CcPanel({ status, expanded, onToggle, onInterrupt, onClear, busy
       <span style={{ opacity: 0.8 }}>{STATE_TEXT[status.state]}</span>
       {steps.length > 0 && <span style={{ opacity: 0.6 }}>第 {done}/{steps.length} 步</span>}
       {status.ageMs !== undefined && running && <span style={{ opacity: 0.6 }}>· {formatAge(status.ageMs)}前有动作</span>}
-      <button type="button" onClick={onToggle} style={{ marginLeft: 'auto', background: 'none', border: 'none', padding: 0,
+      {onToggle && <button type="button" onClick={onToggle} style={{ marginLeft: 'auto', background: 'none', border: 'none', padding: 0,
         color: 'inherit', opacity: 0.65, cursor: 'pointer', textDecoration: 'underline', fontSize: 11 }}>
         {expanded ? '收起' : '展开'}
-      </button>
+      </button>}
     </div>
     {status.current && running && <div style={{ opacity: 0.85, fontFamily: 'monospace', wordBreak: 'break-all' }}>
       {status.current.tool}{status.current.detail ? `：${status.current.detail.slice(0, 120)}` : ''}
@@ -92,12 +94,12 @@ export function CcPanel({ status, expanded, onToggle, onInterrupt, onClear, busy
         </div>
       ))}
     </div>}
-    {running && <div>
+    {running && onInterrupt && <div>
       {status.interruptRequested
         ? <span style={{ color: '#dd6b20' }}>已请求中止，等待 cc-worker 响应…</span>
         : <button type="button" disabled={busy} onClick={onInterrupt}
             style={{ fontSize: 11, padding: '2px 8px', cursor: busy ? 'wait' : 'pointer' }}>中止执行</button>}
-      {status.interruptRequested && <button type="button" disabled={busy} onClick={onClear}
+      {status.interruptRequested && onClear && <button type="button" disabled={busy} onClick={onClear}
         style={{ fontSize: 11, padding: '2px 8px', marginLeft: 6, cursor: busy ? 'wait' : 'pointer' }}>取消中止请求</button>}
     </div>}
   </div>
