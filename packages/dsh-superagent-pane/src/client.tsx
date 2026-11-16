@@ -803,11 +803,9 @@ function TicketBar({ ticket, activity, t, ccStatus, ccExpanded, onToggleCc, onIn
           ? `这张工单下 ${scale.groups.map(group => `${labels.get(group.leader) ?? group.leader} 带 ${group.count} 个 cc-worker`).join('，')}`
             + `${scale.unmanaged > 0 ? `，另有 ${scale.unmanaged} 个 cc-worker 不受 leader 管辖` : ''}（${running} 个在跑）：`
           : `这张工单下有 ${scale.unmanaged} 个 cc-worker（${running} 个在跑）：`
+        // 悬浮标题只保留一行汇总：逐 lane 明细已经在下方列表里，不再重复。
         return <span data-pane-ticket-crew={ticket.id}
-          title={summary
-            + lanes.map(lane => `${labels.get(lane.lane) ?? laneLabel(lane.lane)} ${lane.state === 'running' ? '运行中' : '空闲'}`
-              + `${lane.role === 'lead' ? `（${labels.get(lane.lane)}）` : lane.leader ? `（受 ${labels.get(lane.leader) ?? lane.leader} 管辖）` : ''}`
-              + `${lane.task ? ' — ' + lane.task : ''}`).join('；')}
+          title={summary.replace(/：$/, '')}
           style={{ fontSize: 11, fontWeight: 700, padding: '1px 8px', borderRadius: 10, flexShrink: 0,
             letterSpacing: 0.3, lineHeight: 1.5,
             border: running > 0 ? '1px solid #4a9eff' : '1px solid #555',
@@ -846,12 +844,9 @@ function TicketBar({ ticket, activity, t, ccStatus, ccExpanded, onToggleCc, onIn
         display: 'flex', flexDirection: 'column', gap: 3 }}>
       <div style={{ fontSize: 12, fontWeight: 700, color: '#7cb8ff', letterSpacing: 0.2 }}>
         {(() => {
-          const lanes = crew ?? []
-          const scale = crewScale(lanes)
-          const labels = crewLabels(lanes)
-          if (scale.leaders === 0 && scale.managed === 0) return <>👥 协作分工 · {lanes.length} 个 cc-worker</>
-          return <>👥 协作分工 · {scale.groups.map(group => `${labels.get(group.leader) ?? group.leader} 带 ${group.count} 个`).join('，')}
-            {scale.unmanaged > 0 ? `（另 ${scale.unmanaged} 个不受管辖）` : ''}</>
+          // 分工明细就是下面一行行 lane，表头只补一个「在跑」数，不再重复胶囊里的分组与数量。
+          const running = (crew ?? []).filter(lane => lane.state === 'running').length
+          return <>👥 协作分工{running > 0 ? ` · ${running} 在跑` : ''}</>
         })()}
       </div>
       {(() => {
@@ -873,12 +868,13 @@ function TicketBar({ ticket, activity, t, ccStatus, ccExpanded, onToggleCc, onIn
               background: lane.role === 'lead' ? '#5c4600' : '#3d4a1f',
               color: lane.role === 'lead' ? '#ffd96a' : '#c8e08a',
               border: '1px solid ' + (lane.role === 'lead' ? '#8a6a00' : '#5e7030') }}>
-            👑 {lane.role === 'lead' ? labels.get(lane.lane) ?? 'leader' : `${labels.get(lane.leader ?? '') ?? lane.leader} 管辖`}
+            {/* 受管辖行只留 👑，leader 名字已在 leader 行的徽标里；leader 行徽标自带别名，行内不再重复一次。 */}
+            👑{lane.role === 'lead' ? ` ${labels.get(lane.lane) ?? 'leader'}` : ''}
           </span>}
-          <span style={{ flexShrink: 0, width: 58, fontWeight: 600, fontFamily: 'monospace',
+          {lane.role !== 'lead' && <span style={{ flexShrink: 0, width: 58, fontWeight: 600, fontFamily: 'monospace',
             overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
             color: lane.state === 'running' ? '#9ae6b4' : '#aaa' }}
-            title={lane.lane}>{labels.get(lane.lane) ?? laneLabel(lane.lane)}</span>
+            title={lane.lane}>{labels.get(lane.lane) ?? laneLabel(lane.lane)}</span>}
           <span style={{ flexShrink: 0, fontSize: 10, padding: '0 5px', borderRadius: 3,
             background: lane.state === 'running' ? '#1f4d33' : '#333',
             color: lane.state === 'running' ? '#9ae6b4' : '#999' }}>

@@ -1023,7 +1023,7 @@ window.__ModuleLoader__.load({
 								const summary = team ? `这张工单下 ${scale.groups.map((group) => `${labels.get(group.leader) ?? group.leader} 带 ${group.count} 个 cc-worker`).join("，")}${scale.unmanaged > 0 ? `，另有 ${scale.unmanaged} 个 cc-worker 不受 leader 管辖` : ""}（${running} 个在跑）：` : `这张工单下有 ${scale.unmanaged} 个 cc-worker（${running} 个在跑）：`;
 								return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 									"data-pane-ticket-crew": ticket.id,
-									title: summary + lanes.map((lane) => `${labels.get(lane.lane) ?? laneLabel(lane.lane)} ${lane.state === "running" ? "运行中" : "空闲"}${lane.role === "lead" ? `（${labels.get(lane.lane)}）` : lane.leader ? `（受 ${labels.get(lane.leader) ?? lane.leader} 管辖）` : ""}${lane.task ? " — " + lane.task : ""}`).join("；"),
+									title: summary.replace(/：$/, ""),
 									style: {
 										fontSize: 11,
 										fontWeight: 700,
@@ -1142,19 +1142,8 @@ window.__ModuleLoader__.load({
 									letterSpacing: .2
 								},
 								children: (() => {
-									const lanes = crew ?? [];
-									const scale = crewScale(lanes);
-									const labels = crewLabels(lanes);
-									if (scale.leaders === 0 && scale.managed === 0) return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [
-										"👥 协作分工 · ",
-										lanes.length,
-										" 个 cc-worker"
-									] });
-									return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [
-										"👥 协作分工 · ",
-										scale.groups.map((group) => `${labels.get(group.leader) ?? group.leader} 带 ${group.count} 个`).join("，"),
-										scale.unmanaged > 0 ? `（另 ${scale.unmanaged} 个不受管辖）` : ""
-									] });
+									const running = (crew ?? []).filter((lane) => lane.state === "running").length;
+									return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: ["👥 协作分工", running > 0 ? ` · ${running} 在跑` : ""] });
 								})()
 							}),
 							(() => {
@@ -1206,9 +1195,9 @@ window.__ModuleLoader__.load({
 												color: lane.role === "lead" ? "#ffd96a" : "#c8e08a",
 												border: "1px solid " + (lane.role === "lead" ? "#8a6a00" : "#5e7030")
 											},
-											children: ["👑 ", lane.role === "lead" ? labels.get(lane.lane) ?? "leader" : `${labels.get(lane.leader ?? "") ?? lane.leader} 管辖`]
+											children: ["👑", lane.role === "lead" ? ` ${labels.get(lane.lane) ?? "leader"}` : ""]
 										}),
-										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+										lane.role !== "lead" && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 											style: {
 												flexShrink: 0,
 												width: 58,
