@@ -891,27 +891,21 @@ function TicketBar({ ticket, activity, t, ccStatus, ccExpanded, onToggleCc, onIn
       {(() => {
         const picked = (crew ?? []).find(lane => lane.lane === lanePick)
         if (!picked) return null
-        const label = crewLabels(crew ?? []).get(picked.lane) ?? laneLabel(picked.lane)
-        // 只有响应自报的 lane 与选中 lane 一致，才把它当这条 lane 自己的进度；
-        // 旧服务端忽略 ?lane= 返回 main lane（工单级）状态，绝不能拿来顶替别的 lane。
-        const detail = laneStatus && laneStatus.lane === picked.lane ? laneStatus : null
-        const foreign = !!laneStatus && laneStatus.lane !== picked.lane
-        return <div data-pane-lane-detail={`${ticket.id}:${picked.lane}`}
+        // main 就是工单自己的 worker：不带 ?lane= 的工单级响应读的正是 .cc-worker 根目录，即 main 自己的状态，
+        // 旧服务端不认 lane 字段也照样是它，所以 main 不需要响应自报 lane。
+        const isMain = picked.lane === 'main'
+        // 其它 lane 只认自报同一条 lane 的响应。旧服务端忽略 ?lane= 会返回 main 的状态，
+        // 拿来顶替就是误导；这种情况下这条 lane 什么都不显示，也不打「暂无独立输出」这类占位。
+        if (laneStatus && !isMain && laneStatus.lane !== picked.lane) return null
+        const detail = laneStatus
+        // lane 名已由被选中的那一行显示，日志路径和会话 id 只进悬停提示，不再占可见文本。
+        const hover = [detail?.sessionId ? `会话 ${detail.sessionId}` : '', detail?.log ?? ''].filter(Boolean).join(' · ')
+        return <div data-pane-lane-detail={`${ticket.id}:${picked.lane}`} title={hover || undefined}
           style={{ marginTop: 3, paddingTop: 4, borderTop: '1px dashed rgba(74,158,255,.55)',
             display: 'flex', flexDirection: 'column', gap: 3 }}>
-          <div style={{ display: 'flex', gap: 6, alignItems: 'baseline', flexWrap: 'wrap', fontSize: 11.5 }}>
-            <strong style={{ color: '#9ae6b4' }}>{label} 的实时进度</strong>
-            {detail?.sessionId && <span style={{ fontFamily: 'monospace', opacity: 0.7 }}
-              title="这条 lane 的 Claude Code 会话 id">会话 {detail.sessionId}</span>}
-            {!laneStatus && <span style={{ opacity: 0.6 }}>读取中…</span>}
-            {detail && !detail.present && <span style={{ opacity: 0.6 }}>这条 lane 还没有执行记录</span>}
-            {detail?.log && <span style={{ fontFamily: 'monospace', opacity: 0.5, minWidth: 0,
-              overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={detail.log}>{detail.log}</span>}
-            <span style={{ marginLeft: 'auto', opacity: 0.55 }}>再点该行返回工单级进度</span>
-          </div>
-          {foreign
-            ? <div style={{ opacity: 0.6, fontSize: 11.5 }}>该 worker 暂无独立输出</div>
-            : <CcPanel status={detail} expanded busy={false} />}
+          {!laneStatus && <div style={{ opacity: 0.6, fontSize: 11.5 }}>读取中…</div>}
+          {detail && !detail.present && <div style={{ opacity: 0.6, fontSize: 11.5 }}>这条 lane 还没有执行记录</div>}
+          <CcPanel status={detail} expanded busy={false} />
         </div>
       })()}
     </div>}

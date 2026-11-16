@@ -1242,11 +1242,13 @@ window.__ModuleLoader__.load({
 							(() => {
 								const picked = (crew ?? []).find((lane) => lane.lane === lanePick);
 								if (!picked) return null;
-								const label = crewLabels(crew ?? []).get(picked.lane) ?? laneLabel(picked.lane);
-								const detail = laneStatus && laneStatus.lane === picked.lane ? laneStatus : null;
-								const foreign = !!laneStatus && laneStatus.lane !== picked.lane;
+								const isMain = picked.lane === "main";
+								if (laneStatus && !isMain && laneStatus.lane !== picked.lane) return null;
+								const detail = laneStatus;
+								const hover = [detail?.sessionId ? `会话 ${detail.sessionId}` : "", detail?.log ?? ""].filter(Boolean).join(" · ");
 								return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 									"data-pane-lane-detail": `${ticket.id}:${picked.lane}`,
+									title: hover || void 0,
 									style: {
 										marginTop: 3,
 										paddingTop: 4,
@@ -1255,66 +1257,27 @@ window.__ModuleLoader__.load({
 										flexDirection: "column",
 										gap: 3
 									},
-									children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
-										style: {
-											display: "flex",
-											gap: 6,
-											alignItems: "baseline",
-											flexWrap: "wrap",
-											fontSize: 11.5
-										},
-										children: [
-											/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("strong", {
-												style: { color: "#9ae6b4" },
-												children: [label, " 的实时进度"]
-											}),
-											detail?.sessionId && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
-												style: {
-													fontFamily: "monospace",
-													opacity: .7
-												},
-												title: "这条 lane 的 Claude Code 会话 id",
-												children: ["会话 ", detail.sessionId]
-											}),
-											!laneStatus && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-												style: { opacity: .6 },
-												children: "读取中…"
-											}),
-											detail && !detail.present && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-												style: { opacity: .6 },
-												children: "这条 lane 还没有执行记录"
-											}),
-											detail?.log && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-												style: {
-													fontFamily: "monospace",
-													opacity: .5,
-													minWidth: 0,
-													overflow: "hidden",
-													textOverflow: "ellipsis",
-													whiteSpace: "nowrap"
-												},
-												title: detail.log,
-												children: detail.log
-											}),
-											/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-												style: {
-													marginLeft: "auto",
-													opacity: .55
-												},
-												children: "再点该行返回工单级进度"
-											})
-										]
-									}), foreign ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
-										style: {
-											opacity: .6,
-											fontSize: 11.5
-										},
-										children: "该 worker 暂无独立输出"
-									}) : /* @__PURE__ */ (0, react_jsx_runtime.jsx)(CcPanel, {
-										status: detail,
-										expanded: true,
-										busy: false
-									})]
+									children: [
+										!laneStatus && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+											style: {
+												opacity: .6,
+												fontSize: 11.5
+											},
+											children: "读取中…"
+										}),
+										detail && !detail.present && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+											style: {
+												opacity: .6,
+												fontSize: 11.5
+											},
+											children: "这条 lane 还没有执行记录"
+										}),
+										/* @__PURE__ */ (0, react_jsx_runtime.jsx)(CcPanel, {
+											status: detail,
+											expanded: true,
+											busy: false
+										})
+									]
 								});
 							})()
 						]
