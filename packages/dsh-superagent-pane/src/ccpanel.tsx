@@ -68,21 +68,25 @@ export function CcPanel({ status, expanded, onToggle, onInterrupt, onClear, busy
   const done = steps.filter(step => step.done).length
   const alertColor = status.alert === 'critical' ? '#e53e3e' : status.alert === 'warn' ? '#dd6b20' : undefined
   const running = status.state === 'running' || status.state === 'thinking' || status.state === 'stalled'
+  // 阶段汇报：把状态词与最近一次具体动作并排放在同一条状态行里，避免标题说「思考中」、
+  // 下一行才说在跑什么，也避免再出现第二个状态词。当前步优先，没有当前步就退回最近一步。
+  const latest = status.current ?? steps[steps.length - 1]
+  const action = latest?.tool ? `${latest.tool}${latest.detail ? `：${latest.detail.slice(0, 120)}` : ''}` : undefined
+  const stage = action ?? '等待下一步'
   return <div style={{ marginTop: 4, borderTop: '1px dashed var(--dt-border, #333)', paddingTop: 5, fontSize: 11,
     display: 'flex', flexDirection: 'column', gap: 4 }}>
     <div style={{ display: 'flex', gap: 5, alignItems: 'baseline', flexWrap: 'wrap' }}>
       <span style={{ color, fontWeight: 600 }}>● Claude Code</span>
       <span style={{ opacity: 0.8 }}>{STATE_TEXT[status.state]}</span>
-      {steps.length > 0 && <span style={{ opacity: 0.6 }}>第 {done}/{steps.length} 步</span>}
+      {running && <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontFamily: 'monospace' }}>· {stage}</span>}
+      {steps.length > 0 && <span style={{ opacity: 0.6 }}>· 第 {done}/{steps.length} 步</span>}
       {status.ageMs !== undefined && running && <span style={{ opacity: 0.6 }}>· {formatAge(status.ageMs)}前有动作</span>}
       {onToggle && <button type="button" onClick={onToggle} style={{ marginLeft: 'auto', background: 'none', border: 'none', padding: 0,
         color: 'inherit', opacity: 0.65, cursor: 'pointer', textDecoration: 'underline', fontSize: 11 }}>
         {expanded ? '收起' : '展开'}
       </button>}
     </div>
-    {status.current && running && <div style={{ opacity: 0.85, fontFamily: 'monospace', wordBreak: 'break-all' }}>
-      {status.current.tool}{status.current.detail ? `：${status.current.detail.slice(0, 120)}` : ''}
-    </div>}
+    {/* 当前动作已经并进状态行，这里不再重复一行状态/命令。 */}
     {status.alertText && <div style={{ color: alertColor, fontWeight: 500 }}>⚠ {status.alertText}</div>}
     {status.error && <div style={{ color: '#e53e3e', fontFamily: 'monospace', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
       maxHeight: 80, overflowY: 'auto' }}>{status.error}</div>}

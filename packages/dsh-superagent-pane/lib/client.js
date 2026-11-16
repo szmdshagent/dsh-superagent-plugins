@@ -36,6 +36,8 @@ window.__ModuleLoader__.load({
 			const done = steps.filter((step) => step.done).length;
 			const alertColor = status.alert === "critical" ? "#e53e3e" : status.alert === "warn" ? "#dd6b20" : void 0;
 			const running = status.state === "running" || status.state === "thinking" || status.state === "stalled";
+			const latest = status.current ?? steps[steps.length - 1];
+			const stage = (latest?.tool ? `${latest.tool}${latest.detail ? `：${latest.detail.slice(0, 120)}` : ""}` : void 0) ?? "等待下一步";
 			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 				style: {
 					marginTop: 4,
@@ -66,10 +68,19 @@ window.__ModuleLoader__.load({
 								style: { opacity: .8 },
 								children: STATE_TEXT[status.state]
 							}),
+							running && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+								style: {
+									overflow: "hidden",
+									textOverflow: "ellipsis",
+									whiteSpace: "nowrap",
+									fontFamily: "monospace"
+								},
+								children: ["· ", stage]
+							}),
 							steps.length > 0 && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
 								style: { opacity: .6 },
 								children: [
-									"第 ",
+									"· 第 ",
 									done,
 									"/",
 									steps.length,
@@ -101,14 +112,6 @@ window.__ModuleLoader__.load({
 								children: expanded ? "收起" : "展开"
 							})
 						]
-					}),
-					status.current && running && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
-						style: {
-							opacity: .85,
-							fontFamily: "monospace",
-							wordBreak: "break-all"
-						},
-						children: [status.current.tool, status.current.detail ? `：${status.current.detail.slice(0, 120)}` : ""]
 					}),
 					status.alertText && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 						style: {
