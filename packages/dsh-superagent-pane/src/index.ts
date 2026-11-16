@@ -426,15 +426,33 @@ function readLanes(dir: string): CrewLaneView[] {
       return readFileSync(`/proc/${pid}/cmdline`, 'utf8').includes('claude')
     } catch { return false }
   }
-  // 任务分配：team 调度时由 cc-worker 写入 lanes/<name>/task.txt；没有就不给该字段。
-  const taskOf = (base: string): string | undefined => {
+  // 没有任务登记时，用这条 lane 自己的执行日志概括「现在在干什么」：
+  //   当前步 / 最近一步 →「第 N 步 · Bash: <命令>」；从没跑过任何一轮才算「空闲」。
+  // 日志读取复用 ccvis（runs/<时间戳>.jsonl 增量尾部缓存），单条 lane 只读一次，
+  // 轮询时跟着面板刷新，所以行内文字是实时动作而不是静态计划标签。
+  const liveTask = (lane: string): string => {
+    const clip = (text: string) => text.replace(/\s+/g, ' ').trim().slice(0, 160)
+    try {
+      const cc = readCcStatus(dir, lane)
+      if (!cc.present) return '空闲'
+      const step = cc.current ?? cc.steps[cc.steps.length - 1]
+      if (step) return clip(`第 ${step.step} 步 · ${step.tool ?? '工具'}${step.detail ? `: ${step.detail}` : ''}`)
+      if (cc.state === 'error') return '执行报错'
+      if (cc.state === 'done') return '已完成'
+      return cc.state === 'running' ? '执行中' : '思考中'
+    } catch { return '空闲' }
+  }
+  // 任务一句话：优先 team 派活时 cc-worker 写入的 lanes/<name>/task.txt（任务登记）；
+  // 没有登记就退回这条 lane 的实时执行动作，不再一律显示「未登记任务」。
+  const taskOf = (base: string, lane: string): string => {
     try {
       const text = readFileSync(join(base, 'task.txt'), 'utf8').replace(/\s+/g, ' ').trim()
-      return text ? text.slice(0, 160) : undefined
-    } catch { return undefined }
+      if (text) return text.slice(0, 160)
+    } catch { /* 没有任务登记：看执行实况 */ }
+    return liveTask(lane)
   }
   const view = (base: string, lane: string, state: 'running' | 'idle', role: LaneRole, leader?: string): CrewLaneView =>
-    ({ lane, state, task: taskOf(base), role, ...(role === 'worker' && leader ? { leader } : {}) })
+    ({ lane, state, task: taskOf(base, lane), role, ...(role === 'worker' && leader ? { leader } : {}) })
   try {
     const plan = planned()
     const leaderOf = (lane: string): string | undefined => {

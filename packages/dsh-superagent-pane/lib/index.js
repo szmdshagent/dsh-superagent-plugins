@@ -959,18 +959,31 @@ function readLanes(dir) {
 			return false;
 		}
 	};
-	const taskOf = (base) => {
+	const liveTask = (lane) => {
+		const clip = (text) => text.replace(/\s+/g, " ").trim().slice(0, 160);
+		try {
+			const cc = readCcStatus(dir, lane);
+			if (!cc.present) return "空闲";
+			const step = cc.current ?? cc.steps[cc.steps.length - 1];
+			if (step) return clip(`第 ${step.step} 步 · ${step.tool ?? "工具"}${step.detail ? `: ${step.detail}` : ""}`);
+			if (cc.state === "error") return "执行报错";
+			if (cc.state === "done") return "已完成";
+			return cc.state === "running" ? "执行中" : "思考中";
+		} catch {
+			return "空闲";
+		}
+	};
+	const taskOf = (base, lane) => {
 		try {
 			const text = readFileSync(join(base, "task.txt"), "utf8").replace(/\s+/g, " ").trim();
-			return text ? text.slice(0, 160) : void 0;
-		} catch {
-			return;
-		}
+			if (text) return text.slice(0, 160);
+		} catch {}
+		return liveTask(lane);
 	};
 	const view = (base, lane, state, role, leader) => ({
 		lane,
 		state,
-		task: taskOf(base),
+		task: taskOf(base, lane),
 		role,
 		...role === "worker" && leader ? { leader } : {}
 	});

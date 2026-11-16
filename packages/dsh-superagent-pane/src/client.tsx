@@ -881,8 +881,8 @@ function TicketBar({ ticket, activity, t, ccStatus, ccExpanded, onToggleCc, onIn
             {lane.state === 'running' ? '运行中' : '空闲'}
           </span>
           <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: '#ddd' }}
-            title={lane.task ?? '该 lane 没有登记任务'}>
-            {lane.task ?? <span style={{ opacity: 0.45 }}>未登记任务</span>}
+            title={lane.task ?? '空闲'}>
+            {lane.task ?? <span style={{ opacity: 0.45 }}>空闲</span>}
           </span>
         </button>
         ))
