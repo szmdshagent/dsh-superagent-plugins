@@ -922,19 +922,20 @@ async function collectExecutorSignals(ctx, ticket) {
 	} catch {}
 	return signals;
 }
-/**
-* 读一张工单目录下的协作 lane 状态。
-*
-* lane 布局（cc-worker --lane 引入，2026-11-11）：
-*   <dir>/.cc-worker/{lock,session_id,...}             → lane = main（传统单 worker）
-*   <dir>/.cc-worker/lanes/<name>/{lock,session_id,...} → lane = <name>（协作子 worker）
-*
-* 「在跑」的判据与面板其它地方一致：claude.pid 存在且该 pid 的命令行含 claude。
-* 只读目录，不改任何东西；读不到就当没有 lane。
-*/
 function readLanes(dir) {
 	if (!dir) return [];
 	const out = [];
+	const root = join(dir, ".cc-worker");
+	const planned = () => {
+		try {
+			const data = JSON.parse(readFileSync(join(root, "team-plan.json"), "utf8"));
+			if (!Array.isArray(data)) return /* @__PURE__ */ new Set();
+			return new Set(data.map((item) => typeof item?.lane === "string" ? item.lane.trim() : "").filter(Boolean));
+		} catch {
+			return /* @__PURE__ */ new Set();
+		}
+	};
+	const leaderLane = "lead";
 	const alive = (base) => {
 		try {
 			const pid = Number(readFileSync(join(base, "claude.pid"), "utf8").trim());
@@ -952,21 +953,21 @@ function readLanes(dir) {
 			return;
 		}
 	};
+	const view = (base, lane, state, role) => ({
+		lane,
+		state,
+		task: taskOf(base),
+		role,
+		...role === "worker" ? { leader: leaderLane } : {}
+	});
 	try {
-		const root = join(dir, ".cc-worker");
-		if (alive(root)) out.push({
-			lane: "main",
-			state: "running",
-			task: taskOf(root)
-		});
+		const plan = planned();
+		if (alive(root)) out.push(view(root, "main", "running", "other"));
 		for (const name of readdirSync(join(root, "lanes"), { withFileTypes: true })) {
 			if (!name.isDirectory()) continue;
 			const base = join(root, "lanes", name.name);
-			out.push({
-				lane: name.name,
-				state: alive(base) ? "running" : "idle",
-				task: taskOf(base)
-			});
+			const role = name.name === leaderLane ? "lead" : plan.has(name.name) ? "worker" : "other";
+			out.push(view(base, name.name, alive(base) ? "running" : "idle", role));
 		}
 	} catch {}
 	return out;

@@ -114,5 +114,26 @@ type PaneMode = 'assign' | 'chat' | 'note' | 'broadcast';
 declare function paneTrigger(conversation: string, text: string, sender?: string, mode?: PaneMode, options?: {
   thread?: string;
 }): Trigger;
+/**
+ * 读一张工单目录下的协作 lane 状态。
+ *
+ * lane 布局（cc-worker --lane 引入，2026-11-11）：
+ *   <dir>/.cc-worker/{lock,session_id,...}             → lane = main（传统单 worker）
+ *   <dir>/.cc-worker/lanes/<name>/{lock,session_id,...} → lane = <name>（协作子 worker）
+ *
+ * 「在跑」的判据与面板其它地方一致：claude.pid 存在且该 pid 的命令行含 claude。
+ * 只读目录，不改任何东西；读不到就当没有 lane。
+ */
+/** lane 在协作里的身份：lead=统筹（leader 本身），worker=team-plan.json 里被统领的子任务，other=不受管辖。 */
+type LaneRole = 'lead' | 'worker' | 'other';
+type CrewLaneView = {
+  lane: string;
+  state: 'running' | 'idle';
+  task?: string;
+  /** 协作身份；没有 team-plan、也没有 lead lane 的工单全是 other。 */
+  role: LaneRole;
+  /** 这条 lane 归谁管辖（team 模式下是 lead 的名字）；不受管辖时没有该字段。 */
+  leader?: string;
+};
 declare function apply(ctx: Context): void;
-export { PaneMode, apply, inject, name, paneTrigger };
+export { CrewLaneView, LaneRole, PaneMode, apply, inject, name, paneTrigger };

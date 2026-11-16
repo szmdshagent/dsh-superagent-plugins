@@ -495,7 +495,11 @@ type Ticket = {
 }
 type Activity = { state?: string; kind?: string | null; tool?: string; text?: string; at?: number; ageMs?: number }
 /** 协作规模：未结束工单数、真正在跑的 worker 数、排队数，以及每张工单的状态。 */
-type CrewLane = { lane: string; state: 'running' | 'idle'; task?: string }
+type CrewLane = { lane: string; state: 'running' | 'idle'; task?: string
+  /** 协作身份：lead=统筹（leader 本身），worker=受 leader 管辖，other=不受管辖。 */
+  role?: 'lead' | 'worker' | 'other'
+  /** 管辖这条 lane 的 leader 名（team 模式下是 lead）；other/lead 没有。 */
+  leader?: string }
 
 /**
  * lane 的显示名：统一叫 ccwN。
@@ -515,6 +519,43 @@ type Crew = {
   items: { ticketId: string; title: string; assignment: string; working: boolean; sessionId?: string; lanes?: CrewLane[] }[]
 }
 type Translate = (key: keyof typeof zh, values?: Record<string, string>) => string
+
+/**
+ * leader 关系的兜底来源。
+ *
+ * `/crew` 正常会带 role/leader（服务端读 `.cc-worker/team-plan.json`）；老进程没有这两个字段时，
+ * 借治理面板的 `/api/governance`（它同样按 team-plan.json 算 lane 的 lead/worker/other）补一次。
+ * 工单目录名以工单 id 前 12 位结尾，用这个后缀把目录对回 `/crew` 的 ticketId。
+ * 治理面板没装或读不到时不补：面板按「没有 leader」显示，不报错。
+ */
+type LaneRoleMap = Record<string, Record<string, { role?: 'lead' | 'worker' | 'other'; leader?: string }>>
+let governanceRoles: { at: number; map: LaneRoleMap } | null = null
+async function rolesFromGovernance(): Promise<LaneRoleMap> {
+  if (governanceRoles && Date.now() - governanceRoles.at < 60_000) return governanceRoles.map
+  const body = await request('/api/governance')
+  const map: LaneRoleMap = {}
+  for (const lane of Array.isArray(body?.lanes) ? body.lanes : []) {
+    const dir = typeof lane?.ticket === 'string' ? lane.ticket : ''
+    const suffix = dir.split('-').pop() ?? ''
+    const role = lane?.role === 'lead' || lane?.role === 'worker' ? lane.role : 'other'
+    if (!suffix || typeof lane?.lane !== 'string') continue
+    map[suffix] ??= {}
+    map[suffix]![lane.lane] = role === 'worker' ? { role, leader: 'lead' } : { role }
+  }
+  governanceRoles = { at: Date.now(), map }
+  return map
+}
+/** 把兜底 role 合并进 `/crew`：服务端已经给了 role 的以服务端为准。 */
+function withLaneRoles(body: Crew, map: LaneRoleMap): Crew {
+  return {
+    ...body,
+    items: body.items.map(item => {
+      const suffix = item.ticketId.slice(0, 12)
+      const per = map[suffix] ?? {}
+      return { ...item, lanes: (item.lanes ?? []).map(lane => lane.role ? lane : { ...lane, ...(per[lane.lane] ?? {}) }) }
+    }),
+  }
+}
 
 /** 工具名到文案键的映射；未知工具直接显示原名。 */
 const TOOL_KEYS: Record<string, keyof typeof zh> = {
@@ -700,16 +741,31 @@ function TicketBar({ ticket, activity, t, ccStatus, ccExpanded, onToggleCc, onIn
         const lanes = crew ?? []
         if (lanes.length === 0) return null
         const running = lanes.filter(lane => lane.state === 'running').length
+        // 有 leader 时胶囊改报「leader 数-受管辖 cc 数,不受管辖 cc 数」（如 1-4,1）；
+        // 没有 leader 的历史单沿用「协作 N · M 在跑」。
+        const leaders = lanes.filter(lane => lane.role === 'lead').length
+        const managed = lanes.filter(lane => lane.role === 'worker').length
+        const unmanaged = lanes.length - leaders - managed
+        const team = leaders > 0 || managed > 0
+        const caption = team
+          ? `👥 协作 ${leaders}-${managed}${unmanaged > 0 ? `,${unmanaged}` : ''}`
+          : `👥 协作 ${lanes.length}${running > 0 ? ` · ${running} 在跑` : ''}`
+        const summary = team
+          ? `这张工单下有 ${leaders} 个 leader 带 ${managed} 个 cc-worker`
+            + `${unmanaged > 0 ? `，另有 ${unmanaged} 个 cc-worker 不受 leader 管辖` : ''}（${running} 个在跑）：`
+          : `这张工单下有 ${lanes.length} 个 cc-worker（${running} 个在跑）：`
         return <span data-pane-ticket-crew={ticket.id}
-          title={`这张工单下有 ${lanes.length} 个 cc-worker（${running} 个在跑）：`
-            + lanes.map(lane => `${laneLabel(lane.lane)} ${lane.state === 'running' ? '运行中' : '空闲'}${lane.task ? ' — ' + lane.task : ''}`).join('；')}
+          title={summary
+            + lanes.map(lane => `${laneLabel(lane.lane)} ${lane.state === 'running' ? '运行中' : '空闲'}`
+              + `${lane.role === 'lead' ? '（leader）' : lane.leader ? `（受 ${lane.leader} 管辖）` : ''}`
+              + `${lane.task ? ' — ' + lane.task : ''}`).join('；')}
           style={{ fontSize: 11, fontWeight: 700, padding: '1px 8px', borderRadius: 10, flexShrink: 0,
             letterSpacing: 0.3, lineHeight: 1.5,
             border: running > 0 ? '1px solid #4a9eff' : '1px solid #555',
             background: running > 0 ? '#1d4ed8' : '#3a3a3a',
             color: running > 0 ? '#fff' : '#ccc',
             boxShadow: running > 0 ? '0 0 0 2px rgba(74,158,255,.25)' : 'none' }}>
-          👥 协作 {lanes.length}{running > 0 ? ` · ${running} 在跑` : ''}
+          {caption}
         </span>
       })()}
       {!expanded && compact && <span title={compact} style={{ fontSize: 11, opacity: 0.6, flex: '1 1 0', minWidth: 0,
@@ -740,11 +796,27 @@ function TicketBar({ ticket, activity, t, ccStatus, ccExpanded, onToggleCc, onIn
         background: 'rgba(74, 158, 255, 0.12)', borderLeft: '3px solid #4a9eff',
         display: 'flex', flexDirection: 'column', gap: 3 }}>
       <div style={{ fontSize: 12, fontWeight: 700, color: '#7cb8ff', letterSpacing: 0.2 }}>
-        👥 协作分工 · {(crew ?? []).length} 个 cc-worker
+        {(() => {
+          const lanes = crew ?? []
+          const leaders = lanes.filter(lane => lane.role === 'lead').length
+          const managed = lanes.filter(lane => lane.role === 'worker').length
+          const unmanaged = lanes.length - leaders - managed
+          if (leaders === 0 && managed === 0) return <>👥 协作分工 · {lanes.length} 个 cc-worker</>
+          return <>👥 协作分工 · {leaders} 个 leader 带 {managed} 个 cc-worker
+            {unmanaged > 0 ? `（另 ${unmanaged} 个不受管辖）` : ''}</>
+        })()}
       </div>
       {(crew ?? []).map(lane => (
         <div key={lane.lane} style={{ display: 'flex', gap: 6, alignItems: 'baseline', fontSize: 11.5, minWidth: 0 }}>
           <span style={{ flexShrink: 0, fontSize: 9, color: lane.state === 'running' ? '#38a169' : '#777' }}>●</span>
+          {(lane.role === 'lead' || lane.leader) && <span data-pane-lane-leader={lane.lane}
+            title={lane.role === 'lead' ? '这条 lane 是 leader（统筹），管辖受管辖的 cc-worker' : `这条 cc-worker 归 ${lane.leader} 管辖`}
+            style={{ flexShrink: 0, fontSize: 9.5, padding: '0 5px', borderRadius: 3, lineHeight: 1.5,
+              background: lane.role === 'lead' ? '#5c4600' : '#3d4a1f',
+              color: lane.role === 'lead' ? '#ffd96a' : '#c8e08a',
+              border: '1px solid ' + (lane.role === 'lead' ? '#8a6a00' : '#5e7030') }}>
+            👑 {lane.role === 'lead' ? 'leader' : `${lane.leader} 管辖`}
+          </span>}
           <span style={{ flexShrink: 0, width: 58, fontWeight: 600, fontFamily: 'monospace',
             overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
             color: lane.state === 'running' ? '#9ae6b4' : '#aaa' }}
@@ -1307,10 +1379,19 @@ function PanePanel({ t }: { t: Translate }) {
     let alive = true
     const tick = () => {
       void call('/crew')
-        .then(next => {
+        .then(async next => {
           if (!alive) return
           const body = next as Crew
-          if (body && Array.isArray(body.items)) setCrew(body)
+          if (!body || !Array.isArray(body.items)) return
+          // 老进程的 /crew 没有 role：补一次 team-plan 关系（有缓存，60 秒内不重复读）。
+          const needsRoles = body.items.some(item => (item.lanes ?? []).some(lane => !lane.role))
+          if (needsRoles) {
+            const map = await rolesFromGovernance().catch(() => null)
+            if (!alive) return
+            setCrew(map ? withLaneRoles(body, map) : body)
+            return
+          }
+          setCrew(body)
         })
         .catch(() => { /* 读不到就保持上次 */ })
     }

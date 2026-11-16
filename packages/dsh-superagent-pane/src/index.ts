@@ -378,9 +378,33 @@ async function collectExecutorSignals(ctx: any, ticket: any): Promise<ExecutorSi
  * 「在跑」的判据与面板其它地方一致：claude.pid 存在且该 pid 的命令行含 claude。
  * 只读目录，不改任何东西；读不到就当没有 lane。
  */
-function readLanes(dir: string): { lane: string; state: 'running' | 'idle'; task?: string }[] {
+/** lane 在协作里的身份：lead=统筹（leader 本身），worker=team-plan.json 里被统领的子任务，other=不受管辖。 */
+export type LaneRole = 'lead' | 'worker' | 'other'
+
+export type CrewLaneView = {
+  lane: string
+  state: 'running' | 'idle'
+  task?: string
+  /** 协作身份；没有 team-plan、也没有 lead lane 的工单全是 other。 */
+  role: LaneRole
+  /** 这条 lane 归谁管辖（team 模式下是 lead 的名字）；不受管辖时没有该字段。 */
+  leader?: string
+}
+
+function readLanes(dir: string): CrewLaneView[] {
   if (!dir) return []
-  const out: { lane: string; state: 'running' | 'idle'; task?: string }[] = []
+  const out: CrewLaneView[] = []
+  const root = join(dir, '.cc-worker')
+  // team 模式由 cc-worker 的阶段 1 写出 team-plan.json，列出的 lane 就是 lead 统领的子任务。
+  // 计划文件不存在（历史单/非 team 单）时所有 lane 都算 other，面板上不显示 leader。
+  const planned = (): Set<string> => {
+    try {
+      const data: any = JSON.parse(readFileSync(join(root, 'team-plan.json'), 'utf8'))
+      if (!Array.isArray(data)) return new Set()
+      return new Set(data.map(item => (typeof item?.lane === 'string' ? item.lane.trim() : '')).filter(Boolean))
+    } catch { return new Set() }
+  }
+  const leaderLane = 'lead'
   const alive = (base: string): boolean => {
     try {
       const pid = Number(readFileSync(join(base, 'claude.pid'), 'utf8').trim())
@@ -396,13 +420,16 @@ function readLanes(dir: string): { lane: string; state: 'running' | 'idle'; task
       return text ? text.slice(0, 160) : undefined
     } catch { return undefined }
   }
+  const view = (base: string, lane: string, state: 'running' | 'idle', role: LaneRole): CrewLaneView =>
+    ({ lane, state, task: taskOf(base), role, ...(role === 'worker' ? { leader: leaderLane } : {}) })
   try {
-    const root = join(dir, '.cc-worker')
-    if (alive(root)) out.push({ lane: 'main', state: 'running', task: taskOf(root) })
+    const plan = planned()
+    if (alive(root)) out.push(view(root, 'main', 'running', 'other'))
     for (const name of readdirSync(join(root, 'lanes'), { withFileTypes: true })) {
       if (!name.isDirectory()) continue
       const base = join(root, 'lanes', name.name)
-      out.push({ lane: name.name, state: alive(base) ? 'running' : 'idle', task: taskOf(base) })
+      const role: LaneRole = name.name === leaderLane ? 'lead' : plan.has(name.name) ? 'worker' : 'other'
+      out.push(view(base, name.name, alive(base) ? 'running' : 'idle', role))
     }
   } catch { /* 目录不存在或不可读：没有 lane */ }
   return out

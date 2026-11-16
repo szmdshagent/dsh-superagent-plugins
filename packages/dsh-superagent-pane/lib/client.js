@@ -674,6 +674,43 @@ window.__ModuleLoader__.load({
 			const match = /^w(\d+)$/.exec(name);
 			return match ? `ccw${match[1]}` : name;
 		}
+		let governanceRoles = null;
+		async function rolesFromGovernance() {
+			if (governanceRoles && Date.now() - governanceRoles.at < 6e4) return governanceRoles.map;
+			const body = await request("/api/governance");
+			const map = {};
+			for (const lane of Array.isArray(body?.lanes) ? body.lanes : []) {
+				const suffix = (typeof lane?.ticket === "string" ? lane.ticket : "").split("-").pop() ?? "";
+				const role = lane?.role === "lead" || lane?.role === "worker" ? lane.role : "other";
+				if (!suffix || typeof lane?.lane !== "string") continue;
+				map[suffix] ??= {};
+				map[suffix][lane.lane] = role === "worker" ? {
+					role,
+					leader: "lead"
+				} : { role };
+			}
+			governanceRoles = {
+				at: Date.now(),
+				map
+			};
+			return map;
+		}
+		/** 把兜底 role 合并进 `/crew`：服务端已经给了 role 的以服务端为准。 */
+		function withLaneRoles(body, map) {
+			return {
+				...body,
+				items: body.items.map((item) => {
+					const per = map[item.ticketId.slice(0, 12)] ?? {};
+					return {
+						...item,
+						lanes: (item.lanes ?? []).map((lane) => lane.role ? lane : {
+							...lane,
+							...per[lane.lane] ?? {}
+						})
+					};
+				})
+			};
+		}
 		/** 工具名到文案键的映射；未知工具直接显示原名。 */
 		const TOOL_KEYS = {
 			bash: "toolBash",
@@ -931,9 +968,15 @@ window.__ModuleLoader__.load({
 								const lanes = crew ?? [];
 								if (lanes.length === 0) return null;
 								const running = lanes.filter((lane) => lane.state === "running").length;
-								return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+								const leaders = lanes.filter((lane) => lane.role === "lead").length;
+								const managed = lanes.filter((lane) => lane.role === "worker").length;
+								const unmanaged = lanes.length - leaders - managed;
+								const team = leaders > 0 || managed > 0;
+								const caption = team ? `👥 协作 ${leaders}-${managed}${unmanaged > 0 ? `,${unmanaged}` : ""}` : `👥 协作 ${lanes.length}${running > 0 ? ` · ${running} 在跑` : ""}`;
+								const summary = team ? `这张工单下有 ${leaders} 个 leader 带 ${managed} 个 cc-worker${unmanaged > 0 ? `，另有 ${unmanaged} 个 cc-worker 不受 leader 管辖` : ""}（${running} 个在跑）：` : `这张工单下有 ${lanes.length} 个 cc-worker（${running} 个在跑）：`;
+								return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 									"data-pane-ticket-crew": ticket.id,
-									title: `这张工单下有 ${lanes.length} 个 cc-worker（${running} 个在跑）：` + lanes.map((lane) => `${laneLabel(lane.lane)} ${lane.state === "running" ? "运行中" : "空闲"}${lane.task ? " — " + lane.task : ""}`).join("；"),
+									title: summary + lanes.map((lane) => `${laneLabel(lane.lane)} ${lane.state === "running" ? "运行中" : "空闲"}${lane.role === "lead" ? "（leader）" : lane.leader ? `（受 ${lane.leader} 管辖）` : ""}${lane.task ? " — " + lane.task : ""}`).join("；"),
 									style: {
 										fontSize: 11,
 										fontWeight: 700,
@@ -947,11 +990,7 @@ window.__ModuleLoader__.load({
 										color: running > 0 ? "#fff" : "#ccc",
 										boxShadow: running > 0 ? "0 0 0 2px rgba(74,158,255,.25)" : "none"
 									},
-									children: [
-										"👥 协作 ",
-										lanes.length,
-										running > 0 ? ` · ${running} 在跑` : ""
-									]
+									children: caption
 								});
 							})(),
 							!expanded && compact && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
@@ -1047,18 +1086,32 @@ window.__ModuleLoader__.load({
 							flexDirection: "column",
 							gap: 3
 						},
-						children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+						children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
 							style: {
 								fontSize: 12,
 								fontWeight: 700,
 								color: "#7cb8ff",
 								letterSpacing: .2
 							},
-							children: [
-								"👥 协作分工 · ",
-								(crew ?? []).length,
-								" 个 cc-worker"
-							]
+							children: (() => {
+								const lanes = crew ?? [];
+								const leaders = lanes.filter((lane) => lane.role === "lead").length;
+								const managed = lanes.filter((lane) => lane.role === "worker").length;
+								const unmanaged = lanes.length - leaders - managed;
+								if (leaders === 0 && managed === 0) return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [
+									"👥 协作分工 · ",
+									lanes.length,
+									" 个 cc-worker"
+								] });
+								return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [
+									"👥 协作分工 · ",
+									leaders,
+									" 个 leader 带 ",
+									managed,
+									" 个 cc-worker",
+									unmanaged > 0 ? `（另 ${unmanaged} 个不受管辖）` : ""
+								] });
+							})()
 						}), (crew ?? []).map((lane) => /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 							style: {
 								display: "flex",
@@ -1075,6 +1128,21 @@ window.__ModuleLoader__.load({
 										color: lane.state === "running" ? "#38a169" : "#777"
 									},
 									children: "●"
+								}),
+								(lane.role === "lead" || lane.leader) && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+									"data-pane-lane-leader": lane.lane,
+									title: lane.role === "lead" ? "这条 lane 是 leader（统筹），管辖受管辖的 cc-worker" : `这条 cc-worker 归 ${lane.leader} 管辖`,
+									style: {
+										flexShrink: 0,
+										fontSize: 9.5,
+										padding: "0 5px",
+										borderRadius: 3,
+										lineHeight: 1.5,
+										background: lane.role === "lead" ? "#5c4600" : "#3d4a1f",
+										color: lane.role === "lead" ? "#ffd96a" : "#c8e08a",
+										border: "1px solid " + (lane.role === "lead" ? "#8a6a00" : "#5e7030")
+									},
+									children: ["👑 ", lane.role === "lead" ? "leader" : `${lane.leader} 管辖`]
 								}),
 								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 									style: {
@@ -1970,10 +2038,17 @@ window.__ModuleLoader__.load({
 			(0, react.useEffect)(() => {
 				let alive = true;
 				const tick = () => {
-					call("/crew").then((next) => {
+					call("/crew").then(async (next) => {
 						if (!alive) return;
 						const body = next;
-						if (body && Array.isArray(body.items)) setCrew(body);
+						if (!body || !Array.isArray(body.items)) return;
+						if (body.items.some((item) => (item.lanes ?? []).some((lane) => !lane.role))) {
+							const map = await rolesFromGovernance().catch(() => null);
+							if (!alive) return;
+							setCrew(map ? withLaneRoles(body, map) : body);
+							return;
+						}
+						setCrew(body);
 					}).catch(() => {});
 				};
 				tick();
