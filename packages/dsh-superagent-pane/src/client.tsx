@@ -507,8 +507,8 @@ type CrewLane = { lane: string; state: 'running' | 'idle'; task?: string
  *   other 协作模式下不属于 leader 的利益方（如独立验收 lane）—— 灰
  */
 const ROLE_BADGE: Record<string, { label: string; hint: string; bg: string; fg: string; border: string }> = {
-  main: { label: 'main', hint: '这张工单自己的 worker（没有协作模式时由它执行）', bg: '#1b2f52', fg: '#9cc0f0', border: '#2f4f7d' },
-  other: { label: 'oth-ccw', hint: '协作模式下既不是 leader 也不是 ccworker 的 Claude Code worker（如独立验收）', bg: '#333', fg: '#aaa', border: '#4a4a4a' },
+  main: { label: '⏺', hint: '这张工单自己的 worker（没有协作模式时由它执行）', bg: '#1b2f52', fg: '#9cc0f0', border: '#2f4f7d' },
+  other: { label: '·', hint: '协作模式下既不是 leader 也不是 ccworker 的 Claude Code worker（如独立验收）', bg: '#333', fg: '#aaa', border: '#4a4a4a' },
 }
 
 /**
@@ -979,6 +979,19 @@ function TicketBar({ ticket, activity, t, health, confirmStop, onClose, onCommen
           ordered.push({ lane, level: 1, section: looseLabel[lane.role ?? 'other'] ?? '其它' })
         }
         return ordered.map(({ lane, level, first, last, section }) => {
+        // 身份词与编号：图标表达身份，这段灰字表达「身份 + 编号」
+        const kindName = lane.lane === 'orchestrator' ? '切分'
+          : lane.role === 'leader' ? 'leader'
+          : lane.role === 'worker' ? 'ccw'
+          : lane.role === 'main' ? 'main' : 'other'
+        const kindNo = labels.get(lane.lane) ?? ''
+        // leader1 / ccw3 这类已含身份词，直接用；other 类显示真实 lane 名
+        const kindText = kindName === 'other' ? (kindNo || lane.lane)
+          : kindNo.startsWith(kindName) ? kindNo : `${kindName} ${kindNo}`.trim()
+        const kindHint = lane.role === 'leader' ? '统筹：分配任务并在末尾归纳自己那块'
+          : lane.role === 'worker' ? `队员：归 ${labels.get(lane.leader ?? '') ?? lane.leader ?? '?'} 管辖`
+          : lane.lane === 'orchestrator' ? '切分：只把总任务切块分给各 leader，不做末尾归纳'
+          : lane.role === 'main' ? '这张工单自己的 worker（无协作模式时）' : '协作模式下非 leader 非队员的 lane'
         const indent = level === 2
         const op = laneOps[lane.lane]
         // 行本身是 div + role=button：中止按钮必须是它内部真正的 <button>，button 不能嵌套 button。
@@ -1017,8 +1030,6 @@ function TicketBar({ ticket, activity, t, health, confirmStop, onClose, onCommen
             {last ? '└─' : '├─'}
           </span>}
           {(lane.role === 'leader' || lane.leader || ROLE_BADGE[lane.role ?? 'other']) && (() => {
-            // 六类身份各有自己的徽标：颜色 + 文字都不同，扫一眼能分清谁是谁。
-            // lead/worker 走原来的 👑 体系（保持既有观感）；其余四类各用一个固定徽标。
             const role = lane.role ?? 'other'
             const badge = ROLE_BADGE[role]
             // 切分（orchestrator）虽是 leader 类，但职责只有切块、不做末尾归纳，徽标单独给紫色
@@ -1026,7 +1037,7 @@ function TicketBar({ ticket, activity, t, health, confirmStop, onClose, onCommen
               title="切分：把总任务切成块分给各 leader，不负责末尾归纳（与 leader 的职责不同）"
               style={{ flexShrink: 0, fontSize: 9.5, padding: '0 5px', borderRadius: 3, lineHeight: 1.5,
                 background: '#3a2a55', color: '#c9b3f0', border: '1px solid #5c4380' }}>
-              ✂ 切分
+              ✂
             </span>
             if (role === 'leader' || role === 'worker' || !badge) return <span data-pane-lane-leader={lane.lane}
               title={role === 'leader' ? '这条 lane 是 leader（统筹），管辖受管辖的 cc-worker' : `这条 cc-worker 归 ${labels.get(lane.leader ?? '') ?? lane.leader} 管辖`}
@@ -1034,10 +1045,7 @@ function TicketBar({ ticket, activity, t, health, confirmStop, onClose, onCommen
                 background: role === 'leader' ? '#5c4600' : '#3d4a1f',
                 color: role === 'leader' ? '#ffd96a' : '#c8e08a',
                 border: '1px solid ' + (role === 'leader' ? '#8a6a00' : '#5e7030') }}>
-              {/* leader 显示 leaderN，队员显示 ccwN —— 徽标本身就说明是哪种角色，不用再去对照名字列 */}
-              👑{role === 'leader'
-                ? ` ${labels.get(lane.lane) ?? 'leader'}`
-                : ` ${labels.get(lane.lane) ?? 'ccw'}`}
+              👑
             </span>
             return <span data-pane-lane-role={lane.lane} title={badge.hint}
               style={{ flexShrink: 0, fontSize: 9.5, padding: '0 5px', borderRadius: 3, lineHeight: 1.5,
@@ -1045,6 +1053,12 @@ function TicketBar({ ticket, activity, t, health, confirmStop, onClose, onCommen
               {badge.label}
             </span>
           })()}
+          {/* 灰色文字：身份词 + 编号。图标只表达身份，编号一律放在这里，两件事分开说清。 */}
+          <span data-pane-lane-kind={lane.lane} title={kindHint}
+            style={{ flexShrink: 0, fontSize: 10, opacity: 0.6, fontFamily: 'monospace',
+              whiteSpace: 'nowrap' }}>
+            {kindText}
+          </span>
           {/* 名字列按内容自适应：普通 lane 名（main-verify / orchestrator / l1_w1）必须完整可见，
               只有超过 140px 的极端长名才省略，hover 的 title 仍给完整名。 */}
           {lane.role !== 'leader' && <span style={{ flexShrink: 0, fontWeight: 600, fontFamily: 'monospace',
