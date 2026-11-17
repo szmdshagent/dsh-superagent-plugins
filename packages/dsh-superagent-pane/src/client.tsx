@@ -545,17 +545,25 @@ function crewLabels(lanes: CrewLane[]): Map<string, string> {
   // 其余 leader 按顺序编号 leader1、leader2…
   let leaderNo = 0
   for (const lane of leaders) {
-    labels.set(lane.lane, lane.lane === 'orchestrator' ? '切分' : `leader${++leaderNo}`)
+    labels.set(lane.lane, lane.lane === 'orchestrator' ? '切分' : `l${++leaderNo}`)
   }
-  workerOrder.forEach((lane, index) => labels.set(lane.lane, `ccw${index + 1}`))
+  workerOrder.forEach((lane, index) => labels.set(lane.lane, `w${index + 1}`))
   // 剩余两类：main（无协作时的工单 worker，只有一个）与 other（协作下的其它一切）。
   // other 不再起合成别名（oth-ccwN 看不出是谁），直接显示真实 lane 目录名，
   // 名字列按内容自适应宽度，main-verify / orchestrator / l1_w1 这类名字可以完整读到。
   let mainN = 0
+  // 已分配的编号集合：other 用真实目录名时若与 lN/wN/main 撞名，加前缀避免二义
+  const taken = new Set(labels.values())
   for (const lane of lanes) {
     if (lane.role === 'leader' || lane.role === 'worker' || labels.has(lane.lane)) continue
-    if (lane.role === 'main') labels.set(lane.lane, mainN++ === 0 ? 'main' : `main${mainN}`)
-    else labels.set(lane.lane, lane.lane)
+    if (lane.role === 'main') {
+      // 工单自己的 worker 只可能有一个，用 main；重名才加序号
+      const name = mainN++ === 0 ? 'main' : `main${mainN}`
+      labels.set(lane.lane, taken.has(name) ? `main:${lane.lane}` : name)
+    } else {
+      // other：按 owner 规则用真实 lane 名；与 lN / wN 撞名时加 other: 前缀
+      labels.set(lane.lane, taken.has(lane.lane) ? `other:${lane.lane}` : lane.lane)
+    }
   }
   return labels
 }
@@ -985,10 +993,10 @@ function TicketBar({ ticket, activity, t, health, confirmStop, onClose, onCommen
           : lane.role === 'worker' ? 'ccw'
           : lane.role === 'main' ? 'main' : 'other'
         const kindNo = labels.get(lane.lane) ?? ''
-        // 身份英文已在徽章里（👑 leader / 🎩 ccw / · other），灰字只负责**编号**：
-        // leader1 -> 1、ccw3 -> 3；切分/main/other 没有编号，灰字留空，
-        // 绝不再把身份词重复写一遍。
-        const kindText = /^(leader|ccw)\d+$/.test(kindNo) ? kindNo.replace(/^(leader|ccw)/, '') : ''
+        // 灰字 = 编号：leader 写 lN、队员写 wN（owner 口径）。
+        // other 按具体身份命名，直接显示真实 lane 名；切分 / main 没有编号就不写。
+        const kindText = /^l\d+$|^w\d+$|^切分$/.test(kindNo) ? (kindNo === '切分' ? '' : kindNo)
+          : (lane.role === 'other' ? lane.lane : '')
         const kindHint = lane.role === 'leader' ? '统筹：分配任务并在末尾归纳自己那块'
           : lane.role === 'worker' ? `队员：归 ${labels.get(lane.leader ?? '') ?? lane.leader ?? '?'} 管辖`
           : lane.lane === 'orchestrator' ? '切分：只把总任务切块分给各 leader，不做末尾归纳'
@@ -1066,7 +1074,7 @@ function TicketBar({ ticket, activity, t, health, confirmStop, onClose, onCommen
              规则（owner 2026-11-17）：other 之下不再细分角色，身份差异**由 lane 命名体现**
              （main-verify = 独立验收、w2 = 某次实验产物…），所以这里直接显示真实目录名。
               leader/worker/切分 的「身份 + 编号」已由徽章和灰字说全，再写一次就成「1 ccw1」。 */}
-          {(lane.role === 'main' || lane.role === 'other') && <span style={{ flexShrink: 0, fontWeight: 600,
+          {lane.role === 'main' && <span style={{ flexShrink: 0, fontWeight: 600,
             fontFamily: 'monospace', minWidth: 58, maxWidth: 140, whiteSpace: 'nowrap',
             overflow: 'hidden', textOverflow: 'ellipsis',
             color: lane.state === 'running' ? '#9ae6b4' : '#aaa' }}
