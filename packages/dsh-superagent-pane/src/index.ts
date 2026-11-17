@@ -421,7 +421,9 @@ export function summarizeTask(text: string): string {
     token => token.split('/').filter(Boolean).pop() ?? token).trim()
   if (!line) return ''
   const chars = [...line]
-  const limit = 14
+  // 46 字：足够看清「派 1 个 ccw 用 find 口径统计 A 目录文件数」这种完整任务，
+  // 又不至于把整段派活原文铺满一行。原值 14 会把任务截成「派 1 个 ccw 以…」，等于没说。
+  const limit = 46
   if (chars.length <= limit + 2) return line
   const head = chars.slice(0, limit + 2).join('')
   const cut = Math.max(head.lastIndexOf(' '), head.lastIndexOf('、'), head.lastIndexOf('，'))
@@ -511,8 +513,17 @@ function readLanes(dir: string, ownTask = ''): CrewLaneView[] {
       for (const [leader, members] of plan) if (members.includes(lane)) return leader
       return undefined
     }
-    // 工单自己的 worker：没有协作模式时它就是这张工单的执行者，显示为 main
-    if (alive(root)) out.push(view(root, 'main', 'running', 'main', assigned, ownTask))
+    // 工单自己的 worker：**只在没有协作模式时**显示为 main。
+    // 协作模式的判据是有 team-plan.json，或 lanes/ 下存在协作 lane（leader / ccw 都算）。
+    // 原来只看根目录 claude.pid 是否活着，而协作工单的根目录也可能残留这个文件，
+    // 于是协作单里凭空多出一行 main。
+    let cooperative = plan.size > 0
+    if (!cooperative) {
+      try {
+        cooperative = readdirSync(join(root, 'lanes'), { withFileTypes: true }).some(entry => entry.isDirectory())
+      } catch { /* 没有 lanes 目录就是非协作 */ }
+    }
+    if (!cooperative && alive(root)) out.push(view(root, 'main', 'running', 'main', assigned, ownTask))
     for (const name of readdirSync(join(root, 'lanes'), { withFileTypes: true })) {
       if (!name.isDirectory()) continue
       const base = join(root, 'lanes', name.name)

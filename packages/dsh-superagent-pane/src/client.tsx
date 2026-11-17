@@ -1037,7 +1037,7 @@ function TicketBar({ ticket, activity, t, health, confirmStop, onClose, onCommen
               {/* leader 显示 leaderN，队员显示 ccwN —— 徽标本身就说明是哪种角色，不用再去对照名字列 */}
               👑{role === 'leader'
                 ? ` ${labels.get(lane.lane) ?? 'leader'}`
-                : ` ${labels.get(lane.lane) ?? ''}`}
+                : ` ${labels.get(lane.lane) ?? 'ccw'}`}
             </span>
             return <span data-pane-lane-role={lane.lane} title={badge.hint}
               style={{ flexShrink: 0, fontSize: 9.5, padding: '0 5px', borderRadius: 3, lineHeight: 1.5,
