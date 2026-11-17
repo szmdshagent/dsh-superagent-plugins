@@ -1062,11 +1062,15 @@ function TicketBar({ ticket, activity, t, health, confirmStop, onClose, onCommen
           </span>
           {/* 名字列按内容自适应：普通 lane 名（main-verify / orchestrator / l1_w1）必须完整可见，
               只有超过 140px 的极端长名才省略，hover 的 title 仍给完整名。 */}
-          {lane.role !== 'leader' && <span style={{ flexShrink: 0, fontWeight: 600, fontFamily: 'monospace',
-            minWidth: 58, maxWidth: 140, whiteSpace: 'nowrap',
+          {/* 名字列只给 main / other。
+             规则（owner 2026-11-17）：other 之下不再细分角色，身份差异**由 lane 命名体现**
+             （main-verify = 独立验收、w2 = 某次实验产物…），所以这里直接显示真实目录名。
+              leader/worker/切分 的「身份 + 编号」已由徽章和灰字说全，再写一次就成「1 ccw1」。 */}
+          {(lane.role === 'main' || lane.role === 'other') && <span style={{ flexShrink: 0, fontWeight: 600,
+            fontFamily: 'monospace', minWidth: 58, maxWidth: 140, whiteSpace: 'nowrap',
             overflow: 'hidden', textOverflow: 'ellipsis',
             color: lane.state === 'running' ? '#9ae6b4' : '#aaa' }}
-            title={lane.lane}>{lane.role === 'other' ? lane.lane : (labels.get(lane.lane) ?? laneLabel(lane.lane))}</span>}
+            title={lane.lane}>{lane.lane}</span>}
           <span style={{ flexShrink: 0, fontSize: 10, padding: '0 5px', borderRadius: 3,
             background: lane.state === 'running' ? '#1f4d33' : '#333',
             color: lane.state === 'running' ? '#9ae6b4' : '#999' }}>
