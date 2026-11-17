@@ -675,14 +675,14 @@ window.__ModuleLoader__.load({
 		*/
 		const ROLE_BADGE = {
 			main: {
-				label: "⏺ main",
+				label: "main",
 				hint: "这张工单自己的 worker（没有协作模式时由它执行）",
 				bg: "#1b2f52",
 				fg: "#9cc0f0",
 				border: "#2f4f7d"
 			},
 			other: {
-				label: "· oth-ccw",
+				label: "oth-ccw",
 				hint: "协作模式下既不是 leader 也不是 ccworker 的 Claude Code worker（如独立验收）",
 				bg: "#333",
 				fg: "#aaa",
@@ -715,9 +715,8 @@ window.__ModuleLoader__.load({
 			const workerOrder = [];
 			for (const leader of leaders) for (const lane of lanes) if (lane.role === "worker" && lane.leader === leader.lane) workerOrder.push(lane.lane);
 			for (const lane of lanes) if (lane.role === "worker" && !workerOrder.includes(lane.lane)) workerOrder.push(lane.lane);
-			const hasMembers = (lane) => lanes.some((item) => item.role === "worker" && item.leader === lane.lane);
 			let leaderNo = 0;
-			for (const lane of leaders) labels.set(lane.lane, hasMembers(lane) ? `leader${++leaderNo}` : "lead");
+			for (const lane of leaders) labels.set(lane.lane, lane.lane === "orchestrator" ? "切分" : `leader${++leaderNo}`);
 			workerOrder.forEach((lane, index) => labels.set(lane.lane, `ccw${index + 1}`));
 			let mainN = 0;
 			for (const lane of lanes) {
@@ -757,6 +756,7 @@ window.__ModuleLoader__.load({
 					members: [lane]
 				});
 			}
+			groups.sort((a, b) => Number(b.leader.lane === "orchestrator") - Number(a.leader.lane === "orchestrator"));
 			return {
 				groups,
 				loose: lanes.filter((lane) => lane.role !== "leader" && lane.role !== "worker")
@@ -1357,6 +1357,21 @@ window.__ModuleLoader__.load({
 										(lane.role === "leader" || lane.leader || ROLE_BADGE[lane.role ?? "other"]) && (() => {
 											const role = lane.role ?? "other";
 											const badge = ROLE_BADGE[role];
+											if (lane.lane === "orchestrator") return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+												"data-pane-lane-role": lane.lane,
+												title: "切分：把总任务切成块分给各 leader，不负责末尾归纳（与 leader 的职责不同）",
+												style: {
+													flexShrink: 0,
+													fontSize: 9.5,
+													padding: "0 5px",
+													borderRadius: 3,
+													lineHeight: 1.5,
+													background: "#3a2a55",
+													color: "#c9b3f0",
+													border: "1px solid #5c4380"
+												},
+												children: "✂ 切分"
+											});
 											if (role === "leader" || role === "worker" || !badge) return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
 												"data-pane-lane-leader": lane.lane,
 												title: role === "leader" ? "这条 lane 是 leader（统筹），管辖受管辖的 cc-worker" : `这条 cc-worker 归 ${labels.get(lane.leader ?? "") ?? lane.leader} 管辖`,
@@ -1370,7 +1385,7 @@ window.__ModuleLoader__.load({
 													color: role === "leader" ? "#ffd96a" : "#c8e08a",
 													border: "1px solid " + (role === "leader" ? "#8a6a00" : "#5e7030")
 												},
-												children: ["👑", role === "leader" ? ` ${labels.get(lane.lane) ?? "leader"}` : ""]
+												children: ["👑", role === "leader" ? ` ${labels.get(lane.lane) ?? "leader"}` : ` ${labels.get(lane.lane) ?? ""}`]
 											});
 											return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 												"data-pane-lane-role": lane.lane,

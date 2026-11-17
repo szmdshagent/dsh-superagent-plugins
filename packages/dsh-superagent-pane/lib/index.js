@@ -966,7 +966,8 @@ function readLanes(dir, ownTask = "") {
 			if (data && typeof data === "object") for (const [key, members] of Object.entries(data)) {
 				const leader = key.trim();
 				if (!leader || !Array.isArray(members)) continue;
-				map.set(leader, members.filter((lane) => typeof lane === "string").map((lane) => lane.trim()).filter(Boolean));
+				const lanes = members.map((member) => typeof member === "string" ? member.trim() : member && typeof member === "object" && typeof member.lane === "string" ? member.lane.trim() : "").filter(Boolean);
+				map.set(leader, lanes);
 			}
 		} catch {}
 		return map;
@@ -1015,12 +1016,15 @@ function readLanes(dir, ownTask = "") {
 		const leaderOf = (lane) => {
 			for (const [leader, members] of plan) if (members.includes(lane)) return leader;
 		};
-		if (alive(root)) out.push(view(root, "main", "running", "other", assigned, ownTask));
+		if (alive(root)) out.push(view(root, "main", "running", "main", assigned, ownTask));
 		for (const name of readdirSync(join(root, "lanes"), { withFileTypes: true })) {
 			if (!name.isDirectory()) continue;
 			const base = join(root, "lanes", name.name);
 			const leader = leaderOf(name.name);
-			const role = name.name === "lead" || plan.has(name.name) ? "lead" : leader ? "worker" : "other";
+			let role;
+			if (name.name === "orchestrator" || name.name === "lead" || plan.has(name.name)) role = "leader";
+			else if (leader) role = "worker";
+			else role = "other";
 			out.push(view(base, name.name, alive(base) ? "running" : "idle", role, assigned, ownTask, leader));
 		}
 	} catch {}

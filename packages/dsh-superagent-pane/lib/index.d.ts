@@ -124,8 +124,14 @@ declare function paneTrigger(conversation: string, text: string, sender?: string
  * 「在跑」的判据与面板其它地方一致：claude.pid 存在且该 pid 的命令行含 claude。
  * 只读目录，不改任何东西；读不到就当没有 lane。
  */
-/** lane 在协作里的身份：lead=统筹（leader 本身），worker=team-plan.json 里被统领的子任务，other=不受管辖。 */
-type LaneRole = 'lead' | 'worker' | 'other';
+/**
+ * lane 在协作里的身份（owner 2026-11-17 定义，只分四种，不再细分）：
+ *   leader  统筹者。多 leader 里每个 leaderK 是它，顶层切分者 orchestrator 也归它
+ *   worker  被 leader 带领的 ccworker
+ *   main    没有协作模式时，这张工单自己的 worker
+ *   other   协作模式下，既不是 leader 也不是 ccworker 的一切（含独立验收 lane 等）
+ */
+type LaneRole = 'leader' | 'worker' | 'main' | 'other';
 type CrewLaneView = {
   lane: string;
   state: 'running' | 'idle';
