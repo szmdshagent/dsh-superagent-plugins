@@ -507,8 +507,8 @@ type CrewLane = { lane: string; state: 'running' | 'idle'; task?: string
  *   other 协作模式下不属于 leader 的利益方（如独立验收 lane）—— 灰
  */
 const ROLE_BADGE: Record<string, { label: string; hint: string; bg: string; fg: string; border: string }> = {
-  main: { label: '⏺ main', hint: '这张工单自己的 worker（没有协作模式时由它执行）', bg: '#1b2f52', fg: '#9cc0f0', border: '#2f4f7d' },
-  other: { label: '· oth-ccw', hint: '协作模式下既不是 leader 也不是 ccworker 的 Claude Code worker（如独立验收）', bg: '#333', fg: '#aaa', border: '#4a4a4a' },
+  main: { label: 'main', hint: '这张工单自己的 worker（没有协作模式时由它执行）', bg: '#1b2f52', fg: '#9cc0f0', border: '#2f4f7d' },
+  other: { label: 'oth-ccw', hint: '协作模式下既不是 leader 也不是 ccworker 的 Claude Code worker（如独立验收）', bg: '#333', fg: '#aaa', border: '#4a4a4a' },
 }
 
 /**
