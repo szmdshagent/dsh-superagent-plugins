@@ -509,7 +509,16 @@ window.__ModuleLoader__.load({
 			usageCacheWrite: "写",
 			usageCacheWriteUnreported: "—",
 			usageCacheWriteZeroHint: "当前上游通道不返回缓存写入计数（DeepSeek 无缓存写入计费）",
-			usageHitRate: "命中"
+			usageHitRate: "命中",
+			attachAdd: "添加附件（也可拖拽到输入框或直接粘贴图片）",
+			attachUploading: "上传中 {pct}%",
+			attachFailed: "附件上传失败：{error}",
+			attachRemove: "移除附件",
+			attachDrop: "松开即添加到这条消息",
+			attachLimit: "一条消息最多 {n} 个附件",
+			attachOpen: "查看原图",
+			attachDownload: "下载附件",
+			attachBytes: "{size}"
 		};
 		const en = {
 			panel: "Dispatch",
@@ -649,7 +658,16 @@ window.__ModuleLoader__.load({
 			usageCacheWrite: "write",
 			usageCacheWriteUnreported: "—",
 			usageCacheWriteZeroHint: "The current upstream channel does not report cache writes (DeepSeek has no cache-write billing)",
-			usageHitRate: "hit"
+			usageHitRate: "hit",
+			attachAdd: "Add files (you can also drop them here or paste an image)",
+			attachUploading: "Uploading {pct}%",
+			attachFailed: "Attachment upload failed: {error}",
+			attachRemove: "Remove attachment",
+			attachDrop: "Release to attach to this message",
+			attachLimit: "At most {n} files per message",
+			attachOpen: "View original",
+			attachDownload: "Download attachment",
+			attachBytes: "{size}"
 		};
 		/** 工单上"收到却没被读"的条数；由服务端按 inputs 的 readAt 算出后随列表下发。 */
 		function unreadCount(ticket) {
@@ -682,30 +700,30 @@ window.__ModuleLoader__.load({
 				border: "#2f4f7d"
 			},
 			other: {
-				label: "🧑‍🌾 other",
-				hint: "协作模式下既不是 leader 也不是 ccworker 的 Claude Code worker（如独立验收）",
+				label: "👤 other",
+				hint: "平民：协作模式下既不是 leader 也不是 minister 的 Claude Code worker（如独立验收）",
 				bg: "#333",
 				fg: "#aaa",
 				border: "#4a4a4a"
 			}
 		};
 		/**
-		* lane 的显示名：统一叫 ccwN。
-		* 历史 lane 目录名是 w1/w2（2026-11-11 之前的演示），显示时映射成 ccw1/ccw2，
-		* 不改磁盘目录，避免破坏已有记录；新起的 lane 直接命名 ccwN。
+		* lane 的显示名：统一叫 minister N。
+		* 历史 lane 目录名是 w1/w2（2026-11-11 之前的演示），显示时映射成 minister1/minister2，
+		* 不改磁盘目录，避免破坏已有记录；新起的 lane 直接命名 minister N。
 		*/
 		function laneLabel(name) {
 			const match = /^w(\d+)$/.exec(name);
-			return match ? `ccw${match[1]}` : name;
+			return match ? `minister${match[1]}` : name;
 		}
 		/**
 		* lane 目录名 → 显示名（owner 口径，四种身份）：
-		*   leader1/leader2…（统筹者，多 leader 按顺序）、ccw1/ccw2…（跨 leader 连续编号）、
+		*   leader → L1/L2…（统筹者，多 leader 按顺序）、minister → M1/M2…（跨 leader 连续编号）、
 		*   main（无协作时工单自己的 worker）、other/other1…（协作下其余一切）
 		*/
 		/**
 		* lane 目录名 → 显示名，按身份分属不同命名空间，互不撞名（2026-11-17 分细身份）：
-		*   leader → leader1/2…；worker → ccw1/2…（跨 leader 连续编号）
+		*   leader → L1/L2…；worker → M1/M2…（跨 leader 连续编号）
 		*   main → main（这张工单自己的 worker）
 		*   other → 直接用真实 lane 目录名（main-verify / orchestrator / l1_w1…），owner 要求能看清是谁
 		*/
@@ -716,13 +734,16 @@ window.__ModuleLoader__.load({
 			for (const leader of leaders) for (const lane of lanes) if (lane.role === "worker" && lane.leader === leader.lane) workerOrder.push(lane.lane);
 			for (const lane of lanes) if (lane.role === "worker" && !workerOrder.includes(lane.lane)) workerOrder.push(lane.lane);
 			let leaderNo = 0;
-			for (const lane of leaders) labels.set(lane.lane, lane.lane === "orchestrator" ? "切分" : `leader${++leaderNo}`);
-			workerOrder.forEach((lane, index) => labels.set(lane.lane, `ccw${index + 1}`));
+			for (const lane of leaders) labels.set(lane.lane, lane.lane === "orchestrator" ? "切分" : `L${++leaderNo}`);
+			workerOrder.forEach((name, index) => labels.set(name, `M${index + 1}`));
 			let mainN = 0;
+			const taken = new Set(labels.values());
 			for (const lane of lanes) {
 				if (lane.role === "leader" || lane.role === "worker" || labels.has(lane.lane)) continue;
-				if (lane.role === "main") labels.set(lane.lane, mainN++ === 0 ? "main" : `main${mainN}`);
-				else labels.set(lane.lane, lane.lane);
+				if (lane.role === "main") {
+					const name = mainN++ === 0 ? "main" : `main${mainN}`;
+					labels.set(lane.lane, taken.has(name) ? `main:${lane.lane}` : name);
+				} else labels.set(lane.lane, taken.has(lane.lane) ? `other:${lane.lane}` : lane.lane);
 			}
 			return labels;
 		}
@@ -856,6 +877,410 @@ window.__ModuleLoader__.load({
 					};
 				})
 			};
+		}
+		/** 一条消息最多带多少附件（宿主侧同样限制 20）。 */
+		const ATTACH_LIMIT = 20;
+		/** 人类可读的字节数。 */
+		function formatBytes(bytes) {
+			if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+			if (bytes < 1024) return `${bytes} B`;
+			if (bytes < 1048576) return `${(bytes / 1024).toFixed(1)} KB`;
+			return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+		}
+		/** 已取回的附件 blob URL：按 attachmentId+name 缓存，同一附件只拉一次（刷新页面自然重取）。 */
+		const blobUrls = /* @__PURE__ */ new Map();
+		/**
+		* 按引用取回附件字节并转成 blob URL。
+		*
+		* 为什么不用 `<img src="...">` / `<a href>` 直接指向路由：面板路由要求同源管理头
+		* （`x-orchestrator-request`），img/a 发不出自定义头；所以统一带头发取，再交给 blob URL。
+		*/
+		async function attachmentBlobUrl(item) {
+			const cacheKey = `${item.attachmentId}/${item.name}`;
+			const cached = blobUrls.get(cacheKey);
+			if (cached) return cached;
+			const value = token();
+			const query = new URLSearchParams({
+				id: item.attachmentId,
+				name: item.name
+			});
+			if (value) query.set("token", value);
+			const response = await fetch(`${API}/file?${query.toString()}`, {
+				headers: { "x-orchestrator-request": "1" },
+				credentials: "same-origin",
+				cache: "no-store"
+			});
+			if (!response.ok) throw new Error(`HTTP ${response.status}`);
+			const url = URL.createObjectURL(await response.blob());
+			blobUrls.set(cacheKey, url);
+			return url;
+		}
+		/** 一张图片附件：取回字节后显示缩略图，点击用 blob URL 打开原图。 */
+		function AttachmentImage({ item, t }) {
+			const [url, setUrl] = (0, react.useState)("");
+			const [failed, setFailed] = (0, react.useState)(false);
+			(0, react.useEffect)(() => {
+				let live = true;
+				attachmentBlobUrl(item).then((value) => {
+					if (live) setUrl(value);
+				}).catch(() => {
+					if (live) setFailed(true);
+				});
+				return () => {
+					live = false;
+				};
+			}, [item.attachmentId, item.name]);
+			if (failed) return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+				"data-pane-message-image-failed": item.name,
+				title: item.name,
+				style: {
+					fontSize: 11,
+					opacity: .7
+				},
+				children: ["🖼 ", item.name]
+			});
+			if (!url) return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+				"data-pane-message-image-loading": item.name,
+				style: {
+					display: "inline-block",
+					height: 64,
+					width: 64,
+					borderRadius: 6,
+					background: "rgba(0,0,0,.2)"
+				}
+			});
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("a", {
+				href: url,
+				target: "_blank",
+				rel: "noreferrer",
+				"data-pane-message-image": item.name,
+				title: `${t("attachOpen")}：${item.name}`,
+				style: { display: "block" },
+				children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("img", {
+					src: url,
+					alt: item.name,
+					style: {
+						height: 64,
+						maxWidth: 240,
+						objectFit: "cover",
+						borderRadius: 6,
+						border: "1px solid rgba(255,255,255,.2)",
+						background: "rgba(0,0,0,.2)"
+					}
+				})
+			});
+		}
+		/** 一个文件附件：取回字节后以下载链接呈现（docx/txt 等浏览器不能内嵌预览的类型）。 */
+		function AttachmentFile({ item, t }) {
+			const [url, setUrl] = (0, react.useState)("");
+			(0, react.useEffect)(() => {
+				let live = true;
+				attachmentBlobUrl(item).then((value) => {
+					if (live) setUrl(value);
+				}).catch(() => {});
+				return () => {
+					live = false;
+				};
+			}, [item.attachmentId, item.name]);
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("a", {
+				...url ? {
+					href: url,
+					download: item.name
+				} : {},
+				"data-pane-message-file": item.name,
+				title: `${t("attachDownload")}：${item.name}`,
+				style: {
+					display: "flex",
+					alignItems: "center",
+					gap: 6,
+					maxWidth: 240,
+					height: 40,
+					padding: "0 8px",
+					borderRadius: 6,
+					fontSize: 11,
+					textDecoration: "none",
+					color: "inherit",
+					cursor: url ? "pointer" : "default",
+					border: "1px solid rgba(255,255,255,.25)",
+					background: "rgba(0,0,0,.18)"
+				},
+				children: [
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+						style: { flexShrink: 0 },
+						children: "📄"
+					}),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+						style: {
+							minWidth: 0,
+							overflow: "hidden",
+							textOverflow: "ellipsis",
+							whiteSpace: "nowrap"
+						},
+						children: item.name
+					}),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+						style: {
+							flexShrink: 0,
+							opacity: .7
+						},
+						children: formatBytes(item.bytes)
+					})
+				]
+			});
+		}
+		/** 图片类附件按扩展名判断：只有这些在消息流里渲染缩略图。 */
+		function isImageAttachment(name) {
+			return /\.(png|jpe?g|gif|webp|bmp)$/i.test(name);
+		}
+		/**
+		* 上传一个文件并返回附件引用。用 XHR 而不是 fetch：需要上传进度（大文件、Word/图片都有感）。
+		* 字节直接作为请求体发送，文件名走查询参数（服务端会做与 DSH 附件存储一致的清洗）。
+		*/
+		function uploadPaneFile(file, onProgress, signal) {
+			return new Promise((resolve, reject) => {
+				const value = token();
+				const query = new URLSearchParams({ name: file.name || "file" });
+				if (value) query.set("token", value);
+				const xhr = new XMLHttpRequest();
+				xhr.open("POST", `${API}/upload?${query.toString()}`);
+				xhr.setRequestHeader("x-orchestrator-request", "1");
+				xhr.setRequestHeader("content-type", "application/octet-stream");
+				xhr.upload.onprogress = (event) => {
+					if (event.lengthComputable) onProgress(Math.round(event.loaded / event.total * 100));
+				};
+				xhr.onerror = () => reject(/* @__PURE__ */ new Error("网络错误"));
+				xhr.onabort = () => reject(/* @__PURE__ */ new Error("已取消"));
+				xhr.onload = () => {
+					let body = {};
+					try {
+						body = JSON.parse(xhr.responseText);
+					} catch {
+						body = {};
+					}
+					if (xhr.status >= 200 && xhr.status < 300 && typeof body?.attachmentId === "string") resolve(body);
+					else reject(new Error(body?.error ?? `HTTP ${xhr.status}`));
+				};
+				signal.addEventListener("abort", () => xhr.abort(), { once: true });
+				xhr.send(file);
+			});
+		}
+		/** 展示用文件名：只留叶子名（浏览器不会给完整路径，这里只是防御）。 */
+		function paneLocalName(file) {
+			return (file.name || "file").replace(/\\/g, "/").split("/").pop() || "file";
+		}
+		/** 粘贴板里的文件：截图走 `clipboardData.files`，部分浏览器只有 items，两路都取。 */
+		function clipboardFiles(data) {
+			if (!data) return [];
+			const files = Array.from(data.files ?? []);
+			if (files.length > 0) return files;
+			return Array.from(data.items ?? []).filter((item) => item.kind === "file").map((item) => item.getAsFile()).filter((file) => !!file);
+		}
+		/** 给粘贴进来的图片起个带时间戳的名字：浏览器给的 clipboard 文件常叫 image.png，会互相覆盖展示名。 */
+		function namePastedFile(file) {
+			if (file.name && file.name !== "image.png" && file.name !== "blob") return file;
+			const ext = file.type === "image/jpeg" ? "jpg" : file.type === "image/gif" ? "gif" : file.type === "image/webp" ? "webp" : "png";
+			const now = /* @__PURE__ */ new Date();
+			const pad = (value) => String(value).padStart(2, "0");
+			const name = `粘贴图片-${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}.${ext}`;
+			return new File([file], name, { type: file.type });
+		}
+		const EMPTY_ATTACHMENTS = [];
+		/** 草稿附件状态：选择/拖拽/粘贴共用，上传完成才允许发送。 */
+		function useAttachmentDrafts(t) {
+			const [items, setItems] = (0, react.useState)(EMPTY_ATTACHMENTS);
+			const [error, setError] = (0, react.useState)("");
+			const abortRef = (0, react.useRef)(null);
+			/** 当前草稿的快照：连续两次选择/粘贴时也要算准剩余名额（不能依赖异步的 state）。 */
+			const itemsRef = (0, react.useRef)(EMPTY_ATTACHMENTS);
+			(0, react.useEffect)(() => () => {
+				abortRef.current?.abort();
+			}, []);
+			const update = (0, react.useCallback)((draftId, patch) => {
+				setItems((previous) => previous.map((item) => item.draftId === draftId ? {
+					...item,
+					...patch
+				} : item));
+			}, []);
+			return {
+				items,
+				add: (0, react.useCallback)(async (incoming) => {
+					const files = Array.from(incoming);
+					if (files.length === 0) return;
+					setError("");
+					const controller = abortRef.current ?? new AbortController();
+					abortRef.current = controller;
+					const seen = new Set(itemsRef.current.filter((item) => item.state !== "error").map((item) => `${item.name}/${item.bytes}`));
+					const fresh = files.filter((file) => {
+						const identity = `${paneLocalName(file)}/${file.size}`;
+						if (seen.has(identity)) return false;
+						seen.add(identity);
+						return true;
+					});
+					const room = ATTACH_LIMIT - itemsRef.current.length;
+					if (fresh.length > room) setError(fill(t("attachLimit"), { n: String(ATTACH_LIMIT) }));
+					const accepted = fresh.slice(0, Math.max(0, room)).map((file) => ({
+						draftId: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+						attachmentId: "",
+						name: paneLocalName(file),
+						bytes: file.size,
+						state: "uploading",
+						pct: void 0
+					}));
+					if (accepted.length === 0) return;
+					itemsRef.current = [...itemsRef.current, ...accepted];
+					setItems(itemsRef.current);
+					for (const [index, draft] of accepted.entries()) uploadPaneFile(fresh[index], (pct) => update(draft.draftId, { pct }), controller.signal).then((ref) => update(draft.draftId, {
+						...ref,
+						state: "done",
+						pct: 100
+					})).catch((failure) => update(draft.draftId, {
+						state: "error",
+						error: failure instanceof Error ? failure.message : String(failure)
+					}));
+				}, [t, update]),
+				remove: (0, react.useCallback)((draftId) => {
+					itemsRef.current = itemsRef.current.filter((item) => item.draftId !== draftId);
+					setItems(itemsRef.current);
+				}, []),
+				clear: (0, react.useCallback)(() => {
+					itemsRef.current = EMPTY_ATTACHMENTS;
+					setItems(EMPTY_ATTACHMENTS);
+					setError("");
+				}, []),
+				ready: items.filter((item) => item.state === "done").map((item) => ({
+					attachmentId: item.attachmentId,
+					name: item.name,
+					bytes: item.bytes
+				})),
+				error,
+				setError
+			};
+		}
+		/** 草稿附件栏：横向排列的文件卡，上传中显示进度，失败显示原因，悬停放大移除按钮。 */
+		function AttachmentRail({ items, onRemove, t }) {
+			if (items.length === 0) return null;
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+				"data-pane-attachment-rail": "",
+				style: {
+					display: "flex",
+					flexWrap: "wrap",
+					gap: 6
+				},
+				children: items.map((item) => {
+					const failed = item.state === "error";
+					return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+						"data-pane-attachment-draft": item.name,
+						title: failed ? fill(t("attachFailed"), { error: item.error ?? "" }) : item.path ?? item.name,
+						style: {
+							display: "flex",
+							alignItems: "center",
+							gap: 6,
+							maxWidth: 240,
+							padding: "3px 6px",
+							borderRadius: 6,
+							fontSize: 11,
+							border: `1px solid ${failed ? "#e53e3e" : "var(--dt-border, #333)"}`,
+							background: "var(--dt-surface, #2d2d2d)",
+							opacity: item.state === "uploading" ? .75 : 1
+						},
+						children: [
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								style: { flexShrink: 0 },
+								children: failed ? "⚠" : isImageAttachment(item.name) ? "🖼" : "📄"
+							}),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								style: {
+									minWidth: 0,
+									overflow: "hidden",
+									textOverflow: "ellipsis",
+									whiteSpace: "nowrap"
+								},
+								children: item.name
+							}),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								style: {
+									flexShrink: 0,
+									opacity: .6
+								},
+								children: item.state === "uploading" ? fill(t("attachUploading"), { pct: String(item.pct ?? 0) }) : formatBytes(item.bytes)
+							}),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+								type: "button",
+								"data-pane-attachment-remove": item.name,
+								"aria-label": t("attachRemove"),
+								title: t("attachRemove"),
+								onClick: () => onRemove(item.draftId),
+								style: {
+									flexShrink: 0,
+									background: "none",
+									border: "none",
+									cursor: "pointer",
+									padding: 0,
+									fontSize: 12,
+									color: "inherit",
+									opacity: .6
+								},
+								children: "×"
+							})
+						]
+					}, item.draftId);
+				})
+			});
+		}
+		/** 消息流里的附件：图片显示缩略图（点击看原图），其它文件显示可下载的文件卡。 */
+		function MessageAttachments({ items, t }) {
+			if (items.length === 0) return null;
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+				"data-pane-message-attachments": "",
+				style: {
+					display: "flex",
+					flexWrap: "wrap",
+					gap: 6,
+					marginTop: 6
+				},
+				children: items.map((item) => isImageAttachment(item.name) ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)(AttachmentImage, {
+					item,
+					t
+				}, item.attachmentId + item.name) : /* @__PURE__ */ (0, react_jsx_runtime.jsx)(AttachmentFile, {
+					item,
+					t
+				}, item.attachmentId + item.name))
+			});
+		}
+		/** 附件按钮 + 隐藏的文件选择框：主输入区与工单意见框共用。 */
+		function AttachButton({ disabled, onFiles, t }) {
+			const inputRef = (0, react.useRef)(null);
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+				ref: inputRef,
+				type: "file",
+				multiple: true,
+				"data-pane-attach-input": "",
+				style: { display: "none" },
+				onChange: (event) => {
+					const files = event.target.files;
+					if (files && files.length) onFiles(files);
+				}
+			}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+				type: "button",
+				"data-pane-attach": "",
+				"aria-label": t("attachAdd"),
+				title: t("attachAdd"),
+				disabled,
+				onClick: () => {
+					if (inputRef.current) inputRef.current.value = "";
+					inputRef.current?.click();
+				},
+				style: {
+					height: 24,
+					padding: "0 8px",
+					fontSize: 12,
+					lineHeight: 1,
+					flexShrink: 0,
+					opacity: disabled ? .4 : .8,
+					cursor: disabled ? "not-allowed" : "pointer"
+				},
+				children: "📎"
+			})] });
 		}
 		/** 工具名到文案键的映射；未知工具直接显示原名。 */
 		const TOOL_KEYS = {
@@ -1059,15 +1484,22 @@ window.__ModuleLoader__.load({
 			const [commentDraft, setCommentDraft] = (0, react.useState)("");
 			const [commentState, setCommentState] = (0, react.useState)("idle");
 			const [commentError, setCommentError] = (0, react.useState)("");
+			const [commentDrop, setCommentDrop] = (0, react.useState)(false);
 			const commentRef = (0, react.useRef)(null);
+			const commentFiles = useAttachmentDrafts(t);
 			const submitComment = async () => {
 				const text = commentDraft.trim();
-				if (!text || commentState === "busy" || !onComment) return;
+				if (!text && commentFiles.ready.length === 0 || commentState === "busy" || !onComment) return;
+				if (commentFiles.items.some((item) => item.state === "uploading")) {
+					commentFiles.setError(fill(t("attachUploading"), { pct: "…" }));
+					return;
+				}
 				setCommentState("busy");
 				setCommentError("");
 				try {
-					await onComment(ticket, text);
+					await onComment(ticket, text, commentFiles.ready);
 					setCommentDraft("");
+					commentFiles.clear();
 					setCommentState("ok");
 				} catch (failure) {
 					setCommentState("error");
@@ -1285,7 +1717,7 @@ window.__ModuleLoader__.load({
 							}
 							const looseLabel = {
 								main: "工单自己的 worker",
-								other: "oth-ccw（非 leader / 非 ccworker）"
+								other: "oth-minister（非 leader / 非 minister）"
 							};
 							for (const lane of loose) ordered.push({
 								lane,
@@ -1293,9 +1725,9 @@ window.__ModuleLoader__.load({
 								section: looseLabel[lane.role ?? "other"] ?? "其它"
 							});
 							return ordered.map(({ lane, level, first, last, section }) => {
-								const kindName = lane.lane === "orchestrator" ? "切分" : lane.role === "leader" ? "leader" : lane.role === "worker" ? "ccw" : lane.role === "main" ? "main" : "other";
+								lane.lane === "orchestrator" || lane.role === "leader" || lane.role === "worker" || lane.role;
 								const kindNo = labels.get(lane.lane) ?? "";
-								const kindText = kindName === "other" ? kindNo || lane.lane : kindNo.replace(/^(leader|ccw)\s*/, "");
+								const kindText = /^[LM]\d+$/.test(kindNo) ? kindNo : lane.role === "other" ? lane.lane : "";
 								const kindHint = lane.role === "leader" ? "统筹：分配任务并在末尾归纳自己那块" : lane.role === "worker" ? `队员：归 ${labels.get(lane.leader ?? "") ?? lane.leader ?? "?"} 管辖` : lane.lane === "orchestrator" ? "切分：只把总任务切块分给各 leader，不做末尾归纳" : lane.role === "main" ? "这张工单自己的 worker（无协作模式时）" : "协作模式下非 leader 非队员的 lane";
 								const indent = level === 2;
 								const op = laneOps[lane.lane];
@@ -1389,7 +1821,7 @@ window.__ModuleLoader__.load({
 													color: role === "leader" ? "#ffd96a" : "#c8e08a",
 													border: "1px solid " + (role === "leader" ? "#8a6a00" : "#5e7030")
 												},
-												children: role === "leader" ? "👑 leader" : "🎩 ccw"
+												children: role === "leader" ? "👑 leader" : "🎩 minister"
 											});
 											return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 												"data-pane-lane-role": lane.lane,
@@ -1419,7 +1851,7 @@ window.__ModuleLoader__.load({
 											},
 											children: kindText
 										}),
-										lane.role !== "leader" && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+										lane.role === "main" && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 											style: {
 												flexShrink: 0,
 												fontWeight: 600,
@@ -1432,7 +1864,7 @@ window.__ModuleLoader__.load({
 												color: lane.state === "running" ? "#9ae6b4" : "#aaa"
 											},
 											title: lane.lane,
-											children: labels.get(lane.lane) ?? laneLabel(lane.lane)
+											children: lane.lane
 										}),
 										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 											style: {
@@ -1444,6 +1876,19 @@ window.__ModuleLoader__.load({
 												color: lane.state === "running" ? "#9ae6b4" : "#999"
 											},
 											children: lane.state === "running" ? "运行中" : "空闲"
+										}),
+										(lane.sessions ?? 0) > 1 && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+											"data-pane-lane-sessions": lane.lane,
+											title: `这个 cc-worker 用了 ${lane.sessions} 个会话（上下文到上限时由 handoff 换会话），计数仍为 1 个 worker`,
+											style: {
+												flexShrink: 0,
+												fontSize: 10,
+												padding: "0 5px",
+												borderRadius: 3,
+												background: "#2c3e50",
+												color: "#9fb3c8"
+											},
+											children: [lane.sessions, " 个 handoff 会话 · 同一 worker"]
 										}),
 										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 											style: {
@@ -1594,12 +2039,28 @@ window.__ModuleLoader__.load({
 					}),
 					expanded && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 						"data-pane-ticket-comment-box": ticket.id,
+						onDragOver: (event) => {
+							if (Array.from(event.dataTransfer?.types ?? []).includes("Files")) {
+								event.preventDefault();
+								setCommentDrop(true);
+							}
+						},
+						onDragLeave: () => setCommentDrop(false),
+						onDrop: (event) => {
+							const files = Array.from(event.dataTransfer?.files ?? []);
+							if (files.length === 0) return;
+							event.preventDefault();
+							setCommentDrop(false);
+							commentFiles.add(files);
+						},
 						style: {
 							display: "flex",
 							flexDirection: "column",
 							gap: 4,
 							borderTop: "1px solid var(--dt-border, #333)",
-							paddingTop: 5
+							paddingTop: 5,
+							outline: commentDrop ? "1px dashed var(--dt-accent, #2b6cb0)" : "none",
+							outlineOffset: 2
 						},
 						children: [
 							/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
@@ -1608,61 +2069,89 @@ window.__ModuleLoader__.load({
 									gap: 4,
 									alignItems: "flex-end"
 								},
-								children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("textarea", {
-									ref: commentRef,
-									"data-pane-ticket-comment-input": ticket.id,
-									value: commentDraft,
-									rows: 1,
-									placeholder: t("commentPlaceholder"),
-									"aria-label": t("commentPlaceholder"),
-									disabled: commentState === "busy",
-									onChange: (event) => {
-										setCommentDraft(event.target.value);
-										if (commentState === "ok" || commentState === "error") setCommentState("idle");
-									},
-									onKeyDown: (event) => {
-										if (event.key === "Enter" && !event.shiftKey) {
+								children: [
+									/* @__PURE__ */ (0, react_jsx_runtime.jsx)("textarea", {
+										ref: commentRef,
+										"data-pane-ticket-comment-input": ticket.id,
+										value: commentDraft,
+										rows: 1,
+										placeholder: t("commentPlaceholder"),
+										"aria-label": t("commentPlaceholder"),
+										disabled: commentState === "busy",
+										onChange: (event) => {
+											setCommentDraft(event.target.value);
+											if (commentState === "ok" || commentState === "error") setCommentState("idle");
+										},
+										onKeyDown: (event) => {
+											if (event.key === "Enter" && !event.shiftKey) {
+												event.preventDefault();
+												submitComment();
+											}
+										},
+										onPaste: (event) => {
+											const files = clipboardFiles(event.clipboardData);
+											if (files.length === 0) return;
 											event.preventDefault();
-											submitComment();
+											commentFiles.add(files.map(namePastedFile));
+										},
+										style: {
+											flex: "1 1 0",
+											minWidth: 0,
+											minHeight: 26,
+											maxHeight: 110,
+											resize: "vertical",
+											fontSize: 12,
+											padding: "3px 6px",
+											border: "1px solid var(--dt-border, #333)",
+											borderRadius: 6,
+											background: "var(--dt-surface, #2d2d2d)",
+											color: "inherit"
 										}
-									},
-									style: {
-										flex: "1 1 0",
-										minWidth: 0,
-										minHeight: 26,
-										maxHeight: 110,
-										resize: "vertical",
-										fontSize: 12,
-										padding: "3px 6px",
-										border: "1px solid var(--dt-border, #333)",
-										borderRadius: 6,
-										background: "var(--dt-surface, #2d2d2d)",
-										color: "inherit"
-									}
-								}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
-									type: "button",
-									"data-pane-ticket-comment-send": ticket.id,
-									"aria-label": t("commentSend"),
-									title: t("commentSend"),
-									disabled: commentState === "busy" || !commentDraft.trim(),
-									onClick: (event) => {
-										event.stopPropagation();
-										submitComment();
-									},
-									style: {
-										flexShrink: 0,
-										height: 26,
-										padding: "0 8px",
-										fontSize: 12,
-										lineHeight: 1,
-										borderRadius: 6,
-										border: "1px solid var(--dt-border, #333)",
-										background: commentState === "busy" || !commentDraft.trim() ? "transparent" : "var(--dt-accent, #2b6cb0)",
-										color: commentState === "busy" || !commentDraft.trim() ? "inherit" : "#fff",
-										cursor: commentState === "busy" || !commentDraft.trim() ? "not-allowed" : "pointer"
-									},
-									children: commentState === "busy" ? t("commentSending") : t("commentSend")
-								})]
+									}),
+									/* @__PURE__ */ (0, react_jsx_runtime.jsx)(AttachButton, {
+										disabled: commentState === "busy",
+										onFiles: (files) => {
+											commentFiles.add(files);
+										},
+										t
+									}),
+									/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+										type: "button",
+										"data-pane-ticket-comment-send": ticket.id,
+										"aria-label": t("commentSend"),
+										title: t("commentSend"),
+										disabled: commentState === "busy" || !commentDraft.trim() && commentFiles.ready.length === 0,
+										onClick: (event) => {
+											event.stopPropagation();
+											submitComment();
+										},
+										style: {
+											flexShrink: 0,
+											height: 26,
+											padding: "0 8px",
+											fontSize: 12,
+											lineHeight: 1,
+											borderRadius: 6,
+											border: "1px solid var(--dt-border, #333)",
+											background: commentState === "busy" || !commentDraft.trim() && commentFiles.ready.length === 0 ? "transparent" : "var(--dt-accent, #2b6cb0)",
+											color: commentState === "busy" || !commentDraft.trim() && commentFiles.ready.length === 0 ? "inherit" : "#fff",
+											cursor: commentState === "busy" || !commentDraft.trim() && commentFiles.ready.length === 0 ? "not-allowed" : "pointer"
+										},
+										children: commentState === "busy" ? t("commentSending") : t("commentSend")
+									})
+								]
+							}),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)(AttachmentRail, {
+								items: commentFiles.items,
+								onRemove: commentFiles.remove,
+								t
+							}),
+							commentFiles.error && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								style: {
+									fontSize: 11,
+									color: "#e53e3e"
+								},
+								children: commentFiles.error
 							}),
 							commentState === "ok" && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
 								"data-pane-ticket-comment-status": ticket.id,
@@ -2332,6 +2821,10 @@ window.__ModuleLoader__.load({
 			const [mode, setMode] = (0, react.useState)("assign");
 			const [busy, setBusy] = (0, react.useState)(false);
 			const [error, setError] = (0, react.useState)(null);
+			/** 主输入区的附件草稿（选择/拖拽/粘贴共用一套）。 */
+			const draftFiles = useAttachmentDrafts(t);
+			/** 拖拽文件悬停在主输入区时的提示态。 */
+			const [draftDrop, setDraftDrop] = (0, react.useState)(false);
 			/** 每张工单的协作 lane 明细（/crew）：直接显示在各自工单卡上，不再走右上角汇总。 */
 			const [crew, setCrew] = (0, react.useState)(null);
 			const [tickets, setTickets] = (0, react.useState)([]);
@@ -2713,7 +3206,12 @@ window.__ModuleLoader__.load({
 			}, [confirmStop]);
 			const send = async () => {
 				const text = draft.trim();
-				if (!text || busy) return;
+				const attachments = draftFiles.ready;
+				if (!text && attachments.length === 0 || busy) return;
+				if (draftFiles.items.some((item) => item.state === "uploading")) {
+					setError(fill(t("attachUploading"), { pct: "…" }));
+					return;
+				}
 				setBusy(true);
 				setError(null);
 				try {
@@ -2722,10 +3220,12 @@ window.__ModuleLoader__.load({
 						body: JSON.stringify({
 							conversation,
 							text,
-							mode
+							mode,
+							...attachments.length ? { attachments } : {}
 						})
 					});
 					setDraft("");
+					draftFiles.clear();
 					setDivertedNotice(typeof sent?.diverted === "string" ? sent.diverted : "");
 					pinnedRef.current = true;
 					await load();
@@ -2739,14 +3239,15 @@ window.__ModuleLoader__.load({
 			};
 			/** 把「给某张工单的意见」发到这张工单专属的意见会话 t<id>：该线程没有工单订阅，消息不会广播给同对话其它工单，
 			*  只走 Eval → 路由器按文本里的工单 id 挂到那一张。 */
-			const commentOnTicket = (0, react.useCallback)(async (ticket, text) => {
+			const commentOnTicket = (0, react.useCallback)(async (ticket, text, attachments = []) => {
 				const composed = `【给工单「${ticket.title}」(${ticket.id}) 的意见，请交给该工单的 worker，不要新建工单】\n${text}`;
 				const sent = await call("/message", {
 					method: "POST",
 					body: JSON.stringify({
 						conversation: commentConversation(ticket.id),
 						text: composed,
-						mode: "note"
+						mode: "note",
+						...attachments.length ? { attachments } : {}
 					})
 				});
 				setDivertedNotice(typeof sent?.diverted === "string" ? sent.diverted : "");
@@ -2946,39 +3447,46 @@ window.__ModuleLoader__.load({
 								background: item.direction === "in" ? "var(--dt-accent, #2b6cb0)" : "var(--dt-surface, #2d2d2d)",
 								color: item.direction === "in" ? "#fff" : "inherit"
 							},
-							children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
-								style: {
-									fontSize: 11,
-									opacity: .7,
-									marginBottom: 2
-								},
-								children: [
-									item.direction === "in" ? t("you") : `${t("agent")}${item.kind ? ` · ${item.kind}` : ""}`,
-									item.direction === "in" && item.status === "scheduled" && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-										style: {
-											marginLeft: 6,
-											padding: "0 5px",
-											borderRadius: 3,
-											background: "#2f4f37",
-											color: "#9ae6b4",
-											fontSize: 10
-										},
-										children: t("badgeScheduled")
-									}),
-									item.direction === "in" && decisionBadge(item) && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-										title: item.decision?.reason ?? "",
-										style: {
-											marginLeft: 6,
-											padding: "0 5px",
-											borderRadius: 3,
-											background: "#8a5a00",
-											color: "#ffd88a",
-											fontSize: 10
-										},
-										children: decisionBadge(item)
-									})
-								]
-							}), item.text]
+							children: [
+								/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+									style: {
+										fontSize: 11,
+										opacity: .7,
+										marginBottom: 2
+									},
+									children: [
+										item.direction === "in" ? t("you") : `${t("agent")}${item.kind ? ` · ${item.kind}` : ""}`,
+										item.direction === "in" && item.status === "scheduled" && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											style: {
+												marginLeft: 6,
+												padding: "0 5px",
+												borderRadius: 3,
+												background: "#2f4f37",
+												color: "#9ae6b4",
+												fontSize: 10
+											},
+											children: t("badgeScheduled")
+										}),
+										item.direction === "in" && decisionBadge(item) && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											title: item.decision?.reason ?? "",
+											style: {
+												marginLeft: 6,
+												padding: "0 5px",
+												borderRadius: 3,
+												background: "#8a5a00",
+												color: "#ffd88a",
+												fontSize: 10
+											},
+											children: decisionBadge(item)
+										})
+									]
+								}),
+								item.text,
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)(MessageAttachments, {
+									items: item.attachments ?? [],
+									t
+								})
+							]
 						}, item.id))
 					}),
 					divertedNotice && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
@@ -3021,67 +3529,129 @@ window.__ModuleLoader__.load({
 					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 						style: {
 							display: "flex",
-							gap: 8,
-							alignItems: "stretch"
+							flexDirection: "column",
+							gap: 6
 						},
-						children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("textarea", {
-							value: draft,
-							onChange: (event) => setDraft(event.target.value),
-							placeholder: mode === "chat" ? t("placeholderChat") : mode === "broadcast" ? t("placeholderBroadcast") : t("placeholder"),
-							rows: 3,
-							onKeyDown: (event) => {
-								if (event.key === "Enter" && !event.shiftKey) {
-									event.preventDefault();
-									send();
-								}
-							},
-							style: {
-								flex: 1,
-								resize: "vertical",
-								padding: 8
+						onDragOver: (event) => {
+							if (Array.from(event.dataTransfer?.types ?? []).includes("Files")) {
+								event.preventDefault();
+								setDraftDrop(true);
 							}
-						}), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
-							style: {
-								display: "flex",
-								flexDirection: "column",
-								gap: 6,
-								justifyContent: "space-between"
-							},
-							children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+						},
+						onDragLeave: () => setDraftDrop(false),
+						onDrop: (event) => {
+							const files = Array.from(event.dataTransfer?.files ?? []);
+							if (files.length === 0) return;
+							event.preventDefault();
+							setDraftDrop(false);
+							draftFiles.add(files);
+						},
+						children: [
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)(AttachmentRail, {
+								items: draftFiles.items,
+								onRemove: draftFiles.remove,
+								t
+							}),
+							draftFiles.error && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+								role: "alert",
+								style: {
+									fontSize: 11,
+									color: "#e53e3e"
+								},
+								children: draftFiles.error
+							}),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 								style: {
 									display: "flex",
-									border: "1px solid var(--dt-border, #333)",
-									borderRadius: 6,
-									overflow: "hidden"
+									gap: 8,
+									alignItems: "stretch"
 								},
-								children: [
-									"assign",
-									"broadcast",
-									"chat"
-								].map((item) => /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
-									type: "button",
-									onClick: () => setMode(item),
-									title: item === "chat" ? t("placeholderChat") : item === "broadcast" ? t("placeholderBroadcast") : "",
-									style: {
-										padding: "3px 10px",
-										fontSize: 12,
-										border: "none",
-										cursor: "pointer",
-										background: mode === item ? "var(--dt-accent, #2b6cb0)" : "transparent",
-										color: mode === item ? "#fff" : "inherit"
+								children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("textarea", {
+									"data-pane-draft": "",
+									value: draft,
+									onChange: (event) => setDraft(event.target.value),
+									placeholder: mode === "chat" ? t("placeholderChat") : mode === "broadcast" ? t("placeholderBroadcast") : t("placeholder"),
+									rows: 3,
+									onKeyDown: (event) => {
+										if (event.key === "Enter" && !event.shiftKey) {
+											event.preventDefault();
+											send();
+										}
 									},
-									children: item === "assign" ? t("modeDispatch") : item === "broadcast" ? t("modeBroadcast") : t("modeChat")
-								}, item))
-							}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
-								type: "button",
-								style: { padding: "6px 12px" },
-								disabled: busy || !draft.trim(),
-								onClick: () => {
-									send();
-								},
-								children: busy ? t("sending") : t("send")
-							})]
-						})]
+									onPaste: (event) => {
+										const files = clipboardFiles(event.clipboardData);
+										if (files.length === 0) return;
+										event.preventDefault();
+										draftFiles.add(files.map(namePastedFile));
+									},
+									style: {
+										flex: 1,
+										resize: "vertical",
+										padding: 8,
+										outline: draftDrop ? "1px dashed var(--dt-accent, #2b6cb0)" : "none",
+										outlineOffset: 2
+									}
+								}), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+									style: {
+										display: "flex",
+										flexDirection: "column",
+										gap: 6,
+										justifyContent: "space-between"
+									},
+									children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+										style: {
+											display: "flex",
+											border: "1px solid var(--dt-border, #333)",
+											borderRadius: 6,
+											overflow: "hidden"
+										},
+										children: [
+											"assign",
+											"broadcast",
+											"chat"
+										].map((item) => /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+											type: "button",
+											onClick: () => setMode(item),
+											title: item === "chat" ? t("placeholderChat") : item === "broadcast" ? t("placeholderBroadcast") : "",
+											style: {
+												padding: "3px 10px",
+												fontSize: 12,
+												border: "none",
+												cursor: "pointer",
+												background: mode === item ? "var(--dt-accent, #2b6cb0)" : "transparent",
+												color: mode === item ? "#fff" : "inherit"
+											},
+											children: item === "assign" ? t("modeDispatch") : item === "broadcast" ? t("modeBroadcast") : t("modeChat")
+										}, item))
+									}), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+										style: {
+											display: "flex",
+											gap: 6,
+											alignItems: "center"
+										},
+										children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)(AttachButton, {
+											disabled: busy,
+											onFiles: (files) => {
+												draftFiles.add(files);
+											},
+											t
+										}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+											type: "button",
+											"data-pane-send": "",
+											style: {
+												padding: "6px 12px",
+												flex: 1
+											},
+											disabled: busy || !draft.trim() && draftFiles.ready.length === 0,
+											onClick: () => {
+												send();
+											},
+											children: busy ? t("sending") : t("send")
+										})]
+									})]
+								})]
+							})
+						]
 					}),
 					mode === "chat" && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
 						style: {

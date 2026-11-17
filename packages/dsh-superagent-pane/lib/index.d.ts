@@ -77,8 +77,27 @@ declare module '@deepseek-ai/cordis' {
         close(): Promise<void>;
       }>;
     };
+    /**
+     * DSH 自带的附件存储（`@deepseek-ai/dsh-attachment-local` 提供）。面板复用它保存消息附件：
+     * 内容寻址、按字节原样落盘，`fileHostPath` 给出宿主机绝对路径，worker 直接按路径读取。
+     */
+    attachments: {
+      saveFileStream(input: {
+        data: AsyncIterable<Uint8Array>;
+        name?: string;
+        signal?: AbortSignal;
+      }): Promise<PaneFileRef>;
+      readFileStream(ref: PaneFileRef, signal?: AbortSignal): AsyncIterable<Uint8Array>;
+      fileHostPath(ref: PaneFileRef): string | undefined;
+    };
   }
 }
+/** DSH 附件引用（与 `@deepseek-ai/dsh-attachment` 的 FileAttachmentRef 同形）。 */
+type PaneFileRef = {
+  attachmentId: string;
+  name: string;
+  bytes: number;
+};
 /** 只读消费的会话事件形状；只关心 `type`/`time`/`data`，其余字段不理会。 */
 type PaneSessionEvent = {
   type?: string;
@@ -140,6 +159,12 @@ type CrewLaneView = {
   role: LaneRole;
   /** 这条 lane 归谁管辖（team 模式下是 lead 的名字）；不受管辖时没有该字段。 */
   leader?: string;
+  /** 逻辑 cc worker id：handoff 换会话保持不变（cc-worker 写的 worker-id，旧数据回退到「目录#lane」）。 */
+  workerId: string;
+  /** 本 lane 当前的 Claude Code 会话 id。 */
+  sessionId?: string;
+  /** 本 lane 用过的会话数；>1 说明中间发生过 handoff 换会话，但仍是一个 cc worker。 */
+  sessions: number;
 };
 /**
  * 把 team-plan 里的派活原文压成约 10-14 个汉字的一行任务登记。
