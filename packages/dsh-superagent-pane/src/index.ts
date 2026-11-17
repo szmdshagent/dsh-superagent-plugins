@@ -517,10 +517,17 @@ function readLanes(dir: string, ownTask = ''): CrewLaneView[] {
     // 协作模式的判据是有 team-plan.json，或 lanes/ 下存在协作 lane（leader / ccw 都算）。
     // 原来只看根目录 claude.pid 是否活着，而协作工单的根目录也可能残留这个文件，
     // 于是协作单里凭空多出一行 main。
+    // 协作模式判据：有 team-plan.json，或 lanes/ 下存在**活着的** lane。
+    //
+    // 曾经写成「lanes/ 下有目录就算协作」——这是个回归：一张单跑完后 lane 目录会留在磁盘上，
+    // 下次这张单再派活时，那些历史目录把工单误判成协作单，真正的执行者（root 的 main）
+    // 就被隐藏了，界面上只剩几个昨天的死 lane 显示「空闲」，看起来「明明在跑却没有任何员工」。
+    // 判据必须看「有没有人在跑」，不是「有没有历史目录」。
     let cooperative = plan.size > 0
     if (!cooperative) {
       try {
-        cooperative = readdirSync(join(root, 'lanes'), { withFileTypes: true }).some(entry => entry.isDirectory())
+        cooperative = readdirSync(join(root, 'lanes'), { withFileTypes: true })
+          .some(entry => entry.isDirectory() && alive(join(root, 'lanes', entry.name)))
       } catch { /* 没有 lanes 目录就是非协作 */ }
     }
     if (!cooperative && alive(root)) out.push(view(root, 'main', 'running', 'main', assigned, ownTask))
