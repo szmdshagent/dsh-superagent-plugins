@@ -513,6 +513,15 @@ function readLanes(dir: string, ownTask = ''): CrewLaneView[] {
       for (const [leader, members] of plan) if (members.includes(lane)) return leader
       return undefined
     }
+    // 这张单是否存在 leader：team-plan 非空，或 lanes 里有名为 lead / orchestrator 的目录。
+    // 决定"没有 leader 时 other 一律显示成 main"这条规则。
+    let hasLeader = plan.size > 0
+    if (!hasLeader) {
+      try {
+        hasLeader = readdirSync(join(root, 'lanes'), { withFileTypes: true })
+          .some(entry => entry.isDirectory() && (entry.name === 'lead' || entry.name === 'orchestrator'))
+      } catch { /* 没有 lanes 目录就是没有 leader */ }
+    }
     // 工单自己的 worker：**只在没有协作模式时**显示为 main。
     // 协作模式的判据是有 team-plan.json，或 lanes/ 下存在协作 lane（leader / ccw 都算）。
     // 原来只看根目录 claude.pid 是否活着，而协作工单的根目录也可能残留这个文件，
@@ -540,10 +549,16 @@ function readLanes(dir: string, ownTask = ''): CrewLaneView[] {
       //   orchestrator / lead / team-plan 的 key → leader（统筹者，不区分谁统谁）
       //   被某个 leader 带领 → worker
       //   其余（含 main-verify 这类验收 lane）→ other
+      // 身份判定（owner 口径）：
+      //   orchestrator / lead / team-plan 的 key → leader（统筹者，不区分谁统谁）
+      //   被某个 leader 带领 → worker
+      //   其余：**这张单有 leader 时叫 other（平民），没有任何 leader 时一律叫 main**
+      // owner 要求：没有 leader 就不要出现 other。因为「平民」只有在有等级差时才成立——
+      // 一张单根本没有 leader，就不存在上下级，把它的执行者标成"平民"等于凭空造了一个身份。
       let role: LaneRole
       if (name.name === 'orchestrator' || name.name === 'lead' || plan.has(name.name)) role = 'leader'
       else if (leader) role = 'worker'
-      else role = 'other'
+      else role = hasLeader ? 'other' : 'main'
       out.push(view(base, name.name, alive(base) ? 'running' : 'idle', role, assigned, ownTask, leader))
     }
   } catch { /* 目录不存在或不可读：没有 lane */ }
