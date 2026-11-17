@@ -496,10 +496,20 @@ type Ticket = {
 type Activity = { state?: string; kind?: string | null; tool?: string; text?: string; at?: number; ageMs?: number }
 /** 协作规模：未结束工单数、真正在跑的 worker 数、排队数，以及每张工单的状态。 */
 type CrewLane = { lane: string; state: 'running' | 'idle'; task?: string
-  /** 协作身份：lead=统筹（leader 本身），worker=受 leader 管辖，other=不受管辖。 */
-  role?: 'lead' | 'worker' | 'other'
+  /** 协作身份：leader=统筹者、worker=被带领的 ccworker、main=无协作时工单自己的 worker、other=协作下的其它一切。 */
+  role?: 'leader' | 'worker' | 'main' | 'other'
   /** 管辖这条 lane 的 leader 名（team 模式下是 lead）；other/lead 没有。 */
   leader?: string }
+
+/**
+ * 非 leader/worker 的两种身份徽标（owner 口径：协作模式下除 leader/ccw 之外全叫 other）：
+ *   main  这张工单自己的 worker（无协作模式时）—— 蓝
+ *   other 协作模式下不属于 leader 的利益方（如独立验收 lane）—— 灰
+ */
+const ROLE_BADGE: Record<string, { label: string; hint: string; bg: string; fg: string; border: string }> = {
+  main: { label: '⏺ main', hint: '这张工单自己的 worker（没有协作模式时由它执行）', bg: '#1b2f52', fg: '#9cc0f0', border: '#2f4f7d' },
+  other: { label: '· oth-ccw', hint: '协作模式下既不是 leader 也不是 ccworker 的 Claude Code worker（如独立验收）', bg: '#333', fg: '#aaa', border: '#4a4a4a' },
+}
 
 /**
  * lane 的显示名：统一叫 ccwN。
@@ -512,32 +522,69 @@ function laneLabel(name: string): string {
 }
 
 /**
- * lane 目录名 → 显示名：leader1/leader2…、ccw 跨 leader 连续编号、散户 main/main1…
- * 先排 leader1 管辖的 ccw，再排 leader2 的；不受管辖的散户按 lane 顺序叫 main、main1、main2…
+ * lane 目录名 → 显示名（owner 口径，四种身份）：
+ *   leader1/leader2…（统筹者，多 leader 按顺序）、ccw1/ccw2…（跨 leader 连续编号）、
+ *   main（无协作时工单自己的 worker）、other/other1…（协作下其余一切）
+ */
+/**
+ * lane 目录名 → 显示名，按身份分属不同命名空间，互不撞名（2026-11-17 分细身份）：
+ *   leader → leader1/2…；worker → ccw1/2…（跨 leader 连续编号）
+ *   main → main（这张工单自己的 worker）
+ *   other → oth-ccw1/oth-ccw2…（other + Claude Code worker 的缩写组合）
  */
 function crewLabels(lanes: CrewLane[]): Map<string, string> {
   const labels = new Map<string, string>()
-  const leaders = lanes.filter(lane => lane.role === 'lead')
+  const leaders = lanes.filter(lane => lane.role === 'leader')
   const workerOrder: string[] = []
   for (const leader of leaders) {
     for (const lane of lanes) if (lane.role === 'worker' && lane.leader === leader.lane) workerOrder.push(lane.lane)
   }
   for (const lane of lanes) if (lane.role === 'worker' && !workerOrder.includes(lane.lane)) workerOrder.push(lane.lane)
   leaders.forEach((lane, index) => labels.set(lane.lane, `leader${index + 1}`))
-  workerOrder.forEach((lane, index) => labels.set(lane, `ccw${index + 1}`))
-  const standalone = lanes.filter(lane => lane.role !== 'lead' && lane.role !== 'worker')
-  standalone.forEach((lane, index) => labels.set(lane.lane, index === 0 ? 'main' : `main${index}`))
+  workerOrder.forEach((lane, index) => labels.set(lane.lane, `ccw${index + 1}`))
+  // 剩余两类：main（无协作时的工单 worker，只有一个）与 other（协作下的其它一切）。
+  // other 的显示名用 other + Claude Code worker 的缩写组合成 oth-ccw1、oth-ccw2…，
+  // 与 ccwN 同族：既看得出是「另一类 worker」，也不会和 leader/ccw 混淆。
+  let mainN = 0; let otherN = 0
+  for (const lane of lanes) {
+    if (lane.role === 'leader' || lane.role === 'worker' || labels.has(lane.lane)) continue
+    if (lane.role === 'main') labels.set(lane.lane, mainN++ === 0 ? 'main' : `main${mainN}`)
+    else labels.set(lane.lane, `oth-ccw${++otherN}`)
+  }
   return labels
+}
+/**
+ * 把 lanes 排成「leader 分组树」+「未归组的身份段」。
+ *
+ * 为什么需要它：`/crew` 返回的是平铺数组，直接 map 出来只能看到一串 ccw，
+ * 无法回答「哪些 ccw 归哪个 leader 带」。这里按 leader 归组，组内保持原顺序；
+ * 不属于任何 leader 的身份（顶层统筹 / 独立验收 / 工单主 worker / 其它散户）单独成段。
+ *
+ * 返回：{ groups: [{leader, members[]}], loose: lane[] }
+ */
+function crewGroups(lanes: CrewLane[]) {
+  const groups: { leader: CrewLane; members: CrewLane[] }[] = []
+  for (const lane of lanes) {
+    if (lane.role !== 'leader') continue
+    groups.push({ leader: lane, members: lanes.filter(item => item.role === 'worker' && item.leader === lane.lane) })
+  }
+  // 有 leader 字段但该 leader 的 lane 不在 lanes 里的成员（例如 leader lane 已下线、list 里没有它）：
+  // 补一个虚拟 leader 组，否则这些成员会是孤儿，界面上看不出归属。
+  for (const lane of lanes) {
+    if (lane.role !== 'worker' || !lane.leader) continue
+    if (groups.some(group => group.leader.lane === lane.leader)) continue
+    groups.push({ leader: { lane: lane.leader, state: 'idle', role: 'lead' }, members: [lane] })
+  }
+  const loose = lanes.filter(lane => lane.role !== 'leader' && lane.role !== 'worker')
+  return { groups, loose }
 }
 
 /**
- * 按 leader 把 lane 报成「1-n」：每个 leader 一组，n 是它管辖的 cc-worker 数；
- * 不受任何 leader 管辖的 lane 单独计数。多 leader 时组间用逗号连，
- * 例如 1-3,1-2,4 = 两个 leader 各带 3/2 个，另有 4 个不受管辖。
- * main 是工单自己的主 worker，不是团队 lane，不计进「不受管辖」。
+ * 协作规模：按 leader 分组报「1-n」，并把**不属于任何 leader 的身份分开计**——
+ * 顶层统筹 / 独立验收 / 工单主 worker / 其它散户各算各的，不再混成一个「不受管辖」数。
  */
 function crewScale(lanes: CrewLane[]) {
-  const leads = lanes.filter(lane => lane.role === 'lead')
+  const leads = lanes.filter(lane => lane.role === 'leader')
   const groups = leads.map(lane => ({ leader: lane.lane, count: 0 }))
   let managed = 0
   for (const lane of lanes) {
@@ -550,8 +597,13 @@ function crewScale(lanes: CrewLane[]) {
     }
     group.count += 1
   }
-  return { groups, leaders: leads.length, managed,
-    unmanaged: lanes.filter(lane => lane.role !== 'lead' && lane.role !== 'worker').length }
+  const count = (role: string) => lanes.filter(lane => lane.role === role).length
+  return {
+    groups, leaders: leads.length, managed,
+    mains: count('main'),
+    other: count('other'),
+    unmanaged: lanes.filter(lane => lane.role !== 'leader' && lane.role !== 'worker').length,
+  }
 }
 type Crew = {
   tickets: number
@@ -571,7 +623,7 @@ type Translate = (key: keyof typeof zh, values?: Record<string, string>) => stri
  * 工单目录名以工单 id 前 12 位结尾，用这个后缀把目录对回 `/crew` 的 ticketId。
  * 治理面板没装或读不到时不补：面板按「没有 leader」显示，不报错。
  */
-type LaneRoleMap = Record<string, Record<string, { role?: 'lead' | 'worker' | 'other'; leader?: string }>>
+type LaneRoleMap = Record<string, Record<string, { role?: 'leader' | 'worker' | 'main' | 'other'; leader?: string }>>
 let governanceRoles: { at: number; map: LaneRoleMap } | null = null
 async function rolesFromGovernance(): Promise<LaneRoleMap> {
   if (governanceRoles && Date.now() - governanceRoles.at < 60_000) return governanceRoles.map
@@ -580,7 +632,10 @@ async function rolesFromGovernance(): Promise<LaneRoleMap> {
   for (const lane of Array.isArray(body?.lanes) ? body.lanes : []) {
     const dir = typeof lane?.ticket === 'string' ? lane.ticket : ''
     const suffix = dir.split('-').pop() ?? ''
-    const role = lane?.role === 'lead' || lane?.role === 'worker' ? lane.role : 'other'
+    // 治理面板可能给旧口径（lead/worker/other）：lead 一律归一成 leader，其它原样认
+    const raw = lane?.role
+    const role = raw === 'leader' || raw === 'lead' ? 'leader'
+      : raw === 'worker' || raw === 'main' ? raw : 'other'
     if (!suffix || typeof lane?.lane !== 'string') continue
     map[suffix] ??= {}
     map[suffix]![lane.lane] = role === 'worker' ? { role, leader: 'lead' } : { role }
@@ -810,19 +865,28 @@ function TicketBar({ ticket, activity, t, health, confirmStop, onClose, onCommen
         const lanes = crew ?? []
         if (lanes.length === 0) return null
         const running = lanes.filter(lane => lane.state === 'running').length
-        // 有 leader 时胶囊按 leader 逐组报「1-受管辖 cc 数」，组间逗号连，末尾补散户数
-        // （如 1-4,1；多 leader 如 1-3,1-2,4）；整单只有散户时只报散户数量，在跑数量只进悬浮标题。
+        // 胶囊图注按身份分段报，不再把六类混成一个数：
+        //   G = leader 分组（每组「1-n」），O=顶层统筹、V=独立验收、M=工单主 worker、A=其它散户。
+        // 例：`👥 G 1-2,1-2 · O1 V1 M1`；没有团队协作时退回只报散户数。
         const scale = crewScale(lanes)
         const labels = crewLabels(lanes)
         const team = scale.leaders > 0 || scale.managed > 0
+        const extras = [
+          scale.mains > 0 ? `M${scale.mains}` : '',
+          scale.other > 0 ? `O${scale.other}` : '',
+        ].filter(Boolean)
         const caption = team
-          ? `👥 协作 ${scale.groups.map(group => `1-${group.count}`).join(',')}`
-            + `${scale.unmanaged > 0 ? `,${scale.unmanaged}` : ''}`
+          ? `👥 G ${scale.groups.map(group => `1-${group.count}`).join(',')}`
+            + `${extras.length ? ` · ${extras.join(' ')}` : ''}`
           : `👥 协作 ${scale.unmanaged}`
-        const summary = team
+        const summary = (team
           ? `这张工单下 ${scale.groups.map(group => `${labels.get(group.leader) ?? group.leader} 带 ${group.count} 个 cc-worker`).join('，')}`
-            + `${scale.unmanaged > 0 ? `，另有 ${scale.unmanaged} 个 cc-worker 不受 leader 管辖` : ''}（${running} 个在跑）：`
-          : `这张工单下有 ${scale.unmanaged} 个 cc-worker（${running} 个在跑）：`
+          : `这张工单下有 ${scale.unmanaged} 条 lane`)
+          + [
+            scale.mains > 0 ? `工单自己的 worker（main）` : '',
+            scale.other > 0 ? `${scale.other} 个 other` : '',
+          ].filter(Boolean).map(x => `，${x}`).join('')
+          + `（${running} 个在跑）：`
         // 悬浮标题只保留一行汇总：逐 lane 明细已经在下方列表里，不再重复。
         return <span data-pane-ticket-crew={ticket.id}
           title={summary.replace(/：$/, '')}
@@ -871,7 +935,24 @@ function TicketBar({ ticket, activity, t, health, confirmStop, onClose, onCommen
       </div>
       {(() => {
         const labels = crewLabels(crew ?? [])
-        return (crew ?? []).map(lane => {
+        // 按 leader 分组排成一个有序列表：每组先出 leader 行，再出它管辖的 ccw（带缩进标记）。
+        // 这样「哪些 ccw 由哪个 leader 带」在界面上是结构关系，不是靠一个 👑 去猜。
+        const { groups, loose } = crewGroups(crew ?? [])
+        // level: 1 = 一级标题（leader / 独立身份），2 = 二级条目（leader 的下属）
+        const ordered: { lane: CrewLane; level: 1 | 2; first?: boolean; last?: boolean; section?: string }[] = []
+        for (const group of groups) {
+          ordered.push({ lane: group.leader, level: 1, section: group.members.length ? `${group.members.length} 个下属` : '无下属' })
+          group.members.forEach((member, index) => ordered.push({
+            lane: member, level: 2, first: index === 0, last: index === group.members.length - 1,
+          }))
+        }
+        // 松散身份：不属于任何 leader，单独成段，段前有分隔标题
+        const looseLabel: Record<string, string> = { main: '工单自己的 worker', other: 'oth-ccw（非 leader / 非 ccworker）' }
+        for (const lane of loose) {
+          ordered.push({ lane, level: 1, section: looseLabel[lane.role ?? 'other'] ?? '其它' })
+        }
+        return ordered.map(({ lane, level, first, last, section }) => {
+        const indent = level === 2
         const op = laneOps[lane.lane]
         // 行本身是 div + role=button：中止按钮必须是它内部真正的 <button>，button 不能嵌套 button。
         return (
@@ -884,22 +965,51 @@ function TicketBar({ ticket, activity, t, health, confirmStop, onClose, onCommen
             if (event.key !== 'Enter' && event.key !== ' ') return
             event.preventDefault(); event.stopPropagation(); onPickLane?.(lane.lane)
           }}
-          style={{ display: 'flex', gap: 6, alignItems: 'baseline', fontSize: 11.5, minWidth: 0, width: '100%',
-            textAlign: 'left', font: 'inherit', color: 'inherit', padding: '1px 3px', borderRadius: 4,
+          style={{
+            display: 'flex', gap: 6, alignItems: 'baseline', minWidth: 0, width: '100%',
+            textAlign: 'left', font: 'inherit', color: 'inherit', borderRadius: 4,
+            // 一级（leader / 独立身份）：字号大一档、加粗感靠 fontWeight、整行上分隔线；
+            // 二级（下属）：缩进两格、字号小一档、左侧竖线贯穿，和标题形成明确的从属层次。
+            fontSize: level === 1 ? 12.5 : 11,
+            fontWeight: level === 1 ? 700 : 400,
+            padding: level === 1 ? '4px 6px' : '1px 3px',
+            marginLeft: indent ? 18 : 0,
+            marginTop: level === 1 ? 6 : 0,
+            borderTop: level === 1 ? '1px solid rgba(120,150,200,.35)' : undefined,
+            borderLeft: indent ? '2px solid #5e7030' : undefined,
+            paddingLeft: indent ? 8 : 6,
+            background: lanePick === lane.lane
+              ? 'rgba(74,158,255,.32)'
+              : level === 1 ? 'rgba(255,255,255,.05)' : 'transparent',
             cursor: onPickLane ? 'pointer' : 'default',
-            border: lanePick === lane.lane ? '1px solid #4a9eff' : '1px solid transparent',
-            background: lanePick === lane.lane ? 'rgba(74,158,255,.32)' : 'transparent' }}>
+            boxShadow: lanePick === lane.lane ? 'inset 0 0 0 1px #4a9eff' : undefined,
+          }}>
           <span style={{ flexShrink: 0, fontSize: 9, color: lane.state === 'running' ? '#38a169' : '#777' }}>●</span>
-          {(lane.role === 'lead' || lane.leader) && <span data-pane-lane-leader={lane.lane}
-            title={lane.role === 'lead' ? '这条 lane 是 leader（统筹），管辖受管辖的 cc-worker' : `这条 cc-worker 归 ${labels.get(lane.leader ?? '') ?? lane.leader} 管辖`}
-            style={{ flexShrink: 0, fontSize: 9.5, padding: '0 5px', borderRadius: 3, lineHeight: 1.5,
-              background: lane.role === 'lead' ? '#5c4600' : '#3d4a1f',
-              color: lane.role === 'lead' ? '#ffd96a' : '#c8e08a',
-              border: '1px solid ' + (lane.role === 'lead' ? '#8a6a00' : '#5e7030') }}>
-            {/* 受管辖行只留 👑，leader 名字已在 leader 行的徽标里；leader 行徽标自带别名，行内不再重复一次。 */}
-            👑{lane.role === 'lead' ? ` ${labels.get(lane.lane) ?? 'leader'}` : ''}
+          {indent && <span title="归上面的 leader 管辖" aria-hidden
+            style={{ flexShrink: 0, fontSize: 11, color: '#5e7030', fontFamily: 'monospace', marginLeft: -3 }}>
+            {last ? '└─' : '├─'}
           </span>}
-          {lane.role !== 'lead' && <span style={{ flexShrink: 0, width: 58, fontWeight: 600, fontFamily: 'monospace',
+          {(lane.role === 'leader' || lane.leader || ROLE_BADGE[lane.role ?? 'other']) && (() => {
+            // 六类身份各有自己的徽标：颜色 + 文字都不同，扫一眼能分清谁是谁。
+            // lead/worker 走原来的 👑 体系（保持既有观感）；其余四类各用一个固定徽标。
+            const role = lane.role ?? 'other'
+            const badge = ROLE_BADGE[role]
+            if (role === 'leader' || role === 'worker' || !badge) return <span data-pane-lane-leader={lane.lane}
+              title={role === 'leader' ? '这条 lane 是 leader（统筹），管辖受管辖的 cc-worker' : `这条 cc-worker 归 ${labels.get(lane.leader ?? '') ?? lane.leader} 管辖`}
+              style={{ flexShrink: 0, fontSize: 9.5, padding: '0 5px', borderRadius: 3, lineHeight: 1.5,
+                background: role === 'leader' ? '#5c4600' : '#3d4a1f',
+                color: role === 'leader' ? '#ffd96a' : '#c8e08a',
+                border: '1px solid ' + (role === 'leader' ? '#8a6a00' : '#5e7030') }}>
+              {/* 受管辖行只留 👑，leader 名字已在 leader 行的徽标里；leader 行徽标自带别名，行内不再重复一次。 */}
+              👑{role === 'leader' ? ` ${labels.get(lane.lane) ?? 'leader'}` : ''}
+            </span>
+            return <span data-pane-lane-role={lane.lane} title={badge.hint}
+              style={{ flexShrink: 0, fontSize: 9.5, padding: '0 5px', borderRadius: 3, lineHeight: 1.5,
+                background: badge.bg, color: badge.fg, border: '1px solid ' + badge.border }}>
+              {badge.label}
+            </span>
+          })()}
+          {lane.role !== 'leader' && <span style={{ flexShrink: 0, width: 58, fontWeight: 600, fontFamily: 'monospace',
             overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
             color: lane.state === 'running' ? '#9ae6b4' : '#aaa' }}
             title={lane.lane}>{labels.get(lane.lane) ?? laneLabel(lane.lane)}</span>}
@@ -912,6 +1022,15 @@ function TicketBar({ ticket, activity, t, health, confirmStop, onClose, onCommen
             title={lane.task || '没输出'}>
             {lane.task || <span style={{ opacity: 0.45 }}>没输出</span>}
           </span>
+          {/* 成员行尾补归属：即使把列表扫成平铺，也能立刻看出这条 ccw 归谁带 */}
+          {indent && lane.leader && <span style={{ flexShrink: 0, fontSize: 9.5, color: '#8a9a5e', opacity: 0.9 }}
+            title={`归 ${labels.get(lane.leader) ?? lane.leader} 管辖`}>
+            ←{labels.get(lane.leader) ?? lane.leader}
+          </span>}
+          {/* 一级行尾的身份/规模注脚：leader 显示带几个下属，独立身份显示它是什么 */}
+          {!indent && section && <span style={{ flexShrink: 0, fontSize: 10, color: '#8ea8c8', opacity: 0.85 }}>
+            （{section}）
+          </span>}
           {/* 每个成员行都有自己的中止按钮：正在跑时可点，其余状态置灰（保持行结构统一）。
               行是 div + role=button，这里才是真 button；stopPropagation 防止顺手切换选中 lane。 */}
           <button type="button" data-pane-lane-interrupt={lane.lane}

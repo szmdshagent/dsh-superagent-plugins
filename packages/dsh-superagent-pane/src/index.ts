@@ -378,8 +378,14 @@ async function collectExecutorSignals(ctx: any, ticket: any): Promise<ExecutorSi
  * 「在跑」的判据与面板其它地方一致：claude.pid 存在且该 pid 的命令行含 claude。
  * 只读目录，不改任何东西；读不到就当没有 lane。
  */
-/** lane 在协作里的身份：lead=统筹（leader 本身），worker=team-plan.json 里被统领的子任务，other=不受管辖。 */
-export type LaneRole = 'lead' | 'worker' | 'other'
+/**
+ * lane 在协作里的身份（owner 2026-11-17 定义，只分四种，不再细分）：
+ *   leader  统筹者。多 leader 里每个 leaderK 是它，顶层切分者 orchestrator 也归它
+ *   worker  被 leader 带领的 ccworker
+ *   main    没有协作模式时，这张工单自己的 worker
+ *   other   协作模式下，既不是 leader 也不是 ccworker 的一切（含独立验收 lane 等）
+ */
+export type LaneRole = 'leader' | 'worker' | 'main' | 'other'
 
 export type CrewLaneView = {
   lane: string
@@ -443,7 +449,17 @@ function readLanes(dir: string, ownTask = ''): CrewLaneView[] {
         for (const [key, members] of Object.entries(data)) {
           const leader = key.trim()
           if (!leader || !Array.isArray(members)) continue
-          map.set(leader, members.filter((lane): lane is string => typeof lane === 'string').map(lane => lane.trim()).filter(Boolean))
+          // 成员有两种合法写法，都必须认（2026-11-17 修：只认字符串数组会把对象数组全滤掉，
+          // 于是 leader→成员 关系为空，所有 worker 掉进 other，面板上就是「3 个 leader + 6 个散户」）：
+          //   ["ccw1", "ccw2"]                     ← 手写/旧格式
+          //   [{lane:"ccw1", task:"…"}, ...]        ← cc-worker 合并器实际写出的格式
+          const lanes = members
+            .map((member: unknown) => typeof member === 'string'
+              ? member.trim()
+              : (member && typeof member === 'object' && typeof (member as any).lane === 'string'
+                ? (member as any).lane.trim() : ''))
+            .filter(Boolean)
+          map.set(leader, lanes)
         }
       }
     } catch { /* 没有或坏文件：当作没有计划 */ }
@@ -469,6 +485,7 @@ function readLanes(dir: string, ownTask = ''): CrewLaneView[] {
         : data && typeof data === 'object'
           ? Object.values(data).flatMap(members => (Array.isArray(members) ? members : []))
           : []
+      // 数组格式的顶层也可能带前导键；对象成员与字符串成员都要能读出 lane
       for (const entry of entries) {
         const lane = typeof entry?.lane === 'string' ? entry.lane.trim() : typeof entry === 'string' ? entry.trim() : ''
         if (lane) map.set(lane, typeof entry?.task === 'string' ? entry.task : '')
@@ -494,13 +511,21 @@ function readLanes(dir: string, ownTask = ''): CrewLaneView[] {
       for (const [leader, members] of plan) if (members.includes(lane)) return leader
       return undefined
     }
-    if (alive(root)) out.push(view(root, 'main', 'running', 'other', assigned, ownTask))
+    // 工单自己的 worker：没有协作模式时它就是这张工单的执行者，显示为 main
+    if (alive(root)) out.push(view(root, 'main', 'running', 'main', assigned, ownTask))
     for (const name of readdirSync(join(root, 'lanes'), { withFileTypes: true })) {
       if (!name.isDirectory()) continue
       const base = join(root, 'lanes', name.name)
       // 名为 lead 的 lane 仍是历史约定里的统筹 lane，即使没有 team-plan 也按 leader 显示。
       const leader = leaderOf(name.name)
-      const role: LaneRole = name.name === 'lead' || plan.has(name.name) ? 'lead' : leader ? 'worker' : 'other'
+      // 身份判定（owner 口径，四种）：
+      //   orchestrator / lead / team-plan 的 key → leader（统筹者，不区分谁统谁）
+      //   被某个 leader 带领 → worker
+      //   其余（含 main-verify 这类验收 lane）→ other
+      let role: LaneRole
+      if (name.name === 'orchestrator' || name.name === 'lead' || plan.has(name.name)) role = 'leader'
+      else if (leader) role = 'worker'
+      else role = 'other'
       out.push(view(base, name.name, alive(base) ? 'running' : 'idle', role, assigned, ownTask, leader))
     }
   } catch { /* 目录不存在或不可读：没有 lane */ }
