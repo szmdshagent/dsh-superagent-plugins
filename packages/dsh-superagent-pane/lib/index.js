@@ -1,6 +1,6 @@
 import { n as logKey$1, t as appendLog$1 } from "./log-Co3EtYpg.js";
 import { randomUUID } from "node:crypto";
-import { closeSync, existsSync, openSync, readFileSync, readSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, openSync, readFileSync, readSync, readdirSync, readlinkSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
 import { key } from "dsh-superagent";
@@ -930,6 +930,51 @@ async function collectExecutorSignals(ctx, ticket) {
 	} catch {}
 	return signals;
 }
+/**
+* 正在跑的 cc-worker 进程 → 它们各自属于哪条 lane。
+*
+* 为什么需要：面板原来只认 `work/<工单>/.cc-worker/lanes/<lane>` 目录。用 `cc-worker run --dir <工单目录>`
+* 直接起的 worker、lane 目录还没建出来或跑完已被清掉的 worker，都真实在消耗额度，却一个行都不显示，
+* 看起来「明明在跑却没有员工」。这里直接读 /proc 兜底。
+*
+* 判据：cmdline 含 claude（cc-worker 的 bash 包装、python 旁路进程不算 worker 本体），
+* 且 cwd 或 cmdline 里出现该工单目录。识别不出的 lane 名退回 cwd 末段；工单自己的执行者记为 main。
+*/
+function runningProcessLanes(dir) {
+	if (!dir) return [];
+	const names = [];
+	const laneFrom = (text) => {
+		const hit = /\/\.cc-worker\/lanes\/([^/\s]+)/.exec(text);
+		return hit ? hit[1] : "";
+	};
+	let pids = [];
+	try {
+		pids = readdirSync("/proc");
+	} catch {
+		return [];
+	}
+	for (const pid of pids) {
+		if (!/^\d+$/.test(pid)) continue;
+		let raw = "";
+		try {
+			raw = readFileSync(`/proc/${pid}/cmdline`, "utf8");
+		} catch {
+			continue;
+		}
+		const argv = raw.split("\0").filter(Boolean);
+		if (!argv.some((arg) => /(^|\/)claude$/.test(arg) || /(^|\/)cc-worker$/.test(arg))) continue;
+		const cmdline = argv.join(" ").trim();
+		let cwd = "";
+		try {
+			cwd = readlinkSync(`/proc/${pid}/cwd`);
+		} catch {}
+		if (!cwd.includes(dir) && !cmdline.includes(dir)) continue;
+		const atRoot = cwd === dir || cwd === join(dir, ".cc-worker");
+		const name = laneFrom(cwd) || laneFrom(cmdline) || (atRoot ? "main" : cwd.split("/").filter(Boolean).pop() ?? "main");
+		if (!names.includes(name)) names.push(name);
+	}
+	return names;
+}
 /** 本 lane 的会话谱系：session-lineage.jsonl + switch.log + 当前 session_id，去重后计数。 */
 function sessionChain(base) {
 	const ids = /* @__PURE__ */ new Set();
@@ -979,6 +1024,7 @@ function summarizeTask(text) {
 	const cut = Math.max(head.lastIndexOf(" "), head.lastIndexOf("、"), head.lastIndexOf("，"));
 	return cut > 4 ? `${head.slice(0, cut)}…` : `${chars.slice(0, limit).join("")}…`;
 }
+/** 导出仅为可验证：面板运行时只经 /crew 间接调用它。 */
 function readLanes(dir, ownTask = "") {
 	if (!dir) return [];
 	const out = [];
@@ -1063,15 +1109,32 @@ function readLanes(dir, ownTask = "") {
 			cooperative = readdirSync(join(root, "lanes"), { withFileTypes: true }).some((entry) => entry.isDirectory() && alive(join(root, "lanes", entry.name)));
 		} catch {}
 		if (!cooperative && alive(root)) out.push(view(root, "main", "running", "main", assigned, ownTask));
-		for (const name of readdirSync(join(root, "lanes"), { withFileTypes: true })) {
-			if (!name.isDirectory()) continue;
-			const base = join(root, "lanes", name.name);
-			const leader = leaderOf(name.name);
+		let laneDirs = [];
+		try {
+			laneDirs = readdirSync(join(root, "lanes"), { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => entry.name);
+		} catch {}
+		for (const name of laneDirs) {
+			const base = join(root, "lanes", name);
+			const leader = leaderOf(name);
 			let role;
-			if (name.name === "orchestrator" || name.name === "lead" || plan.has(name.name)) role = "leader";
+			if (name === "orchestrator" || name === "lead" || plan.has(name)) role = "leader";
 			else if (leader) role = "worker";
 			else role = hasLeader ? "other" : "main";
-			out.push(view(base, name.name, alive(base) ? "running" : "idle", role, assigned, ownTask, leader));
+			out.push(view(base, name, alive(base) ? "running" : "idle", role, assigned, ownTask, leader));
+		}
+		for (const name of runningProcessLanes(dir)) {
+			if (out.some((lane) => lane.lane === name)) continue;
+			const role = name === "main" ? "main" : name === "orchestrator" || name === "lead" || plan.has(name) ? "leader" : hasLeader ? "other" : "main";
+			const task = summarizeTask(assigned.get(name) || (name === "main" ? ownTask : "") || registered(join(root, "lanes", name))) || "没输出";
+			out.push({
+				lane: name,
+				state: "running",
+				task,
+				role,
+				workerId: `${dir}#${name}`,
+				sessions: 0,
+				processOnly: true
+			});
 		}
 	} catch {}
 	return out;
@@ -2503,4 +2566,4 @@ function apply(ctx) {
 		};
 	}, "pane: scheduled dispatch");
 }
-export { apply, inject, name, paneTrigger, summarizeTask };
+export { apply, inject, name, paneTrigger, readLanes, summarizeTask };

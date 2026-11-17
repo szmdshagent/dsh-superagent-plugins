@@ -7,7 +7,7 @@
  */
 import type { Context } from '@deepseek-ai/cordis'
 import { randomUUID } from 'node:crypto'
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, readlinkSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { z } from 'zod'
 import { key, type Trigger } from 'dsh-superagent'
@@ -413,6 +413,52 @@ export type CrewLaneView = {
   sessionId?: string
   /** 本 lane 用过的会话数；>1 说明中间发生过 handoff 换会话，但仍是一个 cc worker。 */
   sessions: number
+  /**
+   * 这条行不是由 lane 目录得出来的，而是从「正在跑的 cc-worker 进程」补出来的：
+   * 进程确实在跑，但工单目录下还没有对应 lane 目录（--dir 直接起、lane 目录还没建/已清掉）。
+   * 面板据此知道这一行的依据是进程，不是磁盘记录。
+   */
+  processOnly?: boolean
+}
+
+/**
+ * 正在跑的 cc-worker 进程 → 它们各自属于哪条 lane。
+ *
+ * 为什么需要：面板原来只认 `work/<工单>/.cc-worker/lanes/<lane>` 目录。用 `cc-worker run --dir <工单目录>`
+ * 直接起的 worker、lane 目录还没建出来或跑完已被清掉的 worker，都真实在消耗额度，却一个行都不显示，
+ * 看起来「明明在跑却没有员工」。这里直接读 /proc 兜底。
+ *
+ * 判据：cmdline 含 claude（cc-worker 的 bash 包装、python 旁路进程不算 worker 本体），
+ * 且 cwd 或 cmdline 里出现该工单目录。识别不出的 lane 名退回 cwd 末段；工单自己的执行者记为 main。
+ */
+function runningProcessLanes(dir: string): string[] {
+  if (!dir) return []
+  const names: string[] = []
+  // 一个 lane 至少两个进程（timeout 包装 + claude 本体），按 lane 名去重。
+  const laneFrom = (text: string): string => {
+    const hit = /\/\.cc-worker\/lanes\/([^/\s]+)/.exec(text)
+    return hit ? hit[1]! : ''
+  }
+  let pids: string[] = []
+  try { pids = readdirSync('/proc') } catch { return [] }
+  for (const pid of pids) {
+    if (!/^\d+$/.test(pid)) continue
+    let raw = ''
+    try { raw = readFileSync(`/proc/${pid}/cmdline`, 'utf8') } catch { continue }
+    // 必须有一个 argv 项的 basename 就是 claude / cc-worker：只看「整条命令行里出现过 claude」太松，
+    // 任何脚本、grep、带工单路径的提示词文本都会把无关进程算进来（实测把别的 shell 误判成 worker）。
+    const argv = raw.split('\0').filter(Boolean)
+    if (!argv.some(arg => /(^|\/)claude$/.test(arg) || /(^|\/)cc-worker$/.test(arg))) continue
+    const cmdline = argv.join(' ').trim()
+    let cwd = ''
+    try { cwd = readlinkSync(`/proc/${pid}/cwd`) } catch { /* 权限/已退出：只用 cmdline 判断 */ }
+    if (!cwd.includes(dir) && !cmdline.includes(dir)) continue
+    // cwd 落在 `.cc-worker` 根（或就是工单目录）→ 这张工单自己的 worker，记 main。
+    const atRoot = cwd === dir || cwd === join(dir, '.cc-worker')
+    const name = laneFrom(cwd) || laneFrom(cmdline) || (atRoot ? 'main' : (cwd.split('/').filter(Boolean).pop() ?? 'main'))
+    if (!names.includes(name)) names.push(name)
+  }
+  return names
 }
 
 /** 本 lane 的会话谱系：session-lineage.jsonl + switch.log + 当前 session_id，去重后计数。 */
@@ -473,7 +519,8 @@ export function summarizeTask(text: string): string {
   return cut > 4 ? `${head.slice(0, cut)}…` : `${chars.slice(0, limit).join('')}…`
 }
 
-function readLanes(dir: string, ownTask = ''): CrewLaneView[] {
+/** 导出仅为可验证：面板运行时只经 /crew 间接调用它。 */
+export function readLanes(dir: string, ownTask = ''): CrewLaneView[] {
   if (!dir) return []
   const out: CrewLaneView[] = []
   const root = join(dir, '.cc-worker')
@@ -591,11 +638,14 @@ function readLanes(dir: string, ownTask = ''): CrewLaneView[] {
       } catch { /* 没有 lanes 目录就是非协作 */ }
     }
     if (!cooperative && alive(root)) out.push(view(root, 'main', 'running', 'main', assigned, ownTask))
-    for (const name of readdirSync(join(root, 'lanes'), { withFileTypes: true })) {
-      if (!name.isDirectory()) continue
-      const base = join(root, 'lanes', name.name)
+    // lanes 目录可能根本不存在（用 --dir 直接起的 worker 就是这样）：单独吞掉这个 readdir 的错，
+    // 否则会跳出整个 try，后面的进程兜底也跟着被跳过，正是最需要兜底的那张单没有兜底。
+    let laneDirs: string[] = []
+    try { laneDirs = readdirSync(join(root, 'lanes'), { withFileTypes: true }).filter(entry => entry.isDirectory()).map(entry => entry.name) } catch { /* 没有 lanes 目录 */ }
+    for (const name of laneDirs) {
+      const base = join(root, 'lanes', name)
       // 名为 lead 的 lane 仍是历史约定里的统筹 lane，即使没有 team-plan 也按 leader 显示。
-      const leader = leaderOf(name.name)
+      const leader = leaderOf(name)
       // 身份判定（owner 口径，四种）：
       //   orchestrator / lead / team-plan 的 key → leader（统筹者，不区分谁统谁）
       //   被某个 leader 带领 → worker
@@ -607,10 +657,21 @@ function readLanes(dir: string, ownTask = ''): CrewLaneView[] {
       // owner 要求：没有 leader 就不要出现 other。因为「平民」只有在有等级差时才成立——
       // 一张单根本没有 leader，就不存在上下级，把它的执行者标成"平民"等于凭空造了一个身份。
       let role: LaneRole
-      if (name.name === 'orchestrator' || name.name === 'lead' || plan.has(name.name)) role = 'leader'
+      if (name === 'orchestrator' || name === 'lead' || plan.has(name)) role = 'leader'
       else if (leader) role = 'worker'
       else role = hasLeader ? 'other' : 'main'
-      out.push(view(base, name.name, alive(base) ? 'running' : 'idle', role, assigned, ownTask, leader))
+      out.push(view(base, name, alive(base) ? 'running' : 'idle', role, assigned, ownTask, leader))
+    }
+    // 兜底：进程在跑但这张工单下没有对应 lane 记录（--dir 直接起、lane 目录未建或已清）。
+    // 只追加磁盘上不存在的 lane 名，绝不覆盖已有行的 role/leader/state —— 磁盘记录比进程更可信。
+    for (const name of runningProcessLanes(dir)) {
+      if (out.some(lane => lane.lane === name)) continue
+      // 身份沿用 crewLabels() 的规则：main 命名 → main，orchestrator/lead → leader，其余按有没有 leader 定。
+      const role: LaneRole = name === 'main' ? 'main'
+        : (name === 'orchestrator' || name === 'lead' || plan.has(name)) ? 'leader'
+        : hasLeader ? 'other' : 'main'
+      const task = summarizeTask(assigned.get(name) || (name === 'main' ? ownTask : '') || registered(join(root, 'lanes', name))) || '没输出'
+      out.push({ lane: name, state: 'running', task, role, workerId: `${dir}#${name}`, sessions: 0, processOnly: true })
     }
   } catch { /* 目录不存在或不可读：没有 lane */ }
   return out

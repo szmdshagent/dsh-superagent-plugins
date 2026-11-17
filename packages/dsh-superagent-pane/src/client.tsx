@@ -525,7 +525,9 @@ type CrewLane = { lane: string; state: 'running' | 'idle'; task?: string
   /** 本 lane 当前会话。 */
   sessionId?: string
   /** 本 lane 用过的会话数；>1 表示中间 handoff 换过会话，但仍是同一个 cc worker。 */
-  sessions?: number }
+  sessions?: number
+  /** 这一行是服务端从「正在跑的 cc-worker 进程」补出来的（没有对应 lane 目录）。 */
+  processOnly?: boolean }
 
 /**
  * 非 leader/worker 的两种身份徽标（owner 口径：协作模式下除 leader/ccw 之外全叫 other）：
@@ -1298,6 +1300,7 @@ function TicketBar({ ticket, activity, t, health, confirmStop, onClose, onCommen
         // 行本身是 div + role=button：中止按钮必须是它内部真正的 <button>，button 不能嵌套 button。
         return (
         <div key={lane.lane} data-pane-lane-pick={lane.lane}
+          data-pane-lane-process={lane.processOnly ? lane.lane : undefined}
           role="button" tabIndex={0}
           aria-pressed={lanePick === lane.lane}
           title={lanePick === lane.lane ? '再点一次取消选择，回到这张工单自己的 worker' : '点击查看这条 lane 自己的实时进度'}

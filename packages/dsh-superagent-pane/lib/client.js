@@ -1733,6 +1733,7 @@ window.__ModuleLoader__.load({
 								const op = laneOps[lane.lane];
 								return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 									"data-pane-lane-pick": lane.lane,
+									"data-pane-lane-process": lane.processOnly ? lane.lane : void 0,
 									role: "button",
 									tabIndex: 0,
 									"aria-pressed": lanePick === lane.lane,

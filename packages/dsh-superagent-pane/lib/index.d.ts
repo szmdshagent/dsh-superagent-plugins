@@ -165,6 +165,12 @@ type CrewLaneView = {
   sessionId?: string;
   /** 本 lane 用过的会话数；>1 说明中间发生过 handoff 换会话，但仍是一个 cc worker。 */
   sessions: number;
+  /**
+   * 这条行不是由 lane 目录得出来的，而是从「正在跑的 cc-worker 进程」补出来的：
+   * 进程确实在跑，但工单目录下还没有对应 lane 目录（--dir 直接起、lane 目录还没建/已清掉）。
+   * 面板据此知道这一行的依据是进程，不是磁盘记录。
+   */
+  processOnly?: boolean;
 };
 /**
  * 把 team-plan 里的派活原文压成约 10-14 个汉字的一行任务登记。
@@ -175,5 +181,7 @@ type CrewLaneView = {
  * 仍然超长就在词边界截断并加省略号。
  */
 declare function summarizeTask(text: string): string;
+/** 导出仅为可验证：面板运行时只经 /crew 间接调用它。 */
+declare function readLanes(dir: string, ownTask?: string): CrewLaneView[];
 declare function apply(ctx: Context): void;
-export { CrewLaneView, LaneRole, PaneMode, apply, inject, name, paneTrigger, summarizeTask };
+export { CrewLaneView, LaneRole, PaneMode, apply, inject, name, paneTrigger, readLanes, summarizeTask };
