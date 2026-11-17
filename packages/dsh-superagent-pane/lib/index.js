@@ -944,9 +944,9 @@ function summarizeTask(text) {
 	const line = (sentences.find((part) => /[一-鿿]/.test(part)) ?? sentences[0] ?? flat).replace(/[A-Za-z0-9_.~\-]*(?:\/[A-Za-z0-9_.~\-]+)+/g, (token) => token.split("/").filter(Boolean).pop() ?? token).trim();
 	if (!line) return "";
 	const chars = [...line];
-	const limit = 14;
-	if (chars.length <= 16) return line;
-	const head = chars.slice(0, 16).join("");
+	const limit = 46;
+	if (chars.length <= 48) return line;
+	const head = chars.slice(0, 48).join("");
 	const cut = Math.max(head.lastIndexOf(" "), head.lastIndexOf("、"), head.lastIndexOf("，"));
 	return cut > 4 ? `${head.slice(0, cut)}…` : `${chars.slice(0, limit).join("")}…`;
 }
@@ -1016,7 +1016,11 @@ function readLanes(dir, ownTask = "") {
 		const leaderOf = (lane) => {
 			for (const [leader, members] of plan) if (members.includes(lane)) return leader;
 		};
-		if (alive(root)) out.push(view(root, "main", "running", "main", assigned, ownTask));
+		let cooperative = plan.size > 0;
+		if (!cooperative) try {
+			cooperative = readdirSync(join(root, "lanes"), { withFileTypes: true }).some((entry) => entry.isDirectory());
+		} catch {}
+		if (!cooperative && alive(root)) out.push(view(root, "main", "running", "main", assigned, ownTask));
 		for (const name of readdirSync(join(root, "lanes"), { withFileTypes: true })) {
 			if (!name.isDirectory()) continue;
 			const base = join(root, "lanes", name.name);

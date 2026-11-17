@@ -1385,7 +1385,7 @@ window.__ModuleLoader__.load({
 													color: role === "leader" ? "#ffd96a" : "#c8e08a",
 													border: "1px solid " + (role === "leader" ? "#8a6a00" : "#5e7030")
 												},
-												children: ["👑", role === "leader" ? ` ${labels.get(lane.lane) ?? "leader"}` : ` ${labels.get(lane.lane) ?? ""}`]
+												children: ["👑", role === "leader" ? ` ${labels.get(lane.lane) ?? "leader"}` : ` ${labels.get(lane.lane) ?? "ccw"}`]
 											});
 											return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 												"data-pane-lane-role": lane.lane,
