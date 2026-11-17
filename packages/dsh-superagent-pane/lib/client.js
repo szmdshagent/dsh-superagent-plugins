@@ -669,6 +669,27 @@ window.__ModuleLoader__.load({
 			return "";
 		}
 		/**
+		* 非 leader/worker 的两种身份徽标（owner 口径：协作模式下除 leader/ccw 之外全叫 other）：
+		*   main  这张工单自己的 worker（无协作模式时）—— 蓝
+		*   other 协作模式下不属于 leader 的利益方（如独立验收 lane）—— 灰
+		*/
+		const ROLE_BADGE = {
+			main: {
+				label: "⏺ main",
+				hint: "这张工单自己的 worker（没有协作模式时由它执行）",
+				bg: "#1b2f52",
+				fg: "#9cc0f0",
+				border: "#2f4f7d"
+			},
+			other: {
+				label: "· oth-ccw",
+				hint: "协作模式下既不是 leader 也不是 ccworker 的 Claude Code worker（如独立验收）",
+				bg: "#333",
+				fg: "#aaa",
+				border: "#4a4a4a"
+			}
+		};
+		/**
 		* lane 的显示名：统一叫 ccwN。
 		* 历史 lane 目录名是 w1/w2（2026-11-11 之前的演示），显示时映射成 ccw1/ccw2，
 		* 不改磁盘目录，避免破坏已有记录；新起的 lane 直接命名 ccwN。
@@ -678,28 +699,76 @@ window.__ModuleLoader__.load({
 			return match ? `ccw${match[1]}` : name;
 		}
 		/**
-		* lane 目录名 → 显示名：leader1/leader2…、ccw 跨 leader 连续编号、散户 main/main1…
-		* 先排 leader1 管辖的 ccw，再排 leader2 的；不受管辖的散户按 lane 顺序叫 main、main1、main2…
+		* lane 目录名 → 显示名（owner 口径，四种身份）：
+		*   leader1/leader2…（统筹者，多 leader 按顺序）、ccw1/ccw2…（跨 leader 连续编号）、
+		*   main（无协作时工单自己的 worker）、other/other1…（协作下其余一切）
+		*/
+		/**
+		* lane 目录名 → 显示名，按身份分属不同命名空间，互不撞名（2026-11-17 分细身份）：
+		*   leader → leader1/2…；worker → ccw1/2…（跨 leader 连续编号）
+		*   main → main（这张工单自己的 worker）
+		*   other → oth-ccw1/oth-ccw2…（other + Claude Code worker 的缩写组合）
 		*/
 		function crewLabels(lanes) {
 			const labels = /* @__PURE__ */ new Map();
-			const leaders = lanes.filter((lane) => lane.role === "lead");
+			const leaders = lanes.filter((lane) => lane.role === "leader");
 			const workerOrder = [];
 			for (const leader of leaders) for (const lane of lanes) if (lane.role === "worker" && lane.leader === leader.lane) workerOrder.push(lane.lane);
 			for (const lane of lanes) if (lane.role === "worker" && !workerOrder.includes(lane.lane)) workerOrder.push(lane.lane);
-			leaders.forEach((lane, index) => labels.set(lane.lane, `leader${index + 1}`));
-			workerOrder.forEach((lane, index) => labels.set(lane, `ccw${index + 1}`));
-			lanes.filter((lane) => lane.role !== "lead" && lane.role !== "worker").forEach((lane, index) => labels.set(lane.lane, index === 0 ? "main" : `main${index}`));
+			const hasMembers = (lane) => lanes.some((item) => item.role === "worker" && item.leader === lane.lane);
+			let leaderNo = 0;
+			for (const lane of leaders) labels.set(lane.lane, hasMembers(lane) ? `leader${++leaderNo}` : "lead");
+			workerOrder.forEach((lane, index) => labels.set(lane.lane, `ccw${index + 1}`));
+			let mainN = 0;
+			let otherN = 0;
+			for (const lane of lanes) {
+				if (lane.role === "leader" || lane.role === "worker" || labels.has(lane.lane)) continue;
+				if (lane.role === "main") labels.set(lane.lane, mainN++ === 0 ? "main" : `main${mainN}`);
+				else labels.set(lane.lane, `oth-ccw${++otherN}`);
+			}
 			return labels;
 		}
 		/**
-		* 按 leader 把 lane 报成「1-n」：每个 leader 一组，n 是它管辖的 cc-worker 数；
-		* 不受任何 leader 管辖的 lane 单独计数。多 leader 时组间用逗号连，
-		* 例如 1-3,1-2,4 = 两个 leader 各带 3/2 个，另有 4 个不受管辖。
-		* main 是工单自己的主 worker，不是团队 lane，不计进「不受管辖」。
+		* 把 lanes 排成「leader 分组树」+「未归组的身份段」。
+		*
+		* 为什么需要它：`/crew` 返回的是平铺数组，直接 map 出来只能看到一串 ccw，
+		* 无法回答「哪些 ccw 归哪个 leader 带」。这里按 leader 归组，组内保持原顺序；
+		* 不属于任何 leader 的身份（顶层统筹 / 独立验收 / 工单主 worker / 其它散户）单独成段。
+		*
+		* 返回：{ groups: [{leader, members[]}], loose: lane[] }
+		*/
+		function crewGroups(lanes) {
+			const groups = [];
+			for (const lane of lanes) {
+				if (lane.role !== "leader") continue;
+				groups.push({
+					leader: lane,
+					members: lanes.filter((item) => item.role === "worker" && item.leader === lane.lane)
+				});
+			}
+			for (const lane of lanes) {
+				if (lane.role !== "worker" || !lane.leader) continue;
+				if (groups.some((group) => group.leader.lane === lane.leader)) continue;
+				groups.push({
+					leader: {
+						lane: lane.leader,
+						state: "idle",
+						role: "lead"
+					},
+					members: [lane]
+				});
+			}
+			return {
+				groups,
+				loose: lanes.filter((lane) => lane.role !== "leader" && lane.role !== "worker")
+			};
+		}
+		/**
+		* 协作规模：按 leader 分组报「1-n」，并把**不属于任何 leader 的身份分开计**——
+		* 顶层统筹 / 独立验收 / 工单主 worker / 其它散户各算各的，不再混成一个「不受管辖」数。
 		*/
 		function crewScale(lanes) {
-			const leads = lanes.filter((lane) => lane.role === "lead");
+			const leads = lanes.filter((lane) => lane.role === "leader");
 			const groups = leads.map((lane) => ({
 				leader: lane.lane,
 				count: 0
@@ -718,11 +787,36 @@ window.__ModuleLoader__.load({
 				}
 				group.count += 1;
 			}
+			const count = (role) => lanes.filter((lane) => lane.role === role).length;
 			return {
 				groups,
 				leaders: leads.length,
 				managed,
-				unmanaged: lanes.filter((lane) => lane.role !== "lead" && lane.role !== "worker").length
+				mains: count("main"),
+				other: count("other"),
+				unmanaged: lanes.filter((lane) => lane.role !== "leader" && lane.role !== "worker").length
+			};
+		}
+		/**
+		* 角色名归一化：把各种历史/服务端叫法收敛到四类。
+		*   lead / leadx / orchestrator / verifier(统筹侧) → leader
+		*   worker                                          → worker
+		*   main                                            → main
+		*   其余（verifier / other / 未知）                  → other
+		* 「未知一律 other」而不是「未知一律保留」，是为了让类型始终落在四类里，渲染分支不会漏。
+		*/
+		function normalizeRole(role) {
+			const value = typeof role === "string" ? role.trim().toLowerCase() : "";
+			if (value === "leader" || value === "lead" || value === "orchestrator") return "leader";
+			if (value === "worker" || value === "ccw") return "worker";
+			if (value === "main") return "main";
+			return "other";
+		}
+		/** 把一条 lane 的 role 归一化；没有 role 字段时保持缺失（交给兜底来源补）。 */
+		function normalizeLane(lane) {
+			return lane.role === void 0 ? lane : {
+				...lane,
+				role: normalizeRole(lane.role)
 			};
 		}
 		let governanceRoles = null;
@@ -732,7 +826,7 @@ window.__ModuleLoader__.load({
 			const map = {};
 			for (const lane of Array.isArray(body?.lanes) ? body.lanes : []) {
 				const suffix = (typeof lane?.ticket === "string" ? lane.ticket : "").split("-").pop() ?? "";
-				const role = lane?.role === "lead" || lane?.role === "worker" ? lane.role : "other";
+				const role = normalizeRole(lane?.role);
 				if (!suffix || typeof lane?.lane !== "string") continue;
 				map[suffix] ??= {};
 				map[suffix][lane.lane] = role === "worker" ? {
@@ -754,9 +848,11 @@ window.__ModuleLoader__.load({
 					const per = map[item.ticketId.slice(0, 12)] ?? {};
 					return {
 						...item,
-						lanes: (item.lanes ?? []).map((lane) => lane.role ? lane : {
-							...lane,
-							...per[lane.lane] ?? {}
+						lanes: (item.lanes ?? []).map((lane) => {
+							return normalizeLane(lane.role ? lane : {
+								...lane,
+								...per[lane.lane] ?? {}
+							});
 						})
 					};
 				})
@@ -1044,18 +1140,19 @@ window.__ModuleLoader__.load({
 								const scale = crewScale(lanes);
 								const labels = crewLabels(lanes);
 								const team = scale.leaders > 0 || scale.managed > 0;
-								const caption = team ? `👥 协作 ${scale.groups.map((group) => `1-${group.count}`).join(",")}${scale.unmanaged > 0 ? `,${scale.unmanaged}` : ""}` : `👥 协作 ${scale.unmanaged}`;
-								const summary = team ? `这张工单下 ${scale.groups.map((group) => `${labels.get(group.leader) ?? group.leader} 带 ${group.count} 个 cc-worker`).join("，")}${scale.unmanaged > 0 ? `，另有 ${scale.unmanaged} 个 cc-worker 不受 leader 管辖` : ""}（${running} 个在跑）：` : `这张工单下有 ${scale.unmanaged} 个 cc-worker（${running} 个在跑）：`;
+								const extras = [scale.mains > 0 ? `M${scale.mains}` : "", scale.other > 0 ? `O${scale.other}` : ""].filter(Boolean);
+								const caption = team ? `👥 G ${scale.groups.map((group) => `1-${group.count}`).join(",")}${extras.length ? ` · ${extras.join(" ")}` : ""}` : `👥 协作 ${scale.unmanaged}`;
+								const summary = (team ? `这张工单下 ${scale.groups.map((group) => `${labels.get(group.leader) ?? group.leader} 带 ${group.count} 个 cc-worker`).join("，")}` : `这张工单下有 ${scale.unmanaged} 条 lane`) + [scale.mains > 0 ? `工单自己的 worker（main）` : "", scale.other > 0 ? `${scale.other} 个 other` : ""].filter(Boolean).map((x) => `，${x}`).join("") + `（${running} 个在跑）：`;
 								return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 									"data-pane-ticket-crew": ticket.id,
 									title: summary.replace(/：$/, ""),
 									style: {
 										fontSize: 11,
 										fontWeight: 700,
-										padding: "1px 8px",
+										padding: "1px 10px",
 										borderRadius: 10,
 										flexShrink: 0,
-										letterSpacing: .3,
+										letterSpacing: .8,
 										lineHeight: 1.5,
 										border: running > 0 ? "1px solid #4a9eff" : "1px solid #555",
 										background: running > 0 ? "#1d4ed8" : "#3a3a3a",
@@ -1171,7 +1268,32 @@ window.__ModuleLoader__.load({
 							})()
 						}), (() => {
 							const labels = crewLabels(crew ?? []);
-							return (crew ?? []).map((lane) => {
+							const { groups, loose } = crewGroups(crew ?? []);
+							const ordered = [];
+							for (const group of groups) {
+								ordered.push({
+									lane: group.leader,
+									level: 1,
+									section: group.members.length ? `${group.members.length} 个下属` : "无下属"
+								});
+								group.members.forEach((member, index) => ordered.push({
+									lane: member,
+									level: 2,
+									first: index === 0,
+									last: index === group.members.length - 1
+								}));
+							}
+							const looseLabel = {
+								main: "工单自己的 worker",
+								other: "oth-ccw（非 leader / 非 ccworker）"
+							};
+							for (const lane of loose) ordered.push({
+								lane,
+								level: 1,
+								section: looseLabel[lane.role ?? "other"] ?? "其它"
+							});
+							return ordered.map(({ lane, level, first, last, section }) => {
+								const indent = level === 2;
 								const op = laneOps[lane.lane];
 								return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 									"data-pane-lane-pick": lane.lane,
@@ -1193,17 +1315,23 @@ window.__ModuleLoader__.load({
 										display: "flex",
 										gap: 6,
 										alignItems: "baseline",
-										fontSize: 11.5,
 										minWidth: 0,
 										width: "100%",
 										textAlign: "left",
 										font: "inherit",
 										color: "inherit",
-										padding: "1px 3px",
 										borderRadius: 4,
+										fontSize: level === 1 ? 12.5 : 11,
+										fontWeight: level === 1 ? 700 : 400,
+										padding: level === 1 ? "4px 6px" : "1px 3px",
+										marginLeft: indent ? 18 : 0,
+										marginTop: level === 1 ? 6 : 0,
+										borderTop: level === 1 ? "1px solid rgba(120,150,200,.35)" : void 0,
+										borderLeft: indent ? "2px solid #5e7030" : void 0,
+										paddingLeft: indent ? 8 : 6,
+										background: lanePick === lane.lane ? "rgba(74,158,255,.32)" : level === 1 ? "rgba(255,255,255,.05)" : "transparent",
 										cursor: onPickLane ? "pointer" : "default",
-										border: lanePick === lane.lane ? "1px solid #4a9eff" : "1px solid transparent",
-										background: lanePick === lane.lane ? "rgba(74,158,255,.32)" : "transparent"
+										boxShadow: lanePick === lane.lane ? "inset 0 0 0 1px #4a9eff" : void 0
 									},
 									children: [
 										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
@@ -1214,22 +1342,53 @@ window.__ModuleLoader__.load({
 											},
 											children: "●"
 										}),
-										(lane.role === "lead" || lane.leader) && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
-											"data-pane-lane-leader": lane.lane,
-											title: lane.role === "lead" ? "这条 lane 是 leader（统筹），管辖受管辖的 cc-worker" : `这条 cc-worker 归 ${labels.get(lane.leader ?? "") ?? lane.leader} 管辖`,
+										indent && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											title: "归上面的 leader 管辖",
+											"aria-hidden": true,
 											style: {
 												flexShrink: 0,
-												fontSize: 9.5,
-												padding: "0 5px",
-												borderRadius: 3,
-												lineHeight: 1.5,
-												background: lane.role === "lead" ? "#5c4600" : "#3d4a1f",
-												color: lane.role === "lead" ? "#ffd96a" : "#c8e08a",
-												border: "1px solid " + (lane.role === "lead" ? "#8a6a00" : "#5e7030")
+												fontSize: 11,
+												color: "#5e7030",
+												fontFamily: "monospace",
+												marginLeft: -3
 											},
-											children: ["👑", lane.role === "lead" ? ` ${labels.get(lane.lane) ?? "leader"}` : ""]
+											children: last ? "└─" : "├─"
 										}),
-										lane.role !== "lead" && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+										(lane.role === "leader" || lane.leader || ROLE_BADGE[lane.role ?? "other"]) && (() => {
+											const role = lane.role ?? "other";
+											const badge = ROLE_BADGE[role];
+											if (role === "leader" || role === "worker" || !badge) return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+												"data-pane-lane-leader": lane.lane,
+												title: role === "leader" ? "这条 lane 是 leader（统筹），管辖受管辖的 cc-worker" : `这条 cc-worker 归 ${labels.get(lane.leader ?? "") ?? lane.leader} 管辖`,
+												style: {
+													flexShrink: 0,
+													fontSize: 9.5,
+													padding: "0 5px",
+													borderRadius: 3,
+													lineHeight: 1.5,
+													background: role === "leader" ? "#5c4600" : "#3d4a1f",
+													color: role === "leader" ? "#ffd96a" : "#c8e08a",
+													border: "1px solid " + (role === "leader" ? "#8a6a00" : "#5e7030")
+												},
+												children: ["👑", role === "leader" ? ` ${labels.get(lane.lane) ?? "leader"}` : ""]
+											});
+											return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+												"data-pane-lane-role": lane.lane,
+												title: badge.hint,
+												style: {
+													flexShrink: 0,
+													fontSize: 9.5,
+													padding: "0 5px",
+													borderRadius: 3,
+													lineHeight: 1.5,
+													background: badge.bg,
+													color: badge.fg,
+													border: "1px solid " + badge.border
+												},
+												children: badge.label
+											});
+										})(),
+										lane.role !== "leader" && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 											style: {
 												flexShrink: 0,
 												width: 58,
@@ -1267,6 +1426,29 @@ window.__ModuleLoader__.load({
 												style: { opacity: .45 },
 												children: "没输出"
 											})
+										}),
+										indent && lane.leader && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+											style: {
+												flexShrink: 0,
+												fontSize: 9.5,
+												color: "#8a9a5e",
+												opacity: .9
+											},
+											title: `归 ${labels.get(lane.leader) ?? lane.leader} 管辖`,
+											children: ["←", labels.get(lane.leader) ?? lane.leader]
+										}),
+										!indent && section && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+											style: {
+												flexShrink: 0,
+												fontSize: 10,
+												color: "#8ea8c8",
+												opacity: .85
+											},
+											children: [
+												"（",
+												section,
+												"）"
+											]
 										}),
 										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
 											type: "button",
@@ -2171,10 +2353,22 @@ window.__ModuleLoader__.load({
 						if (body.items.some((item) => (item.lanes ?? []).some((lane) => !lane.role))) {
 							const map = await rolesFromGovernance().catch(() => null);
 							if (!alive) return;
-							setCrew(map ? withLaneRoles(body, map) : body);
+							setCrew(map ? withLaneRoles(body, map) : {
+								...body,
+								items: (body.items ?? []).map((item) => ({
+									...item,
+									lanes: (item.lanes ?? []).map(normalizeLane)
+								}))
+							});
 							return;
 						}
-						setCrew(body);
+						setCrew({
+							...body,
+							items: (body.items ?? []).map((item) => ({
+								...item,
+								lanes: (item.lanes ?? []).map(normalizeLane)
+							}))
+						});
 					}).catch(() => {});
 				};
 				tick();

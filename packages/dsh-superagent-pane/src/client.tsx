@@ -916,8 +916,8 @@ function TicketBar({ ticket, activity, t, health, confirmStop, onClose, onCommen
         // 悬浮标题只保留一行汇总：逐 lane 明细已经在下方列表里，不再重复。
         return <span data-pane-ticket-crew={ticket.id}
           title={summary.replace(/：$/, '')}
-          style={{ fontSize: 11, fontWeight: 700, padding: '1px 8px', borderRadius: 10, flexShrink: 0,
-            letterSpacing: 0.3, lineHeight: 1.5,
+          style={{ fontSize: 11, fontWeight: 700, padding: '1px 10px', borderRadius: 10, flexShrink: 0,
+            letterSpacing: 0.8, lineHeight: 1.5,
             border: running > 0 ? '1px solid #4a9eff' : '1px solid #555',
             background: running > 0 ? '#1d4ed8' : '#3a3a3a',
             color: running > 0 ? '#fff' : '#ccc',
