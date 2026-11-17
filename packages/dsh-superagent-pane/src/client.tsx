@@ -508,7 +508,7 @@ type CrewLane = { lane: string; state: 'running' | 'idle'; task?: string
  */
 const ROLE_BADGE: Record<string, { label: string; hint: string; bg: string; fg: string; border: string }> = {
   main: { label: '⏺ main', hint: '这张工单自己的 worker（没有协作模式时由它执行）', bg: '#1b2f52', fg: '#9cc0f0', border: '#2f4f7d' },
-  other: { label: '· other', hint: '协作模式下既不是 leader 也不是 ccworker 的 Claude Code worker（如独立验收）', bg: '#333', fg: '#aaa', border: '#4a4a4a' },
+  other: { label: '🧑‍🌾 other', hint: '协作模式下既不是 leader 也不是 ccworker 的 Claude Code worker（如独立验收）', bg: '#333', fg: '#aaa', border: '#4a4a4a' },
 }
 
 /**
