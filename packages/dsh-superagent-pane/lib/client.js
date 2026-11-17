@@ -1327,7 +1327,7 @@ window.__ModuleLoader__.load({
 						},
 						children: work.raw
 					}),
-					expanded && /* @__PURE__ */ (0, react_jsx_runtime.jsx)(CcPanel, {
+					expanded && !(crew ?? []).some((lane) => lane.lane === lanePick) && /* @__PURE__ */ (0, react_jsx_runtime.jsx)(CcPanel, {
 						status: ccStatus,
 						expanded: ccExpanded,
 						onToggle: onToggleCc,

@@ -919,8 +919,11 @@ function TicketBar({ ticket, activity, t, ccStatus, ccExpanded, onToggleCc, onIn
     </div>}
     {expanded && open && work?.raw && <div style={{ fontFamily: 'monospace', fontSize: 11, whiteSpace: 'pre-wrap', wordBreak: 'break-word',
       maxHeight: 140, overflowY: 'auto', background: 'rgba(0,0,0,.25)', padding: '6px 8px', borderRadius: 4, opacity: 0.85 }}>{work.raw}</div>}
-    {expanded && <CcPanel status={ccStatus} expanded={ccExpanded} onToggle={onToggleCc}
-      onInterrupt={onInterrupt} onClear={onClear} busy={ccBusy} />}
+    {/* 选中某条 lane 时，成员详情已经是唯一的 CC 状态来源；这里再渲染工单级块就会同一状态显示两次
+        （main 更是同一份数据）。没选中（或选中的 lane 已不在分工里）时照旧显示工单级聚合。 */}
+    {expanded && !(crew ?? []).some(lane => lane.lane === lanePick) &&
+      <CcPanel status={ccStatus} expanded={ccExpanded} onToggle={onToggleCc}
+        onInterrupt={onInterrupt} onClear={onClear} busy={ccBusy} />}
     {zombie && <div style={{ color: '#e53e3e', fontSize: 11 }}>⚠ {health?.detail ?? '执行器卡死，新消息投进去出不来。建议停止该工单后重新派活。'}</div>}
     {/* 展开态就是「展开看全文」：摘要框限高 + 框内滚轮下滑，卡片自身负责折叠。
         运行中（working）也显示已有 summary——worker 在跑不代表报告内容不该看。 */}
