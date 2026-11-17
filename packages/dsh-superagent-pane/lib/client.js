@@ -682,7 +682,7 @@ window.__ModuleLoader__.load({
 				border: "#2f4f7d"
 			},
 			other: {
-				label: "· other",
+				label: "🧑‍🌾 other",
 				hint: "协作模式下既不是 leader 也不是 ccworker 的 Claude Code worker（如独立验收）",
 				bg: "#333",
 				fg: "#aaa",
