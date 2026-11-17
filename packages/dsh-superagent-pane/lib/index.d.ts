@@ -77,8 +77,27 @@ declare module '@deepseek-ai/cordis' {
         close(): Promise<void>;
       }>;
     };
+    /**
+     * DSH 自带的附件存储（`@deepseek-ai/dsh-attachment-local` 提供）。面板复用它保存消息附件：
+     * 内容寻址、按字节原样落盘，`fileHostPath` 给出宿主机绝对路径，worker 直接按路径读取。
+     */
+    attachments: {
+      saveFileStream(input: {
+        data: AsyncIterable<Uint8Array>;
+        name?: string;
+        signal?: AbortSignal;
+      }): Promise<PaneFileRef>;
+      readFileStream(ref: PaneFileRef, signal?: AbortSignal): AsyncIterable<Uint8Array>;
+      fileHostPath(ref: PaneFileRef): string | undefined;
+    };
   }
 }
+/** DSH 附件引用（与 `@deepseek-ai/dsh-attachment` 的 FileAttachmentRef 同形）。 */
+type PaneFileRef = {
+  attachmentId: string;
+  name: string;
+  bytes: number;
+};
 /** 只读消费的会话事件形状；只关心 `type`/`time`/`data`，其余字段不理会。 */
 type PaneSessionEvent = {
   type?: string;
@@ -114,5 +133,55 @@ type PaneMode = 'assign' | 'chat' | 'note' | 'broadcast';
 declare function paneTrigger(conversation: string, text: string, sender?: string, mode?: PaneMode, options?: {
   thread?: string;
 }): Trigger;
+/**
+ * 读一张工单目录下的协作 lane 状态。
+ *
+ * lane 布局（cc-worker --lane 引入，2026-11-11）：
+ *   <dir>/.cc-worker/{lock,session_id,...}             → lane = main（传统单 worker）
+ *   <dir>/.cc-worker/lanes/<name>/{lock,session_id,...} → lane = <name>（协作子 worker）
+ *
+ * 「在跑」的判据与面板其它地方一致：claude.pid 存在且该 pid 的命令行含 claude。
+ * 只读目录，不改任何东西；读不到就当没有 lane。
+ */
+/**
+ * lane 在协作里的身份（owner 2026-11-17 定义，只分四种，不再细分）：
+ *   leader  统筹者。多 leader 里每个 leaderK 是它，顶层切分者 orchestrator 也归它
+ *   worker  被 leader 带领的 ccworker
+ *   main    没有协作模式时，这张工单自己的 worker
+ *   other   协作模式下，既不是 leader 也不是 ccworker 的一切（含独立验收 lane 等）
+ */
+type LaneRole = 'leader' | 'worker' | 'main' | 'other';
+type CrewLaneView = {
+  lane: string;
+  state: 'running' | 'idle';
+  task?: string;
+  /** 协作身份；没有 team-plan、也没有 lead lane 的工单全是 other。 */
+  role: LaneRole;
+  /** 这条 lane 归谁管辖（team 模式下是 lead 的名字）；不受管辖时没有该字段。 */
+  leader?: string;
+  /** 逻辑 cc worker id：handoff 换会话保持不变（cc-worker 写的 worker-id，旧数据回退到「目录#lane」）。 */
+  workerId: string;
+  /** 本 lane 当前的 Claude Code 会话 id。 */
+  sessionId?: string;
+  /** 本 lane 用过的会话数；>1 说明中间发生过 handoff 换会话，但仍是一个 cc worker。 */
+  sessions: number;
+  /**
+   * 这条行不是由 lane 目录得出来的，而是从「正在跑的 cc-worker 进程」补出来的：
+   * 进程确实在跑，但工单目录下还没有对应 lane 目录（--dir 直接起、lane 目录还没建/已清掉）。
+   * 面板据此知道这一行的依据是进程，不是磁盘记录。
+   */
+  processOnly?: boolean;
+};
+/**
+ * 把 team-plan 里的派活原文压成约 10-14 个汉字的一行任务登记。
+ *
+ * 派活原文通常长这样：`统计 /tmp/x/A 的文件数（只读）。做法：… 验收：… 禁止：…`，
+ * 面板只需要第一句「要做什么」：取第一个完整短句、去掉括号里的补充说明、
+ * 把长路径压成末段（既保留 A/B/C 这种区分词，又不让路径吃掉整行预算），
+ * 仍然超长就在词边界截断并加省略号。
+ */
+declare function summarizeTask(text: string): string;
+/** 导出仅为可验证：面板运行时只经 /crew 间接调用它。 */
+declare function readLanes(dir: string, ownTask?: string): CrewLaneView[];
 declare function apply(ctx: Context): void;
-export { PaneMode, apply, inject, name, paneTrigger };
+export { CrewLaneView, LaneRole, PaneMode, apply, inject, name, paneTrigger, readLanes, summarizeTask };

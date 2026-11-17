@@ -36,6 +36,8 @@ window.__ModuleLoader__.load({
 			const done = steps.filter((step) => step.done).length;
 			const alertColor = status.alert === "critical" ? "#e53e3e" : status.alert === "warn" ? "#dd6b20" : void 0;
 			const running = status.state === "running" || status.state === "thinking" || status.state === "stalled";
+			const latest = status.current ?? steps[steps.length - 1];
+			const stage = (latest?.tool ? `${latest.tool}${latest.detail ? `：${latest.detail.slice(0, 120)}` : ""}` : void 0) ?? "等待下一步";
 			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 				style: {
 					marginTop: 4,
@@ -66,10 +68,19 @@ window.__ModuleLoader__.load({
 								style: { opacity: .8 },
 								children: STATE_TEXT[status.state]
 							}),
+							running && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+								style: {
+									overflow: "hidden",
+									textOverflow: "ellipsis",
+									whiteSpace: "nowrap",
+									fontFamily: "monospace"
+								},
+								children: ["· ", stage]
+							}),
 							steps.length > 0 && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
 								style: { opacity: .6 },
 								children: [
-									"第 ",
+									"· 第 ",
 									done,
 									"/",
 									steps.length,
@@ -84,7 +95,7 @@ window.__ModuleLoader__.load({
 									"前有动作"
 								]
 							}),
-							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+							onToggle && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
 								type: "button",
 								onClick: onToggle,
 								style: {
@@ -101,14 +112,6 @@ window.__ModuleLoader__.load({
 								children: expanded ? "收起" : "展开"
 							})
 						]
-					}),
-					status.current && running && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
-						style: {
-							opacity: .85,
-							fontFamily: "monospace",
-							wordBreak: "break-all"
-						},
-						children: [status.current.tool, status.current.detail ? `：${status.current.detail.slice(0, 120)}` : ""]
 					}),
 					status.alertText && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 						style: {
@@ -167,7 +170,7 @@ window.__ModuleLoader__.load({
 							]
 						}, step.step))
 					}),
-					running && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", { children: [status.interruptRequested ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+					running && onInterrupt && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", { children: [status.interruptRequested ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 						style: { color: "#dd6b20" },
 						children: "已请求中止，等待 cc-worker 响应…"
 					}) : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
@@ -180,7 +183,7 @@ window.__ModuleLoader__.load({
 							cursor: busy ? "wait" : "pointer"
 						},
 						children: "中止执行"
-					}), status.interruptRequested && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+					}), status.interruptRequested && onClear && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
 						type: "button",
 						disabled: busy,
 						onClick: onClear,
@@ -506,7 +509,16 @@ window.__ModuleLoader__.load({
 			usageCacheWrite: "写",
 			usageCacheWriteUnreported: "—",
 			usageCacheWriteZeroHint: "当前上游通道不返回缓存写入计数（DeepSeek 无缓存写入计费）",
-			usageHitRate: "命中"
+			usageHitRate: "命中",
+			attachAdd: "添加附件（也可拖拽到输入框或直接粘贴图片）",
+			attachUploading: "上传中 {pct}%",
+			attachFailed: "附件上传失败：{error}",
+			attachRemove: "移除附件",
+			attachDrop: "松开即添加到这条消息",
+			attachLimit: "一条消息最多 {n} 个附件",
+			attachOpen: "查看原图",
+			attachDownload: "下载附件",
+			attachBytes: "{size}"
 		};
 		const en = {
 			panel: "Dispatch",
@@ -646,7 +658,16 @@ window.__ModuleLoader__.load({
 			usageCacheWrite: "write",
 			usageCacheWriteUnreported: "—",
 			usageCacheWriteZeroHint: "The current upstream channel does not report cache writes (DeepSeek has no cache-write billing)",
-			usageHitRate: "hit"
+			usageHitRate: "hit",
+			attachAdd: "Add files (you can also drop them here or paste an image)",
+			attachUploading: "Uploading {pct}%",
+			attachFailed: "Attachment upload failed: {error}",
+			attachRemove: "Remove attachment",
+			attachDrop: "Release to attach to this message",
+			attachLimit: "At most {n} files per message",
+			attachOpen: "View original",
+			attachDownload: "Download attachment",
+			attachBytes: "{size}"
 		};
 		/** 工单上"收到却没被读"的条数；由服务端按 inputs 的 readAt 算出后随列表下发。 */
 		function unreadCount(ticket) {
@@ -666,13 +687,600 @@ window.__ModuleLoader__.load({
 			return "";
 		}
 		/**
-		* lane 的显示名：统一叫 ccwN。
-		* 历史 lane 目录名是 w1/w2（2026-11-11 之前的演示），显示时映射成 ccw1/ccw2，
-		* 不改磁盘目录，避免破坏已有记录；新起的 lane 直接命名 ccwN。
+		* 非 leader/worker 的两种身份徽标（owner 口径：协作模式下除 leader/ccw 之外全叫 other）：
+		*   main  这张工单自己的 worker（无协作模式时）—— 蓝
+		*   other 协作模式下不属于 leader 的利益方（如独立验收 lane）—— 灰
+		*/
+		const ROLE_BADGE = {
+			main: {
+				label: "⏺ main",
+				hint: "这张工单自己的 worker（没有协作模式时由它执行）",
+				bg: "#1b2f52",
+				fg: "#9cc0f0",
+				border: "#2f4f7d"
+			},
+			other: {
+				label: "👤 other",
+				hint: "平民：协作模式下既不是 leader 也不是 minister 的 Claude Code worker（如独立验收）",
+				bg: "#333",
+				fg: "#aaa",
+				border: "#4a4a4a"
+			}
+		};
+		/**
+		* lane 的显示名：统一叫 minister N。
+		* 历史 lane 目录名是 w1/w2（2026-11-11 之前的演示），显示时映射成 minister1/minister2，
+		* 不改磁盘目录，避免破坏已有记录；新起的 lane 直接命名 minister N。
 		*/
 		function laneLabel(name) {
 			const match = /^w(\d+)$/.exec(name);
-			return match ? `ccw${match[1]}` : name;
+			return match ? `minister${match[1]}` : name;
+		}
+		/**
+		* lane 目录名 → 显示名（owner 口径，四种身份）：
+		*   leader → L1/L2…（统筹者，多 leader 按顺序）、minister → M1/M2…（跨 leader 连续编号）、
+		*   main（无协作时工单自己的 worker）、other/other1…（协作下其余一切）
+		*/
+		/**
+		* lane 目录名 → 显示名，按身份分属不同命名空间，互不撞名（2026-11-17 分细身份）：
+		*   leader → L1/L2…；worker → M1/M2…（跨 leader 连续编号）
+		*   main → main（这张工单自己的 worker）
+		*   other → 直接用真实 lane 目录名（main-verify / orchestrator / l1_w1…），owner 要求能看清是谁
+		*/
+		function crewLabels(lanes) {
+			const labels = /* @__PURE__ */ new Map();
+			const leaders = lanes.filter((lane) => lane.role === "leader");
+			const workerOrder = [];
+			for (const leader of leaders) for (const lane of lanes) if (lane.role === "worker" && lane.leader === leader.lane) workerOrder.push(lane.lane);
+			for (const lane of lanes) if (lane.role === "worker" && !workerOrder.includes(lane.lane)) workerOrder.push(lane.lane);
+			let leaderNo = 0;
+			for (const lane of leaders) labels.set(lane.lane, lane.lane === "orchestrator" ? "切分" : `L${++leaderNo}`);
+			workerOrder.forEach((name, index) => labels.set(name, `M${index + 1}`));
+			let mainN = 0;
+			const taken = new Set(labels.values());
+			for (const lane of lanes) {
+				if (lane.role === "leader" || lane.role === "worker" || labels.has(lane.lane)) continue;
+				if (lane.role === "main") {
+					const name = mainN++ === 0 ? "main" : `main${mainN}`;
+					labels.set(lane.lane, taken.has(name) ? `main:${lane.lane}` : name);
+				} else labels.set(lane.lane, taken.has(lane.lane) ? `other:${lane.lane}` : lane.lane);
+			}
+			return labels;
+		}
+		/**
+		* 把 lanes 排成「leader 分组树」+「未归组的身份段」。
+		*
+		* 为什么需要它：`/crew` 返回的是平铺数组，直接 map 出来只能看到一串 ccw，
+		* 无法回答「哪些 ccw 归哪个 leader 带」。这里按 leader 归组，组内保持原顺序；
+		* 不属于任何 leader 的身份（顶层统筹 / 独立验收 / 工单主 worker / 其它散户）单独成段。
+		*
+		* 返回：{ groups: [{leader, members[]}], loose: lane[] }
+		*/
+		function crewGroups(lanes) {
+			const groups = [];
+			for (const lane of lanes) {
+				if (lane.role !== "leader") continue;
+				groups.push({
+					leader: lane,
+					members: lanes.filter((item) => item.role === "worker" && item.leader === lane.lane)
+				});
+			}
+			for (const lane of lanes) {
+				if (lane.role !== "worker" || !lane.leader) continue;
+				if (groups.some((group) => group.leader.lane === lane.leader)) continue;
+				groups.push({
+					leader: {
+						lane: lane.leader,
+						state: "idle",
+						role: "lead"
+					},
+					members: [lane]
+				});
+			}
+			groups.sort((a, b) => Number(b.leader.lane === "orchestrator") - Number(a.leader.lane === "orchestrator"));
+			return {
+				groups,
+				loose: lanes.filter((lane) => lane.role !== "leader" && lane.role !== "worker")
+			};
+		}
+		/**
+		* 协作规模：按 leader 分组报「1-n」，并把**不属于任何 leader 的身份分开计**——
+		* 顶层统筹 / 独立验收 / 工单主 worker / 其它散户各算各的，不再混成一个「不受管辖」数。
+		*/
+		function crewScale(lanes) {
+			const leads = lanes.filter((lane) => lane.role === "leader");
+			const groups = leads.map((lane) => ({
+				leader: lane.lane,
+				count: 0
+			}));
+			let managed = 0;
+			for (const lane of lanes) {
+				if (lane.role !== "worker") continue;
+				managed += 1;
+				let group = groups.find((item) => item.leader === lane.leader);
+				if (!group) {
+					group = {
+						leader: lane.leader ?? "lead",
+						count: 0
+					};
+					groups.push(group);
+				}
+				group.count += 1;
+			}
+			const count = (role) => lanes.filter((lane) => lane.role === role).length;
+			return {
+				groups,
+				leaders: leads.length,
+				managed,
+				mains: count("main"),
+				other: count("other"),
+				unmanaged: lanes.filter((lane) => lane.role !== "leader" && lane.role !== "worker").length
+			};
+		}
+		/**
+		* 角色名归一化：把各种历史/服务端叫法收敛到四类。
+		*   lead / leadx / orchestrator / verifier(统筹侧) → leader
+		*   worker                                          → worker
+		*   main                                            → main
+		*   其余（verifier / other / 未知）                  → other
+		* 「未知一律 other」而不是「未知一律保留」，是为了让类型始终落在四类里，渲染分支不会漏。
+		*/
+		function normalizeRole(role) {
+			const value = typeof role === "string" ? role.trim().toLowerCase() : "";
+			if (value === "leader" || value === "lead" || value === "orchestrator") return "leader";
+			if (value === "worker" || value === "ccw") return "worker";
+			if (value === "main") return "main";
+			return "other";
+		}
+		/** 把一条 lane 的 role 归一化；没有 role 字段时保持缺失（交给兜底来源补）。 */
+		function normalizeLane(lane) {
+			return lane.role === void 0 ? lane : {
+				...lane,
+				role: normalizeRole(lane.role)
+			};
+		}
+		let governanceRoles = null;
+		async function rolesFromGovernance() {
+			if (governanceRoles && Date.now() - governanceRoles.at < 6e4) return governanceRoles.map;
+			const body = await request("/api/governance");
+			const map = {};
+			for (const lane of Array.isArray(body?.lanes) ? body.lanes : []) {
+				const suffix = (typeof lane?.ticket === "string" ? lane.ticket : "").split("-").pop() ?? "";
+				const role = normalizeRole(lane?.role);
+				if (!suffix || typeof lane?.lane !== "string") continue;
+				map[suffix] ??= {};
+				map[suffix][lane.lane] = role === "worker" ? {
+					role,
+					leader: "lead"
+				} : { role };
+			}
+			governanceRoles = {
+				at: Date.now(),
+				map
+			};
+			return map;
+		}
+		/** 把兜底 role 合并进 `/crew`：服务端已经给了 role 的以服务端为准。 */
+		function withLaneRoles(body, map) {
+			return {
+				...body,
+				items: body.items.map((item) => {
+					const per = map[item.ticketId.slice(0, 12)] ?? {};
+					return {
+						...item,
+						lanes: (item.lanes ?? []).map((lane) => {
+							return normalizeLane(lane.role ? lane : {
+								...lane,
+								...per[lane.lane] ?? {}
+							});
+						})
+					};
+				})
+			};
+		}
+		/** 一条消息最多带多少附件（宿主侧同样限制 20）。 */
+		const ATTACH_LIMIT = 20;
+		/** 人类可读的字节数。 */
+		function formatBytes(bytes) {
+			if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+			if (bytes < 1024) return `${bytes} B`;
+			if (bytes < 1048576) return `${(bytes / 1024).toFixed(1)} KB`;
+			return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+		}
+		/** 已取回的附件 blob URL：按 attachmentId+name 缓存，同一附件只拉一次（刷新页面自然重取）。 */
+		const blobUrls = /* @__PURE__ */ new Map();
+		/**
+		* 按引用取回附件字节并转成 blob URL。
+		*
+		* 为什么不用 `<img src="...">` / `<a href>` 直接指向路由：面板路由要求同源管理头
+		* （`x-orchestrator-request`），img/a 发不出自定义头；所以统一带头发取，再交给 blob URL。
+		*/
+		async function attachmentBlobUrl(item) {
+			const cacheKey = `${item.attachmentId}/${item.name}`;
+			const cached = blobUrls.get(cacheKey);
+			if (cached) return cached;
+			const value = token();
+			const query = new URLSearchParams({
+				id: item.attachmentId,
+				name: item.name
+			});
+			if (value) query.set("token", value);
+			const response = await fetch(`${API}/file?${query.toString()}`, {
+				headers: { "x-orchestrator-request": "1" },
+				credentials: "same-origin",
+				cache: "no-store"
+			});
+			if (!response.ok) throw new Error(`HTTP ${response.status}`);
+			const url = URL.createObjectURL(await response.blob());
+			blobUrls.set(cacheKey, url);
+			return url;
+		}
+		/** 一张图片附件：取回字节后显示缩略图，点击用 blob URL 打开原图。 */
+		function AttachmentImage({ item, t }) {
+			const [url, setUrl] = (0, react.useState)("");
+			const [failed, setFailed] = (0, react.useState)(false);
+			(0, react.useEffect)(() => {
+				let live = true;
+				attachmentBlobUrl(item).then((value) => {
+					if (live) setUrl(value);
+				}).catch(() => {
+					if (live) setFailed(true);
+				});
+				return () => {
+					live = false;
+				};
+			}, [item.attachmentId, item.name]);
+			if (failed) return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+				"data-pane-message-image-failed": item.name,
+				title: item.name,
+				style: {
+					fontSize: 11,
+					opacity: .7
+				},
+				children: ["🖼 ", item.name]
+			});
+			if (!url) return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+				"data-pane-message-image-loading": item.name,
+				style: {
+					display: "inline-block",
+					height: 64,
+					width: 64,
+					borderRadius: 6,
+					background: "rgba(0,0,0,.2)"
+				}
+			});
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("a", {
+				href: url,
+				target: "_blank",
+				rel: "noreferrer",
+				"data-pane-message-image": item.name,
+				title: `${t("attachOpen")}：${item.name}`,
+				style: { display: "block" },
+				children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("img", {
+					src: url,
+					alt: item.name,
+					style: {
+						height: 64,
+						maxWidth: 240,
+						objectFit: "cover",
+						borderRadius: 6,
+						border: "1px solid rgba(255,255,255,.2)",
+						background: "rgba(0,0,0,.2)"
+					}
+				})
+			});
+		}
+		/** 一个文件附件：取回字节后以下载链接呈现（docx/txt 等浏览器不能内嵌预览的类型）。 */
+		function AttachmentFile({ item, t }) {
+			const [url, setUrl] = (0, react.useState)("");
+			(0, react.useEffect)(() => {
+				let live = true;
+				attachmentBlobUrl(item).then((value) => {
+					if (live) setUrl(value);
+				}).catch(() => {});
+				return () => {
+					live = false;
+				};
+			}, [item.attachmentId, item.name]);
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("a", {
+				...url ? {
+					href: url,
+					download: item.name
+				} : {},
+				"data-pane-message-file": item.name,
+				title: `${t("attachDownload")}：${item.name}`,
+				style: {
+					display: "flex",
+					alignItems: "center",
+					gap: 6,
+					maxWidth: 240,
+					height: 40,
+					padding: "0 8px",
+					borderRadius: 6,
+					fontSize: 11,
+					textDecoration: "none",
+					color: "inherit",
+					cursor: url ? "pointer" : "default",
+					border: "1px solid rgba(255,255,255,.25)",
+					background: "rgba(0,0,0,.18)"
+				},
+				children: [
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+						style: { flexShrink: 0 },
+						children: "📄"
+					}),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+						style: {
+							minWidth: 0,
+							overflow: "hidden",
+							textOverflow: "ellipsis",
+							whiteSpace: "nowrap"
+						},
+						children: item.name
+					}),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+						style: {
+							flexShrink: 0,
+							opacity: .7
+						},
+						children: formatBytes(item.bytes)
+					})
+				]
+			});
+		}
+		/** 图片类附件按扩展名判断：只有这些在消息流里渲染缩略图。 */
+		function isImageAttachment(name) {
+			return /\.(png|jpe?g|gif|webp|bmp)$/i.test(name);
+		}
+		/**
+		* 上传一个文件并返回附件引用。用 XHR 而不是 fetch：需要上传进度（大文件、Word/图片都有感）。
+		* 字节直接作为请求体发送，文件名走查询参数（服务端会做与 DSH 附件存储一致的清洗）。
+		*/
+		function uploadPaneFile(file, onProgress, signal) {
+			return new Promise((resolve, reject) => {
+				const value = token();
+				const query = new URLSearchParams({ name: file.name || "file" });
+				if (value) query.set("token", value);
+				const xhr = new XMLHttpRequest();
+				xhr.open("POST", `${API}/upload?${query.toString()}`);
+				xhr.setRequestHeader("x-orchestrator-request", "1");
+				xhr.setRequestHeader("content-type", "application/octet-stream");
+				xhr.upload.onprogress = (event) => {
+					if (event.lengthComputable) onProgress(Math.round(event.loaded / event.total * 100));
+				};
+				xhr.onerror = () => reject(/* @__PURE__ */ new Error("网络错误"));
+				xhr.onabort = () => reject(/* @__PURE__ */ new Error("已取消"));
+				xhr.onload = () => {
+					let body = {};
+					try {
+						body = JSON.parse(xhr.responseText);
+					} catch {
+						body = {};
+					}
+					if (xhr.status >= 200 && xhr.status < 300 && typeof body?.attachmentId === "string") resolve(body);
+					else reject(new Error(body?.error ?? `HTTP ${xhr.status}`));
+				};
+				signal.addEventListener("abort", () => xhr.abort(), { once: true });
+				xhr.send(file);
+			});
+		}
+		/** 展示用文件名：只留叶子名（浏览器不会给完整路径，这里只是防御）。 */
+		function paneLocalName(file) {
+			return (file.name || "file").replace(/\\/g, "/").split("/").pop() || "file";
+		}
+		/** 粘贴板里的文件：截图走 `clipboardData.files`，部分浏览器只有 items，两路都取。 */
+		function clipboardFiles(data) {
+			if (!data) return [];
+			const files = Array.from(data.files ?? []);
+			if (files.length > 0) return files;
+			return Array.from(data.items ?? []).filter((item) => item.kind === "file").map((item) => item.getAsFile()).filter((file) => !!file);
+		}
+		/** 给粘贴进来的图片起个带时间戳的名字：浏览器给的 clipboard 文件常叫 image.png，会互相覆盖展示名。 */
+		function namePastedFile(file) {
+			if (file.name && file.name !== "image.png" && file.name !== "blob") return file;
+			const ext = file.type === "image/jpeg" ? "jpg" : file.type === "image/gif" ? "gif" : file.type === "image/webp" ? "webp" : "png";
+			const now = /* @__PURE__ */ new Date();
+			const pad = (value) => String(value).padStart(2, "0");
+			const name = `粘贴图片-${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}.${ext}`;
+			return new File([file], name, { type: file.type });
+		}
+		const EMPTY_ATTACHMENTS = [];
+		/** 草稿附件状态：选择/拖拽/粘贴共用，上传完成才允许发送。 */
+		function useAttachmentDrafts(t) {
+			const [items, setItems] = (0, react.useState)(EMPTY_ATTACHMENTS);
+			const [error, setError] = (0, react.useState)("");
+			const abortRef = (0, react.useRef)(null);
+			/** 当前草稿的快照：连续两次选择/粘贴时也要算准剩余名额（不能依赖异步的 state）。 */
+			const itemsRef = (0, react.useRef)(EMPTY_ATTACHMENTS);
+			(0, react.useEffect)(() => () => {
+				abortRef.current?.abort();
+			}, []);
+			const update = (0, react.useCallback)((draftId, patch) => {
+				setItems((previous) => previous.map((item) => item.draftId === draftId ? {
+					...item,
+					...patch
+				} : item));
+			}, []);
+			return {
+				items,
+				add: (0, react.useCallback)(async (incoming) => {
+					const files = Array.from(incoming);
+					if (files.length === 0) return;
+					setError("");
+					const controller = abortRef.current ?? new AbortController();
+					abortRef.current = controller;
+					const seen = new Set(itemsRef.current.filter((item) => item.state !== "error").map((item) => `${item.name}/${item.bytes}`));
+					const fresh = files.filter((file) => {
+						const identity = `${paneLocalName(file)}/${file.size}`;
+						if (seen.has(identity)) return false;
+						seen.add(identity);
+						return true;
+					});
+					const room = ATTACH_LIMIT - itemsRef.current.length;
+					if (fresh.length > room) setError(fill(t("attachLimit"), { n: String(ATTACH_LIMIT) }));
+					const accepted = fresh.slice(0, Math.max(0, room)).map((file) => ({
+						draftId: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+						attachmentId: "",
+						name: paneLocalName(file),
+						bytes: file.size,
+						state: "uploading",
+						pct: void 0
+					}));
+					if (accepted.length === 0) return;
+					itemsRef.current = [...itemsRef.current, ...accepted];
+					setItems(itemsRef.current);
+					for (const [index, draft] of accepted.entries()) uploadPaneFile(fresh[index], (pct) => update(draft.draftId, { pct }), controller.signal).then((ref) => update(draft.draftId, {
+						...ref,
+						state: "done",
+						pct: 100
+					})).catch((failure) => update(draft.draftId, {
+						state: "error",
+						error: failure instanceof Error ? failure.message : String(failure)
+					}));
+				}, [t, update]),
+				remove: (0, react.useCallback)((draftId) => {
+					itemsRef.current = itemsRef.current.filter((item) => item.draftId !== draftId);
+					setItems(itemsRef.current);
+				}, []),
+				clear: (0, react.useCallback)(() => {
+					itemsRef.current = EMPTY_ATTACHMENTS;
+					setItems(EMPTY_ATTACHMENTS);
+					setError("");
+				}, []),
+				ready: items.filter((item) => item.state === "done").map((item) => ({
+					attachmentId: item.attachmentId,
+					name: item.name,
+					bytes: item.bytes
+				})),
+				error,
+				setError
+			};
+		}
+		/** 草稿附件栏：横向排列的文件卡，上传中显示进度，失败显示原因，悬停放大移除按钮。 */
+		function AttachmentRail({ items, onRemove, t }) {
+			if (items.length === 0) return null;
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+				"data-pane-attachment-rail": "",
+				style: {
+					display: "flex",
+					flexWrap: "wrap",
+					gap: 6
+				},
+				children: items.map((item) => {
+					const failed = item.state === "error";
+					return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+						"data-pane-attachment-draft": item.name,
+						title: failed ? fill(t("attachFailed"), { error: item.error ?? "" }) : item.path ?? item.name,
+						style: {
+							display: "flex",
+							alignItems: "center",
+							gap: 6,
+							maxWidth: 240,
+							padding: "3px 6px",
+							borderRadius: 6,
+							fontSize: 11,
+							border: `1px solid ${failed ? "#e53e3e" : "var(--dt-border, #333)"}`,
+							background: "var(--dt-surface, #2d2d2d)",
+							opacity: item.state === "uploading" ? .75 : 1
+						},
+						children: [
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								style: { flexShrink: 0 },
+								children: failed ? "⚠" : isImageAttachment(item.name) ? "🖼" : "📄"
+							}),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								style: {
+									minWidth: 0,
+									overflow: "hidden",
+									textOverflow: "ellipsis",
+									whiteSpace: "nowrap"
+								},
+								children: item.name
+							}),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								style: {
+									flexShrink: 0,
+									opacity: .6
+								},
+								children: item.state === "uploading" ? fill(t("attachUploading"), { pct: String(item.pct ?? 0) }) : formatBytes(item.bytes)
+							}),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+								type: "button",
+								"data-pane-attachment-remove": item.name,
+								"aria-label": t("attachRemove"),
+								title: t("attachRemove"),
+								onClick: () => onRemove(item.draftId),
+								style: {
+									flexShrink: 0,
+									background: "none",
+									border: "none",
+									cursor: "pointer",
+									padding: 0,
+									fontSize: 12,
+									color: "inherit",
+									opacity: .6
+								},
+								children: "×"
+							})
+						]
+					}, item.draftId);
+				})
+			});
+		}
+		/** 消息流里的附件：图片显示缩略图（点击看原图），其它文件显示可下载的文件卡。 */
+		function MessageAttachments({ items, t }) {
+			if (items.length === 0) return null;
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+				"data-pane-message-attachments": "",
+				style: {
+					display: "flex",
+					flexWrap: "wrap",
+					gap: 6,
+					marginTop: 6
+				},
+				children: items.map((item) => isImageAttachment(item.name) ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)(AttachmentImage, {
+					item,
+					t
+				}, item.attachmentId + item.name) : /* @__PURE__ */ (0, react_jsx_runtime.jsx)(AttachmentFile, {
+					item,
+					t
+				}, item.attachmentId + item.name))
+			});
+		}
+		/** 附件按钮 + 隐藏的文件选择框：主输入区与工单意见框共用。 */
+		function AttachButton({ disabled, onFiles, t }) {
+			const inputRef = (0, react.useRef)(null);
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+				ref: inputRef,
+				type: "file",
+				multiple: true,
+				"data-pane-attach-input": "",
+				style: { display: "none" },
+				onChange: (event) => {
+					const files = event.target.files;
+					if (files && files.length) onFiles(files);
+				}
+			}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+				type: "button",
+				"data-pane-attach": "",
+				"aria-label": t("attachAdd"),
+				title: t("attachAdd"),
+				disabled,
+				onClick: () => {
+					if (inputRef.current) inputRef.current.value = "";
+					inputRef.current?.click();
+				},
+				style: {
+					height: 24,
+					padding: "0 8px",
+					fontSize: 12,
+					lineHeight: 1,
+					flexShrink: 0,
+					opacity: disabled ? .4 : .8,
+					cursor: disabled ? "not-allowed" : "pointer"
+				},
+				children: "📎"
+			})] });
 		}
 		/** 工具名到文案键的映射；未知工具直接显示原名。 */
 		const TOOL_KEYS = {
@@ -829,8 +1437,30 @@ window.__ModuleLoader__.load({
 		/** 状态条里的圆点：运行中呼吸闪烁，其余静态。 */
 		const DOT_STYLE = `.dsh-pane-dot-running{animation:dsh-pane-pulse 1.6s ease-in-out infinite}@keyframes dsh-pane-pulse{0%,100%{opacity:1}50%{opacity:.35}}`;
 		/** 对话上方的一条工单状态条：哪个工单、到哪一步、worker 此刻在做什么（说人话，详情可展开原始命令）。 */
-		function TicketBar({ ticket, activity, t, ccStatus, ccExpanded, onToggleCc, onInterrupt, onClear, ccBusy, health, confirmStop, onClose, onComment, onOpenComment, crew }) {
+		function TicketBar({ ticket, activity, t, health, confirmStop, onClose, onComment, onOpenComment, crew, lanePick, laneStatus, onPickLane, onInterruptLane, ccStatus, ccExpanded, onToggleCc, onInterrupt, onClear, ccBusy }) {
 			const [open, setOpen] = (0, react.useState)(false);
+			/** 每条 lane 自己的中止按钮状态：busy 请求在飞，done/fail 是几秒后自动消失的回执。 */
+			const [laneOps, setLaneOps] = (0, react.useState)({});
+			const abortLane = (lane) => {
+				if (!onInterruptLane || laneOps[lane] === "busy") return;
+				setLaneOps((prev) => ({
+					...prev,
+					[lane]: "busy"
+				}));
+				const settle = (value) => {
+					setLaneOps((prev) => ({
+						...prev,
+						[lane]: value
+					}));
+					setTimeout(() => setLaneOps((prev) => {
+						if (prev[lane] !== value) return prev;
+						const next = { ...prev };
+						delete next[lane];
+						return next;
+					}), 4e3);
+				};
+				onInterruptLane(lane).then(() => settle("done"), () => settle("fail"));
+			};
 			const stage = ticket.stage ?? "ended";
 			const zombie = health?.health === "zombie";
 			const [expanded, setExpanded] = (0, react.useState)(() => EXPANDED_TICKETS.has(ticket.id));
@@ -854,15 +1484,22 @@ window.__ModuleLoader__.load({
 			const [commentDraft, setCommentDraft] = (0, react.useState)("");
 			const [commentState, setCommentState] = (0, react.useState)("idle");
 			const [commentError, setCommentError] = (0, react.useState)("");
+			const [commentDrop, setCommentDrop] = (0, react.useState)(false);
 			const commentRef = (0, react.useRef)(null);
+			const commentFiles = useAttachmentDrafts(t);
 			const submitComment = async () => {
 				const text = commentDraft.trim();
-				if (!text || commentState === "busy" || !onComment) return;
+				if (!text && commentFiles.ready.length === 0 || commentState === "busy" || !onComment) return;
+				if (commentFiles.items.some((item) => item.state === "uploading")) {
+					commentFiles.setError(fill(t("attachUploading"), { pct: "…" }));
+					return;
+				}
 				setCommentState("busy");
 				setCommentError("");
 				try {
-					await onComment(ticket, text);
+					await onComment(ticket, text, commentFiles.ready);
 					setCommentDraft("");
+					commentFiles.clear();
 					setCommentState("ok");
 				} catch (failure) {
 					setCommentState("error");
@@ -931,27 +1568,30 @@ window.__ModuleLoader__.load({
 								const lanes = crew ?? [];
 								if (lanes.length === 0) return null;
 								const running = lanes.filter((lane) => lane.state === "running").length;
-								return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+								const scale = crewScale(lanes);
+								const labels = crewLabels(lanes);
+								const team = scale.leaders > 0 || scale.managed > 0;
+								const segments = scale.groups.filter((group) => group.count > 0).map((group) => `1-${group.count}`);
+								if (team && segments.length > 0 && scale.unmanaged > 0) segments.push(String(scale.unmanaged));
+								const caption = segments.length > 0 ? `👥 ${segments.join(",")}` : `👥 ${scale.unmanaged}`;
+								const summary = (team ? `这张工单下 ${scale.groups.map((group) => `${labels.get(group.leader) ?? group.leader} 带 ${group.count} 个 cc-worker`).join("，")}` : `这张工单下有 ${scale.unmanaged} 条 lane`) + [scale.mains > 0 ? `工单自己的 worker（main）` : "", scale.other > 0 ? `${scale.other} 个 other` : ""].filter(Boolean).map((x) => `，${x}`).join("") + `（${running} 个在跑）：`;
+								return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 									"data-pane-ticket-crew": ticket.id,
-									title: `这张工单下有 ${lanes.length} 个 cc-worker（${running} 个在跑）：` + lanes.map((lane) => `${laneLabel(lane.lane)} ${lane.state === "running" ? "运行中" : "空闲"}${lane.task ? " — " + lane.task : ""}`).join("；"),
+									title: summary.replace(/：$/, ""),
 									style: {
 										fontSize: 11,
 										fontWeight: 700,
-										padding: "1px 8px",
+										padding: "1px 10px",
 										borderRadius: 10,
 										flexShrink: 0,
-										letterSpacing: .3,
+										letterSpacing: .8,
 										lineHeight: 1.5,
 										border: running > 0 ? "1px solid #4a9eff" : "1px solid #555",
 										background: running > 0 ? "#1d4ed8" : "#3a3a3a",
 										color: running > 0 ? "#fff" : "#ccc",
 										boxShadow: running > 0 ? "0 0 0 2px rgba(74,158,255,.25)" : "none"
 									},
-									children: [
-										"👥 协作 ",
-										lanes.length,
-										running > 0 ? ` · ${running} 在跑` : ""
-									]
+									children: caption
 								});
 							})(),
 							!expanded && compact && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
@@ -1047,76 +1687,288 @@ window.__ModuleLoader__.load({
 							flexDirection: "column",
 							gap: 3
 						},
-						children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+						children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
 							style: {
 								fontSize: 12,
 								fontWeight: 700,
 								color: "#7cb8ff",
 								letterSpacing: .2
 							},
-							children: [
-								"👥 协作分工 · ",
-								(crew ?? []).length,
-								" 个 cc-worker"
-							]
-						}), (crew ?? []).map((lane) => /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
-							style: {
-								display: "flex",
-								gap: 6,
-								alignItems: "baseline",
-								fontSize: 11.5,
-								minWidth: 0
-							},
-							children: [
-								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-									style: {
-										flexShrink: 0,
-										fontSize: 9,
-										color: lane.state === "running" ? "#38a169" : "#777"
+							children: (() => {
+								const running = (crew ?? []).filter((lane) => lane.state === "running").length;
+								return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: ["👥 协作分工", running > 0 ? ` · ${running} 在跑` : ""] });
+							})()
+						}), (() => {
+							const labels = crewLabels(crew ?? []);
+							const { groups, loose } = crewGroups(crew ?? []);
+							const ordered = [];
+							for (const group of groups) {
+								ordered.push({
+									lane: group.leader,
+									level: 1,
+									section: group.members.length ? `${group.members.length} 个下属` : "无下属"
+								});
+								group.members.forEach((member, index) => ordered.push({
+									lane: member,
+									level: 2,
+									first: index === 0,
+									last: index === group.members.length - 1
+								}));
+							}
+							const looseLabel = {
+								main: "工单自己的 worker",
+								other: "oth-minister（非 leader / 非 minister）"
+							};
+							for (const lane of loose) ordered.push({
+								lane,
+								level: 1,
+								section: looseLabel[lane.role ?? "other"] ?? "其它"
+							});
+							return ordered.map(({ lane, level, first, last, section }) => {
+								lane.lane === "orchestrator" || lane.role === "leader" || lane.role === "worker" || lane.role;
+								const kindNo = labels.get(lane.lane) ?? "";
+								const kindText = /^[LM]\d+$/.test(kindNo) ? kindNo : lane.role === "other" ? lane.lane : "";
+								const kindHint = lane.role === "leader" ? "统筹：分配任务并在末尾归纳自己那块" : lane.role === "worker" ? `队员：归 ${labels.get(lane.leader ?? "") ?? lane.leader ?? "?"} 管辖` : lane.lane === "orchestrator" ? "切分：只把总任务切块分给各 leader，不做末尾归纳" : lane.role === "main" ? "这张工单自己的 worker（无协作模式时）" : "协作模式下非 leader 非队员的 lane";
+								const indent = level === 2;
+								const op = laneOps[lane.lane];
+								return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+									"data-pane-lane-pick": lane.lane,
+									"data-pane-lane-process": lane.processOnly ? lane.lane : void 0,
+									role: "button",
+									tabIndex: 0,
+									"aria-pressed": lanePick === lane.lane,
+									title: lanePick === lane.lane ? "再点一次取消选择，回到这张工单自己的 worker" : "点击查看这条 lane 自己的实时进度",
+									onClick: (event) => {
+										event.stopPropagation();
+										onPickLane?.(lane.lane);
 									},
-									children: "●"
-								}),
-								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-									style: {
-										flexShrink: 0,
-										width: 58,
-										fontWeight: 600,
-										fontFamily: "monospace",
-										overflow: "hidden",
-										textOverflow: "ellipsis",
-										whiteSpace: "nowrap",
-										color: lane.state === "running" ? "#9ae6b4" : "#aaa"
+									onKeyDown: (event) => {
+										if (event.key !== "Enter" && event.key !== " ") return;
+										event.preventDefault();
+										event.stopPropagation();
+										onPickLane?.(lane.lane);
 									},
-									title: lane.lane,
-									children: laneLabel(lane.lane)
-								}),
-								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 									style: {
-										flexShrink: 0,
-										fontSize: 10,
-										padding: "0 5px",
-										borderRadius: 3,
-										background: lane.state === "running" ? "#1f4d33" : "#333",
-										color: lane.state === "running" ? "#9ae6b4" : "#999"
-									},
-									children: lane.state === "running" ? "运行中" : "空闲"
-								}),
-								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-									style: {
+										display: "flex",
+										gap: 6,
+										alignItems: "baseline",
 										minWidth: 0,
-										overflow: "hidden",
-										textOverflow: "ellipsis",
-										whiteSpace: "nowrap",
-										color: "#ddd"
+										width: "100%",
+										textAlign: "left",
+										font: "inherit",
+										color: "inherit",
+										borderRadius: 4,
+										fontSize: level === 1 ? 12.5 : 11,
+										fontWeight: level === 1 ? 700 : 400,
+										boxSizing: "border-box",
+										width: indent ? "calc(100% - 18px)" : "100%",
+										padding: level === 1 ? "4px 6px" : "1px 6px",
+										marginLeft: indent ? 18 : 0,
+										marginTop: level === 1 ? 6 : 0,
+										borderTop: level === 1 ? "1px solid rgba(120,150,200,.35)" : void 0,
+										borderLeft: indent ? "2px solid #5e7030" : void 0,
+										paddingLeft: indent ? 8 : 6,
+										paddingRight: 6,
+										background: lanePick === lane.lane ? "rgba(74,158,255,.32)" : level === 1 ? "rgba(255,255,255,.05)" : "transparent",
+										cursor: onPickLane ? "pointer" : "default",
+										boxShadow: lanePick === lane.lane ? "inset 0 0 0 1px #4a9eff" : void 0
 									},
-									title: lane.task ?? "该 lane 没有登记任务",
-									children: lane.task ?? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-										style: { opacity: .45 },
-										children: "未登记任务"
-									})
-								})
-							]
-						}, lane.lane))]
+									children: [
+										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											style: {
+												flexShrink: 0,
+												fontSize: 9,
+												color: lane.state === "running" ? "#38a169" : "#777"
+											},
+											children: "●"
+										}),
+										indent && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											title: "归上面的 leader 管辖",
+											"aria-hidden": true,
+											style: {
+												flexShrink: 0,
+												fontSize: 11,
+												color: "#5e7030",
+												fontFamily: "monospace",
+												marginLeft: -3
+											},
+											children: last ? "└─" : "├─"
+										}),
+										(lane.role === "leader" || lane.leader || ROLE_BADGE[lane.role ?? "other"]) && (() => {
+											const role = lane.role ?? "other";
+											const badge = ROLE_BADGE[role];
+											if (lane.lane === "orchestrator") return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+												"data-pane-lane-role": lane.lane,
+												title: "切分：把总任务切成块分给各 leader，不负责末尾归纳（与 leader 的职责不同）",
+												style: {
+													flexShrink: 0,
+													fontSize: 9.5,
+													padding: "0 5px",
+													borderRadius: 3,
+													lineHeight: 1.5,
+													background: "#3a2a55",
+													color: "#c9b3f0",
+													border: "1px solid #5c4380"
+												},
+												children: "✂ 切分"
+											});
+											if (role === "leader" || role === "worker" || !badge) return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+												"data-pane-lane-leader": lane.lane,
+												title: role === "leader" ? "这条 lane 是 leader（统筹），管辖受管辖的 cc-worker" : `这条 cc-worker 归 ${labels.get(lane.leader ?? "") ?? lane.leader} 管辖`,
+												style: {
+													flexShrink: 0,
+													fontSize: 9.5,
+													padding: "0 5px",
+													borderRadius: 3,
+													lineHeight: 1.5,
+													background: role === "leader" ? "#5c4600" : "#3d4a1f",
+													color: role === "leader" ? "#ffd96a" : "#c8e08a",
+													border: "1px solid " + (role === "leader" ? "#8a6a00" : "#5e7030")
+												},
+												children: role === "leader" ? "👑 leader" : "🎩 minister"
+											});
+											return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+												"data-pane-lane-role": lane.lane,
+												title: badge.hint,
+												style: {
+													flexShrink: 0,
+													fontSize: 9.5,
+													padding: "0 5px",
+													borderRadius: 3,
+													lineHeight: 1.5,
+													background: badge.bg,
+													color: badge.fg,
+													border: "1px solid " + badge.border
+												},
+												children: badge.label
+											});
+										})(),
+										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											"data-pane-lane-kind": lane.lane,
+											title: kindHint,
+											style: {
+												flexShrink: 0,
+												fontSize: 10,
+												opacity: .6,
+												fontFamily: "monospace",
+												whiteSpace: "nowrap"
+											},
+											children: kindText
+										}),
+										lane.role === "main" && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											style: {
+												flexShrink: 0,
+												fontWeight: 600,
+												fontFamily: "monospace",
+												minWidth: 58,
+												maxWidth: 140,
+												whiteSpace: "nowrap",
+												overflow: "hidden",
+												textOverflow: "ellipsis",
+												color: lane.state === "running" ? "#9ae6b4" : "#aaa"
+											},
+											title: lane.lane,
+											children: lane.lane
+										}),
+										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											style: {
+												flexShrink: 0,
+												fontSize: 10,
+												padding: "0 5px",
+												borderRadius: 3,
+												background: lane.state === "running" ? "#1f4d33" : "#333",
+												color: lane.state === "running" ? "#9ae6b4" : "#999"
+											},
+											children: lane.state === "running" ? "运行中" : "空闲"
+										}),
+										(lane.sessions ?? 0) > 1 && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+											"data-pane-lane-sessions": lane.lane,
+											title: `这个 cc-worker 用了 ${lane.sessions} 个会话（上下文到上限时由 handoff 换会话），计数仍为 1 个 worker`,
+											style: {
+												flexShrink: 0,
+												fontSize: 10,
+												padding: "0 5px",
+												borderRadius: 3,
+												background: "#2c3e50",
+												color: "#9fb3c8"
+											},
+											children: [lane.sessions, " 个 handoff 会话 · 同一 worker"]
+										}),
+										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											style: {
+												minWidth: 0,
+												overflow: "hidden",
+												textOverflow: "ellipsis",
+												whiteSpace: "nowrap",
+												color: "#ddd"
+											},
+											title: lane.task || "没输出",
+											children: lane.task || /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+												style: { opacity: .45 },
+												children: "没输出"
+											})
+										}),
+										indent && lane.leader && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+											style: {
+												flexShrink: 0,
+												fontSize: 9.5,
+												color: "#8a9a5e",
+												opacity: .9
+											},
+											title: `归 ${labels.get(lane.leader) ?? lane.leader} 管辖`,
+											children: ["←", labels.get(lane.leader) ?? lane.leader]
+										}),
+										!indent && section && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+											style: {
+												flexShrink: 0,
+												fontSize: 10,
+												color: "#8ea8c8",
+												opacity: .85
+											},
+											children: [
+												"（",
+												section,
+												"）"
+											]
+										}),
+										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											style: {
+												flex: "0 0 auto",
+												marginLeft: "auto",
+												display: "flex",
+												alignItems: "center"
+											},
+											children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+												type: "button",
+												"data-pane-lane-interrupt": lane.lane,
+												disabled: lane.state !== "running" || op === "busy",
+												"aria-label": `中止 ${labels.get(lane.lane) ?? laneLabel(lane.lane)}`,
+												title: op === "done" ? "已请求中止" : op === "fail" ? "中止请求失败" : lane.state === "running" ? `中止 ${labels.get(lane.lane) ?? laneLabel(lane.lane)} 的执行` : "该 lane 空闲，无需中止",
+												onClick: (event) => {
+													event.stopPropagation();
+													abortLane(lane.lane);
+												},
+												style: {
+													flexShrink: 0,
+													font: "inherit",
+													fontSize: 10,
+													lineHeight: 1.4,
+													whiteSpace: "nowrap",
+													padding: "0 6px",
+													borderRadius: 3,
+													cursor: lane.state === "running" && op !== "busy" ? "pointer" : "not-allowed",
+													border: "1px solid " + (op === "fail" ? "#8a3030" : op === "done" ? "#3d6b45" : "#6b3a3a"),
+													background: op === "fail" ? "rgba(160,50,50,.35)" : op === "done" ? "rgba(60,120,70,.35)" : "rgba(120,40,40,.25)",
+													color: op === "fail" ? "#ffb3b3" : op === "done" ? "#b6e6bf" : "#ffb0b0",
+													opacity: lane.state === "running" ? op === "busy" ? .6 : 1 : .4
+												},
+												children: op === "busy" ? "中止中…" : op === "done" ? "已请求中止" : op === "fail" ? "失败" : "中止"
+											})
+										})
+									]
+								}, lane.lane);
+							});
+						})()]
 					}),
 					expanded && work && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 						style: { opacity: .88 },
@@ -1160,14 +2012,22 @@ window.__ModuleLoader__.load({
 						},
 						children: work.raw
 					}),
-					expanded && /* @__PURE__ */ (0, react_jsx_runtime.jsx)(CcPanel, {
-						status: ccStatus,
-						expanded: ccExpanded,
-						onToggle: onToggleCc,
-						onInterrupt,
-						onClear,
-						busy: ccBusy
-					}),
+					expanded && (() => {
+						const target = (crew ?? []).find((lane) => lane.lane === lanePick)?.lane ?? "main";
+						const status = target === "main" ? ccStatus : laneStatus?.lane === target ? laneStatus : null;
+						if (!status || !status.present) return null;
+						return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+							"data-pane-cc-lane": target,
+							children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)(CcPanel, {
+								status,
+								expanded: target === "main" ? ccExpanded : true,
+								onToggle: target === "main" ? onToggleCc : void 0,
+								onInterrupt: target === "main" ? onInterrupt : void 0,
+								onClear: target === "main" ? onClear : void 0,
+								busy: target === "main" ? ccBusy : false
+							})
+						});
+					})(),
 					zombie && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 						style: {
 							color: "#e53e3e",
@@ -1191,12 +2051,28 @@ window.__ModuleLoader__.load({
 					}),
 					expanded && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 						"data-pane-ticket-comment-box": ticket.id,
+						onDragOver: (event) => {
+							if (Array.from(event.dataTransfer?.types ?? []).includes("Files")) {
+								event.preventDefault();
+								setCommentDrop(true);
+							}
+						},
+						onDragLeave: () => setCommentDrop(false),
+						onDrop: (event) => {
+							const files = Array.from(event.dataTransfer?.files ?? []);
+							if (files.length === 0) return;
+							event.preventDefault();
+							setCommentDrop(false);
+							commentFiles.add(files);
+						},
 						style: {
 							display: "flex",
 							flexDirection: "column",
 							gap: 4,
 							borderTop: "1px solid var(--dt-border, #333)",
-							paddingTop: 5
+							paddingTop: 5,
+							outline: commentDrop ? "1px dashed var(--dt-accent, #2b6cb0)" : "none",
+							outlineOffset: 2
 						},
 						children: [
 							/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
@@ -1205,61 +2081,89 @@ window.__ModuleLoader__.load({
 									gap: 4,
 									alignItems: "flex-end"
 								},
-								children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("textarea", {
-									ref: commentRef,
-									"data-pane-ticket-comment-input": ticket.id,
-									value: commentDraft,
-									rows: 1,
-									placeholder: t("commentPlaceholder"),
-									"aria-label": t("commentPlaceholder"),
-									disabled: commentState === "busy",
-									onChange: (event) => {
-										setCommentDraft(event.target.value);
-										if (commentState === "ok" || commentState === "error") setCommentState("idle");
-									},
-									onKeyDown: (event) => {
-										if (event.key === "Enter" && !event.shiftKey) {
+								children: [
+									/* @__PURE__ */ (0, react_jsx_runtime.jsx)("textarea", {
+										ref: commentRef,
+										"data-pane-ticket-comment-input": ticket.id,
+										value: commentDraft,
+										rows: 1,
+										placeholder: t("commentPlaceholder"),
+										"aria-label": t("commentPlaceholder"),
+										disabled: commentState === "busy",
+										onChange: (event) => {
+											setCommentDraft(event.target.value);
+											if (commentState === "ok" || commentState === "error") setCommentState("idle");
+										},
+										onKeyDown: (event) => {
+											if (event.key === "Enter" && !event.shiftKey) {
+												event.preventDefault();
+												submitComment();
+											}
+										},
+										onPaste: (event) => {
+											const files = clipboardFiles(event.clipboardData);
+											if (files.length === 0) return;
 											event.preventDefault();
-											submitComment();
+											commentFiles.add(files.map(namePastedFile));
+										},
+										style: {
+											flex: "1 1 0",
+											minWidth: 0,
+											minHeight: 26,
+											maxHeight: 110,
+											resize: "vertical",
+											fontSize: 12,
+											padding: "3px 6px",
+											border: "1px solid var(--dt-border, #333)",
+											borderRadius: 6,
+											background: "var(--dt-surface, #2d2d2d)",
+											color: "inherit"
 										}
-									},
-									style: {
-										flex: "1 1 0",
-										minWidth: 0,
-										minHeight: 26,
-										maxHeight: 110,
-										resize: "vertical",
-										fontSize: 12,
-										padding: "3px 6px",
-										border: "1px solid var(--dt-border, #333)",
-										borderRadius: 6,
-										background: "var(--dt-surface, #2d2d2d)",
-										color: "inherit"
-									}
-								}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
-									type: "button",
-									"data-pane-ticket-comment-send": ticket.id,
-									"aria-label": t("commentSend"),
-									title: t("commentSend"),
-									disabled: commentState === "busy" || !commentDraft.trim(),
-									onClick: (event) => {
-										event.stopPropagation();
-										submitComment();
-									},
-									style: {
-										flexShrink: 0,
-										height: 26,
-										padding: "0 8px",
-										fontSize: 12,
-										lineHeight: 1,
-										borderRadius: 6,
-										border: "1px solid var(--dt-border, #333)",
-										background: commentState === "busy" || !commentDraft.trim() ? "transparent" : "var(--dt-accent, #2b6cb0)",
-										color: commentState === "busy" || !commentDraft.trim() ? "inherit" : "#fff",
-										cursor: commentState === "busy" || !commentDraft.trim() ? "not-allowed" : "pointer"
-									},
-									children: commentState === "busy" ? t("commentSending") : t("commentSend")
-								})]
+									}),
+									/* @__PURE__ */ (0, react_jsx_runtime.jsx)(AttachButton, {
+										disabled: commentState === "busy",
+										onFiles: (files) => {
+											commentFiles.add(files);
+										},
+										t
+									}),
+									/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+										type: "button",
+										"data-pane-ticket-comment-send": ticket.id,
+										"aria-label": t("commentSend"),
+										title: t("commentSend"),
+										disabled: commentState === "busy" || !commentDraft.trim() && commentFiles.ready.length === 0,
+										onClick: (event) => {
+											event.stopPropagation();
+											submitComment();
+										},
+										style: {
+											flexShrink: 0,
+											height: 26,
+											padding: "0 8px",
+											fontSize: 12,
+											lineHeight: 1,
+											borderRadius: 6,
+											border: "1px solid var(--dt-border, #333)",
+											background: commentState === "busy" || !commentDraft.trim() && commentFiles.ready.length === 0 ? "transparent" : "var(--dt-accent, #2b6cb0)",
+											color: commentState === "busy" || !commentDraft.trim() && commentFiles.ready.length === 0 ? "inherit" : "#fff",
+											cursor: commentState === "busy" || !commentDraft.trim() && commentFiles.ready.length === 0 ? "not-allowed" : "pointer"
+										},
+										children: commentState === "busy" ? t("commentSending") : t("commentSend")
+									})
+								]
+							}),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)(AttachmentRail, {
+								items: commentFiles.items,
+								onRemove: commentFiles.remove,
+								t
+							}),
+							commentFiles.error && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								style: {
+									fontSize: 11,
+									color: "#e53e3e"
+								},
+								children: commentFiles.error
 							}),
 							commentState === "ok" && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
 								"data-pane-ticket-comment-status": ticket.id,
@@ -1929,13 +2833,22 @@ window.__ModuleLoader__.load({
 			const [mode, setMode] = (0, react.useState)("assign");
 			const [busy, setBusy] = (0, react.useState)(false);
 			const [error, setError] = (0, react.useState)(null);
+			/** 主输入区的附件草稿（选择/拖拽/粘贴共用一套）。 */
+			const draftFiles = useAttachmentDrafts(t);
+			/** 拖拽文件悬停在主输入区时的提示态。 */
+			const [draftDrop, setDraftDrop] = (0, react.useState)(false);
 			/** 每张工单的协作 lane 明细（/crew）：直接显示在各自工单卡上，不再走右上角汇总。 */
 			const [crew, setCrew] = (0, react.useState)(null);
 			const [tickets, setTickets] = (0, react.useState)([]);
 			const [activities, setActivities] = (0, react.useState)({});
+			/** 每张工单自己的 worker（main）的 Claude Code 实况：卡片上唯一的 CC 状态块的默认内容。 */
 			const [ccStatuses, setCcStatuses] = (0, react.useState)({});
 			const [ccExpanded, setCcExpanded] = (0, react.useState)(false);
 			const [ccBusy, setCcBusy] = (0, react.useState)(false);
+			/** 每张工单在协作分工里选中查看的 lane（点行选中，再点同一行取消）。 */
+			const [lanePicks, setLanePicks] = (0, react.useState)({});
+			/** 被选中 lane 的实况，键是「工单 id:lane」，与工单级聚合互不影响。 */
+			const [laneStatuses, setLaneStatuses] = (0, react.useState)({});
 			const [healths, setHealths] = (0, react.useState)({});
 			/** 用户在面板里删掉（只是从下拉隐藏）的对话名，持久在 localStorage。 */
 			const [removedConversations, setRemovedConversations] = (0, react.useState)(() => rememberedRemovedConversations());
@@ -1970,10 +2883,29 @@ window.__ModuleLoader__.load({
 			(0, react.useEffect)(() => {
 				let alive = true;
 				const tick = () => {
-					call("/crew").then((next) => {
+					call("/crew").then(async (next) => {
 						if (!alive) return;
 						const body = next;
-						if (body && Array.isArray(body.items)) setCrew(body);
+						if (!body || !Array.isArray(body.items)) return;
+						if (body.items.some((item) => (item.lanes ?? []).some((lane) => !lane.role))) {
+							const map = await rolesFromGovernance().catch(() => null);
+							if (!alive) return;
+							setCrew(map ? withLaneRoles(body, map) : {
+								...body,
+								items: (body.items ?? []).map((item) => ({
+									...item,
+									lanes: (item.lanes ?? []).map(normalizeLane)
+								}))
+							});
+							return;
+						}
+						setCrew({
+							...body,
+							items: (body.items ?? []).map((item) => ({
+								...item,
+								lanes: (item.lanes ?? []).map(normalizeLane)
+							}))
+						});
 					}).catch(() => {});
 				};
 				tick();
@@ -2180,7 +3112,48 @@ window.__ModuleLoader__.load({
 				const element = scrollRef.current;
 				if (element && pinnedRef.current) element.scrollTop = element.scrollHeight;
 			}, [items]);
-			/** 中止请求：写 interrupt 标记并立刻刷新一次。 */
+			/** 协作分工的行被点击：选中该 lane；再点同一行则取消，回到工单级聚合视图。 */
+			const pickLane = (0, react.useCallback)((ticketId, lane) => {
+				setLanePicks((prev) => {
+					if (prev[ticketId] === lane) {
+						const next = { ...prev };
+						delete next[ticketId];
+						return next;
+					}
+					return {
+						...prev,
+						[ticketId]: lane
+					};
+				});
+			}, []);
+			const laneKey = Object.entries(lanePicks).filter(([, lane]) => lane !== "main").map(([id, lane]) => `${id}:${lane}`).sort().join("|");
+			(0, react.useEffect)(() => {
+				const picks = Object.entries(lanePicks).filter(([, lane]) => lane !== "main");
+				if (picks.length === 0) return;
+				let live = true;
+				const read = async () => {
+					for (const [ticketId, lane] of picks) try {
+						const info = await request(`${API}/cc/${encodeURIComponent(ticketId)}?lane=${encodeURIComponent(lane)}`);
+						if (!live) return;
+						if (info?.cc) setLaneStatuses((prev) => ({
+							...prev,
+							[`${ticketId}:${lane}`]: {
+								...info.cc,
+								lane: typeof info?.lane === "string" ? info.lane : void 0
+							}
+						}));
+					} catch {}
+				};
+				read();
+				const timer = setInterval(() => {
+					if (live) read();
+				}, 2500);
+				return () => {
+					live = false;
+					clearInterval(timer);
+				};
+			}, [laneKey]);
+			/** 中止/取消中止：写 interrupt 标记并立刻刷新一次（只对 main 那一份工单级状态开放）。 */
 			const ccCommand = (0, react.useCallback)(async (ticketId, action) => {
 				setCcBusy(true);
 				try {
@@ -2192,6 +3165,17 @@ window.__ModuleLoader__.load({
 				} catch {} finally {
 					setCcBusy(false);
 				}
+			}, [pollStatus]);
+			/**
+			* 中止某一条 lane 的执行：POST /cc/<id>/interrupt?lane=<lane>（lane=main 即工单自己的 worker）。
+			* 成功后立刻刷新一次工单级状态；失败向上抛，让行上的按钮显示「失败」。
+			*/
+			const interruptLane = (0, react.useCallback)(async (ticketId, lane) => {
+				await call(`/cc/${encodeURIComponent(ticketId)}/interrupt?lane=${encodeURIComponent(lane)}`, {
+					method: "POST",
+					body: JSON.stringify({ lane })
+				});
+				await pollStatus();
 			}, [pollStatus]);
 			/**
 			* 关闭一张工单卡。已结束的直接收起（记进名单，不动工单）；进行中的先停止——两步确认，
@@ -2234,7 +3218,12 @@ window.__ModuleLoader__.load({
 			}, [confirmStop]);
 			const send = async () => {
 				const text = draft.trim();
-				if (!text || busy) return;
+				const attachments = draftFiles.ready;
+				if (!text && attachments.length === 0 || busy) return;
+				if (draftFiles.items.some((item) => item.state === "uploading")) {
+					setError(fill(t("attachUploading"), { pct: "…" }));
+					return;
+				}
 				setBusy(true);
 				setError(null);
 				try {
@@ -2243,10 +3232,12 @@ window.__ModuleLoader__.load({
 						body: JSON.stringify({
 							conversation,
 							text,
-							mode
+							mode,
+							...attachments.length ? { attachments } : {}
 						})
 					});
 					setDraft("");
+					draftFiles.clear();
 					setDivertedNotice(typeof sent?.diverted === "string" ? sent.diverted : "");
 					pinnedRef.current = true;
 					await load();
@@ -2260,14 +3251,15 @@ window.__ModuleLoader__.load({
 			};
 			/** 把「给某张工单的意见」发到这张工单专属的意见会话 t<id>：该线程没有工单订阅，消息不会广播给同对话其它工单，
 			*  只走 Eval → 路由器按文本里的工单 id 挂到那一张。 */
-			const commentOnTicket = (0, react.useCallback)(async (ticket, text) => {
+			const commentOnTicket = (0, react.useCallback)(async (ticket, text, attachments = []) => {
 				const composed = `【给工单「${ticket.title}」(${ticket.id}) 的意见，请交给该工单的 worker，不要新建工单】\n${text}`;
 				const sent = await call("/message", {
 					method: "POST",
 					body: JSON.stringify({
 						conversation: commentConversation(ticket.id),
 						text: composed,
-						mode: "note"
+						mode: "note",
+						...attachments.length ? { attachments } : {}
 					})
 				});
 				setDivertedNotice(typeof sent?.diverted === "string" ? sent.diverted : "");
@@ -2415,7 +3407,10 @@ window.__ModuleLoader__.load({
 							t,
 							ccStatus: ccStatuses[ticket.id] ?? null,
 							ccExpanded,
-							health: healths[ticket.id] ?? null,
+							lanePick: lanePicks[ticket.id],
+							laneStatus: lanePicks[ticket.id] ? laneStatuses[`${ticket.id}:${lanePicks[ticket.id]}`] ?? null : null,
+							onPickLane: (lane) => pickLane(ticket.id, lane),
+							onInterruptLane: (lane) => interruptLane(ticket.id, lane),
 							onToggleCc: () => setCcExpanded((value) => !value),
 							ccBusy,
 							onInterrupt: () => {
@@ -2424,6 +3419,7 @@ window.__ModuleLoader__.load({
 							onClear: () => {
 								ccCommand(ticket.id, "clear");
 							},
+							health: healths[ticket.id] ?? null,
 							onComment: commentOnTicket,
 							onOpenComment: (ticket) => {
 								setConversation(commentConversation(ticket.id));
@@ -2463,39 +3459,46 @@ window.__ModuleLoader__.load({
 								background: item.direction === "in" ? "var(--dt-accent, #2b6cb0)" : "var(--dt-surface, #2d2d2d)",
 								color: item.direction === "in" ? "#fff" : "inherit"
 							},
-							children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
-								style: {
-									fontSize: 11,
-									opacity: .7,
-									marginBottom: 2
-								},
-								children: [
-									item.direction === "in" ? t("you") : `${t("agent")}${item.kind ? ` · ${item.kind}` : ""}`,
-									item.direction === "in" && item.status === "scheduled" && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-										style: {
-											marginLeft: 6,
-											padding: "0 5px",
-											borderRadius: 3,
-											background: "#2f4f37",
-											color: "#9ae6b4",
-											fontSize: 10
-										},
-										children: t("badgeScheduled")
-									}),
-									item.direction === "in" && decisionBadge(item) && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-										title: item.decision?.reason ?? "",
-										style: {
-											marginLeft: 6,
-											padding: "0 5px",
-											borderRadius: 3,
-											background: "#8a5a00",
-											color: "#ffd88a",
-											fontSize: 10
-										},
-										children: decisionBadge(item)
-									})
-								]
-							}), item.text]
+							children: [
+								/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+									style: {
+										fontSize: 11,
+										opacity: .7,
+										marginBottom: 2
+									},
+									children: [
+										item.direction === "in" ? t("you") : `${t("agent")}${item.kind ? ` · ${item.kind}` : ""}`,
+										item.direction === "in" && item.status === "scheduled" && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											style: {
+												marginLeft: 6,
+												padding: "0 5px",
+												borderRadius: 3,
+												background: "#2f4f37",
+												color: "#9ae6b4",
+												fontSize: 10
+											},
+											children: t("badgeScheduled")
+										}),
+										item.direction === "in" && decisionBadge(item) && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											title: item.decision?.reason ?? "",
+											style: {
+												marginLeft: 6,
+												padding: "0 5px",
+												borderRadius: 3,
+												background: "#8a5a00",
+												color: "#ffd88a",
+												fontSize: 10
+											},
+											children: decisionBadge(item)
+										})
+									]
+								}),
+								item.text,
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)(MessageAttachments, {
+									items: item.attachments ?? [],
+									t
+								})
+							]
 						}, item.id))
 					}),
 					divertedNotice && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
@@ -2538,67 +3541,129 @@ window.__ModuleLoader__.load({
 					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 						style: {
 							display: "flex",
-							gap: 8,
-							alignItems: "stretch"
+							flexDirection: "column",
+							gap: 6
 						},
-						children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("textarea", {
-							value: draft,
-							onChange: (event) => setDraft(event.target.value),
-							placeholder: mode === "chat" ? t("placeholderChat") : mode === "broadcast" ? t("placeholderBroadcast") : t("placeholder"),
-							rows: 3,
-							onKeyDown: (event) => {
-								if (event.key === "Enter" && !event.shiftKey) {
-									event.preventDefault();
-									send();
-								}
-							},
-							style: {
-								flex: 1,
-								resize: "vertical",
-								padding: 8
+						onDragOver: (event) => {
+							if (Array.from(event.dataTransfer?.types ?? []).includes("Files")) {
+								event.preventDefault();
+								setDraftDrop(true);
 							}
-						}), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
-							style: {
-								display: "flex",
-								flexDirection: "column",
-								gap: 6,
-								justifyContent: "space-between"
-							},
-							children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+						},
+						onDragLeave: () => setDraftDrop(false),
+						onDrop: (event) => {
+							const files = Array.from(event.dataTransfer?.files ?? []);
+							if (files.length === 0) return;
+							event.preventDefault();
+							setDraftDrop(false);
+							draftFiles.add(files);
+						},
+						children: [
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)(AttachmentRail, {
+								items: draftFiles.items,
+								onRemove: draftFiles.remove,
+								t
+							}),
+							draftFiles.error && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+								role: "alert",
+								style: {
+									fontSize: 11,
+									color: "#e53e3e"
+								},
+								children: draftFiles.error
+							}),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 								style: {
 									display: "flex",
-									border: "1px solid var(--dt-border, #333)",
-									borderRadius: 6,
-									overflow: "hidden"
+									gap: 8,
+									alignItems: "stretch"
 								},
-								children: [
-									"assign",
-									"broadcast",
-									"chat"
-								].map((item) => /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
-									type: "button",
-									onClick: () => setMode(item),
-									title: item === "chat" ? t("placeholderChat") : item === "broadcast" ? t("placeholderBroadcast") : "",
-									style: {
-										padding: "3px 10px",
-										fontSize: 12,
-										border: "none",
-										cursor: "pointer",
-										background: mode === item ? "var(--dt-accent, #2b6cb0)" : "transparent",
-										color: mode === item ? "#fff" : "inherit"
+								children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("textarea", {
+									"data-pane-draft": "",
+									value: draft,
+									onChange: (event) => setDraft(event.target.value),
+									placeholder: mode === "chat" ? t("placeholderChat") : mode === "broadcast" ? t("placeholderBroadcast") : t("placeholder"),
+									rows: 3,
+									onKeyDown: (event) => {
+										if (event.key === "Enter" && !event.shiftKey) {
+											event.preventDefault();
+											send();
+										}
 									},
-									children: item === "assign" ? t("modeDispatch") : item === "broadcast" ? t("modeBroadcast") : t("modeChat")
-								}, item))
-							}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
-								type: "button",
-								style: { padding: "6px 12px" },
-								disabled: busy || !draft.trim(),
-								onClick: () => {
-									send();
-								},
-								children: busy ? t("sending") : t("send")
-							})]
-						})]
+									onPaste: (event) => {
+										const files = clipboardFiles(event.clipboardData);
+										if (files.length === 0) return;
+										event.preventDefault();
+										draftFiles.add(files.map(namePastedFile));
+									},
+									style: {
+										flex: 1,
+										resize: "vertical",
+										padding: 8,
+										outline: draftDrop ? "1px dashed var(--dt-accent, #2b6cb0)" : "none",
+										outlineOffset: 2
+									}
+								}), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+									style: {
+										display: "flex",
+										flexDirection: "column",
+										gap: 6,
+										justifyContent: "space-between"
+									},
+									children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+										style: {
+											display: "flex",
+											border: "1px solid var(--dt-border, #333)",
+											borderRadius: 6,
+											overflow: "hidden"
+										},
+										children: [
+											"assign",
+											"broadcast",
+											"chat"
+										].map((item) => /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+											type: "button",
+											onClick: () => setMode(item),
+											title: item === "chat" ? t("placeholderChat") : item === "broadcast" ? t("placeholderBroadcast") : "",
+											style: {
+												padding: "3px 10px",
+												fontSize: 12,
+												border: "none",
+												cursor: "pointer",
+												background: mode === item ? "var(--dt-accent, #2b6cb0)" : "transparent",
+												color: mode === item ? "#fff" : "inherit"
+											},
+											children: item === "assign" ? t("modeDispatch") : item === "broadcast" ? t("modeBroadcast") : t("modeChat")
+										}, item))
+									}), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+										style: {
+											display: "flex",
+											gap: 6,
+											alignItems: "center"
+										},
+										children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)(AttachButton, {
+											disabled: busy,
+											onFiles: (files) => {
+												draftFiles.add(files);
+											},
+											t
+										}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+											type: "button",
+											"data-pane-send": "",
+											style: {
+												padding: "6px 12px",
+												flex: 1
+											},
+											disabled: busy || !draft.trim() && draftFiles.ready.length === 0,
+											onClick: () => {
+												send();
+											},
+											children: busy ? t("sending") : t("send")
+										})]
+									})]
+								})]
+							})
+						]
 					}),
 					mode === "chat" && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
 						style: {

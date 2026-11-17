@@ -314,6 +314,15 @@ const zh = {
   usageCacheWriteUnreported: '—',
   usageCacheWriteZeroHint: '当前上游通道不返回缓存写入计数（DeepSeek 无缓存写入计费）',
   usageHitRate: '命中',
+  attachAdd: '添加附件（也可拖拽到输入框或直接粘贴图片）',
+  attachUploading: '上传中 {pct}%',
+  attachFailed: '附件上传失败：{error}',
+  attachRemove: '移除附件',
+  attachDrop: '松开即添加到这条消息',
+  attachLimit: '一条消息最多 {n} 个附件',
+  attachOpen: '查看原图',
+  attachDownload: '下载附件',
+  attachBytes: '{size}',
 }
 const en = {
   panel: 'Dispatch',
@@ -454,6 +463,15 @@ const en = {
   usageCacheWriteUnreported: '—',
   usageCacheWriteZeroHint: 'The current upstream channel does not report cache writes (DeepSeek has no cache-write billing)',
   usageHitRate: 'hit',
+  attachAdd: 'Add files (you can also drop them here or paste an image)',
+  attachUploading: 'Uploading {pct}%',
+  attachFailed: 'Attachment upload failed: {error}',
+  attachRemove: 'Remove attachment',
+  attachDrop: 'Release to attach to this message',
+  attachLimit: 'At most {n} files per message',
+  attachOpen: 'View original',
+  attachDownload: 'Download attachment',
+  attachBytes: '{size}',
 }
 
 /** 工单上"收到却没被读"的条数；由服务端按 inputs 的 readAt 算出后随列表下发。 */
@@ -477,6 +495,8 @@ function decisionBadge(item: Item): string {
 }
 
 type Item = { id: string; direction: 'in' | 'out'; at: string; text: string; kind?: string; mode?: string; status?: string
+  /** 随这条消息发送的附件（服务端只存引用；图片按引用回读显示）。 */
+  attachments?: PaneAttachment[]
   /** 服务端补上的裁决信息：kind 为 ignore/accept/stop/evaluating 等；reason 是给人看的理由。 */
   decision?: { kind?: string; reason?: string }
   /** 该消息对应工单的当前状态（ended/completed/working 等）。 */
@@ -495,16 +515,143 @@ type Ticket = {
 }
 type Activity = { state?: string; kind?: string | null; tool?: string; text?: string; at?: number; ageMs?: number }
 /** 协作规模：未结束工单数、真正在跑的 worker 数、排队数，以及每张工单的状态。 */
-type CrewLane = { lane: string; state: 'running' | 'idle'; task?: string }
+type CrewLane = { lane: string; state: 'running' | 'idle'; task?: string
+  /** 协作身份：leader=统筹者、worker=被带领的 ccworker、main=无协作时工单自己的 worker、other=协作下的其它一切。 */
+  role?: 'leader' | 'worker' | 'main' | 'other'
+  /** 管辖这条 lane 的 leader 名（team 模式下是 lead）；other/lead 没有。 */
+  leader?: string
+  /** 逻辑 cc worker id（handoff 换会话不变）；面板计数按它而不是按会话。 */
+  workerId?: string
+  /** 本 lane 当前会话。 */
+  sessionId?: string
+  /** 本 lane 用过的会话数；>1 表示中间 handoff 换过会话，但仍是同一个 cc worker。 */
+  sessions?: number
+  /** 这一行是服务端从「正在跑的 cc-worker 进程」补出来的（没有对应 lane 目录）。 */
+  processOnly?: boolean }
 
 /**
- * lane 的显示名：统一叫 ccwN。
- * 历史 lane 目录名是 w1/w2（2026-11-11 之前的演示），显示时映射成 ccw1/ccw2，
- * 不改磁盘目录，避免破坏已有记录；新起的 lane 直接命名 ccwN。
+ * 非 leader/worker 的两种身份徽标（owner 口径：协作模式下除 leader/ccw 之外全叫 other）：
+ *   main  这张工单自己的 worker（无协作模式时）—— 蓝
+ *   other 协作模式下不属于 leader 的利益方（如独立验收 lane）—— 灰
+ */
+const ROLE_BADGE: Record<string, { label: string; hint: string; bg: string; fg: string; border: string }> = {
+  main: { label: '⏺ main', hint: '这张工单自己的 worker（没有协作模式时由它执行）', bg: '#1b2f52', fg: '#9cc0f0', border: '#2f4f7d' },
+  other: { label: '👤 other', hint: '平民：协作模式下既不是 leader 也不是 minister 的 Claude Code worker（如独立验收）', bg: '#333', fg: '#aaa', border: '#4a4a4a' },
+}
+
+/**
+ * lane 的显示名：统一叫 minister N。
+ * 历史 lane 目录名是 w1/w2（2026-11-11 之前的演示），显示时映射成 minister1/minister2，
+ * 不改磁盘目录，避免破坏已有记录；新起的 lane 直接命名 minister N。
  */
 function laneLabel(name: string): string {
   const match = /^w(\d+)$/.exec(name)
-  return match ? `ccw${match[1]}` : name
+  return match ? `minister${match[1]}` : name
+}
+
+/**
+ * lane 目录名 → 显示名（owner 口径，四种身份）：
+ *   leader → L1/L2…（统筹者，多 leader 按顺序）、minister → M1/M2…（跨 leader 连续编号）、
+ *   main（无协作时工单自己的 worker）、other/other1…（协作下其余一切）
+ */
+/**
+ * lane 目录名 → 显示名，按身份分属不同命名空间，互不撞名（2026-11-17 分细身份）：
+ *   leader → L1/L2…；worker → M1/M2…（跨 leader 连续编号）
+ *   main → main（这张工单自己的 worker）
+ *   other → 直接用真实 lane 目录名（main-verify / orchestrator / l1_w1…），owner 要求能看清是谁
+ */
+function crewLabels(lanes: CrewLane[]): Map<string, string> {
+  const labels = new Map<string, string>()
+  const leaders = lanes.filter(lane => lane.role === 'leader')
+  const workerOrder: string[] = []
+  for (const leader of leaders) {
+    for (const lane of lanes) if (lane.role === 'worker' && lane.leader === leader.lane) workerOrder.push(lane.lane)
+  }
+  for (const lane of lanes) if (lane.role === 'worker' && !workerOrder.includes(lane.lane)) workerOrder.push(lane.lane)
+  // orchestrator 单独叫「切分」：它只把总任务切成块分给各 leader，不做末尾归纳，
+  // 与 leader（带队 + 归纳自己那块）是两种不同职责，共用一个名字会混淆。
+  // 其余 leader 按顺序编号 leader1、leader2…
+  let leaderNo = 0
+  for (const lane of leaders) {
+    labels.set(lane.lane, lane.lane === 'orchestrator' ? '切分' : `L${++leaderNo}`)
+  }
+  // workerOrder 存的是 lane 名字（string），这里必须直接拿 name 当 key。
+  // 曾经写成 labels.set(lane.lane, ...) —— 字符串的 .lane 是 undefined，
+  // 编号全被写进 labels[undefined]，于是 leader 有 L1、minister 却一个 M 号都不显示。
+  workerOrder.forEach((name, index) => labels.set(name, `M${index + 1}`))
+  // 剩余两类：main（无协作时的工单 worker，只有一个）与 other（协作下的其它一切）。
+  // other 不再起合成别名（oth-ccwN 看不出是谁），直接显示真实 lane 目录名，
+  // 名字列按内容自适应宽度，main-verify / orchestrator / l1_w1 这类名字可以完整读到。
+  let mainN = 0
+  // 已分配的编号集合：other 用真实目录名时若与 lN/wN/main 撞名，加前缀避免二义
+  const taken = new Set(labels.values())
+  for (const lane of lanes) {
+    if (lane.role === 'leader' || lane.role === 'worker' || labels.has(lane.lane)) continue
+    if (lane.role === 'main') {
+      // 工单自己的 worker 只可能有一个，用 main；重名才加序号
+      const name = mainN++ === 0 ? 'main' : `main${mainN}`
+      labels.set(lane.lane, taken.has(name) ? `main:${lane.lane}` : name)
+    } else {
+      // other：按 owner 规则用真实 lane 名；与 lN / wN 撞名时加 other: 前缀
+      labels.set(lane.lane, taken.has(lane.lane) ? `other:${lane.lane}` : lane.lane)
+    }
+  }
+  return labels
+}
+/**
+ * 把 lanes 排成「leader 分组树」+「未归组的身份段」。
+ *
+ * 为什么需要它：`/crew` 返回的是平铺数组，直接 map 出来只能看到一串 ccw，
+ * 无法回答「哪些 ccw 归哪个 leader 带」。这里按 leader 归组，组内保持原顺序；
+ * 不属于任何 leader 的身份（顶层统筹 / 独立验收 / 工单主 worker / 其它散户）单独成段。
+ *
+ * 返回：{ groups: [{leader, members[]}], loose: lane[] }
+ */
+function crewGroups(lanes: CrewLane[]) {
+  const groups: { leader: CrewLane; members: CrewLane[] }[] = []
+  for (const lane of lanes) {
+    if (lane.role !== 'leader') continue
+    groups.push({ leader: lane, members: lanes.filter(item => item.role === 'worker' && item.leader === lane.lane) })
+  }
+  // 有 leader 字段但该 leader 的 lane 不在 lanes 里的成员（例如 leader lane 已下线、list 里没有它）：
+  // 补一个虚拟 leader 组，否则这些成员会是孤儿，界面上看不出归属。
+  for (const lane of lanes) {
+    if (lane.role !== 'worker' || !lane.leader) continue
+    if (groups.some(group => group.leader.lane === lane.leader)) continue
+    groups.push({ leader: { lane: lane.leader, state: 'idle', role: 'lead' }, members: [lane] })
+  }
+  // 总任务切分者排最前：它是流程的第一步，排在 leader1..N 之后会让阅读顺序与执行顺序相反。
+  // 其余 leader 保持原有顺序（lane 目录的字母序），不重排以免每次刷新跳动。
+  groups.sort((a, b) => Number(b.leader.lane === 'orchestrator') - Number(a.leader.lane === 'orchestrator'))
+  const loose = lanes.filter(lane => lane.role !== 'leader' && lane.role !== 'worker')
+  return { groups, loose }
+}
+
+/**
+ * 协作规模：按 leader 分组报「1-n」，并把**不属于任何 leader 的身份分开计**——
+ * 顶层统筹 / 独立验收 / 工单主 worker / 其它散户各算各的，不再混成一个「不受管辖」数。
+ */
+function crewScale(lanes: CrewLane[]) {
+  const leads = lanes.filter(lane => lane.role === 'leader')
+  const groups = leads.map(lane => ({ leader: lane.lane, count: 0 }))
+  let managed = 0
+  for (const lane of lanes) {
+    if (lane.role !== 'worker') continue
+    managed += 1
+    let group = groups.find(item => item.leader === lane.leader)
+    if (!group) {
+      group = { leader: lane.leader ?? 'lead', count: 0 }
+      groups.push(group)
+    }
+    group.count += 1
+  }
+  const count = (role: string) => lanes.filter(lane => lane.role === role).length
+  return {
+    groups, leaders: leads.length, managed,
+    mains: count('main'),
+    other: count('other'),
+    unmanaged: lanes.filter(lane => lane.role !== 'leader' && lane.role !== 'worker').length,
+  }
 }
 type Crew = {
   tickets: number
@@ -515,6 +662,326 @@ type Crew = {
   items: { ticketId: string; title: string; assignment: string; working: boolean; sessionId?: string; lanes?: CrewLane[] }[]
 }
 type Translate = (key: keyof typeof zh, values?: Record<string, string>) => string
+
+/**
+ * leader 关系的兜底来源。
+ *
+ * `/crew` 正常会带 role/leader（服务端读 `.cc-worker/team-plan.json`）；老进程没有这两个字段时，
+ * 借治理面板的 `/api/governance`（它同样按 team-plan.json 算 lane 的 lead/worker/other）补一次。
+ * 工单目录名以工单 id 前 12 位结尾，用这个后缀把目录对回 `/crew` 的 ticketId。
+ * 治理面板没装或读不到时不补：面板按「没有 leader」显示，不报错。
+ */
+type LaneRoleMap = Record<string, Record<string, { role?: 'leader' | 'worker' | 'main' | 'other'; leader?: string }>>
+
+/**
+ * 角色名归一化：把各种历史/服务端叫法收敛到四类。
+ *   lead / leadx / orchestrator / verifier(统筹侧) → leader
+ *   worker                                          → worker
+ *   main                                            → main
+ *   其余（verifier / other / 未知）                  → other
+ * 「未知一律 other」而不是「未知一律保留」，是为了让类型始终落在四类里，渲染分支不会漏。
+ */
+function normalizeRole(role: unknown): 'leader' | 'worker' | 'main' | 'other' {
+  const value = typeof role === 'string' ? role.trim().toLowerCase() : ''
+  if (value === 'leader' || value === 'lead' || value === 'orchestrator') return 'leader'
+  if (value === 'worker' || value === 'ccw') return 'worker'
+  if (value === 'main') return 'main'
+  return 'other'
+}
+
+/** 把一条 lane 的 role 归一化；没有 role 字段时保持缺失（交给兜底来源补）。 */
+function normalizeLane(lane: CrewLane): CrewLane {
+  return lane.role === undefined ? lane : { ...lane, role: normalizeRole(lane.role) }
+}
+let governanceRoles: { at: number; map: LaneRoleMap } | null = null
+async function rolesFromGovernance(): Promise<LaneRoleMap> {
+  if (governanceRoles && Date.now() - governanceRoles.at < 60_000) return governanceRoles.map
+  const body = await request('/api/governance')
+  const map: LaneRoleMap = {}
+  for (const lane of Array.isArray(body?.lanes) ? body.lanes : []) {
+    const dir = typeof lane?.ticket === 'string' ? lane.ticket : ''
+    const suffix = dir.split('-').pop() ?? ''
+    // 治理面板可能给旧口径（lead/worker/other）：统一走归一化，lead→leader
+    const role = normalizeRole(lane?.role)
+    if (!suffix || typeof lane?.lane !== 'string') continue
+    map[suffix] ??= {}
+    map[suffix]![lane.lane] = role === 'worker' ? { role, leader: 'lead' } : { role }
+  }
+  governanceRoles = { at: Date.now(), map }
+  return map
+}
+/** 把兜底 role 合并进 `/crew`：服务端已经给了 role 的以服务端为准。 */
+function withLaneRoles(body: Crew, map: LaneRoleMap): Crew {
+  return {
+    ...body,
+    items: body.items.map(item => {
+      const suffix = item.ticketId.slice(0, 12)
+      const per = map[suffix] ?? {}
+      return { ...item, lanes: (item.lanes ?? []).map(lane => {
+        const merged = lane.role ? lane : { ...lane, ...(per[lane.lane] ?? {}) }
+        return normalizeLane(merged)
+      }) }
+    }),
+  }
+}
+
+// ——— 消息附件 ———
+//
+// 复用 DSH 自带的附件存储：文件字节交给宿主的 `/orchestrator/api/pane/upload`，由它调用
+// `ctx.attachments.saveFileStream` 按内容寻址落盘；这里只保存引用（sha256 + 名字 + 字节数 + 宿主机路径）。
+// 消息流里的图片缩略图与下载都按引用回读 `/orchestrator/api/pane/file`，刷新后仍能看。
+
+/** 与宿主侧 `PaneAttachment` 同形；`path` 是宿主机绝对路径，worker 直接按它读文件。 */
+type PaneAttachment = { attachmentId: string; name: string; bytes: number; path?: string }
+/** 草稿栏里的一条：上传中/成功/失败，成功后才能随消息发送。 */
+type DraftAttachment = PaneAttachment & { draftId: string; state: 'uploading' | 'done' | 'error'; pct?: number; error?: string }
+/** 一条消息最多带多少附件（宿主侧同样限制 20）。 */
+const ATTACH_LIMIT = 20
+
+/** 人类可读的字节数。 */
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B'
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+}
+
+/** 已取回的附件 blob URL：按 attachmentId+name 缓存，同一附件只拉一次（刷新页面自然重取）。 */
+const blobUrls = new Map<string, string>()
+
+/**
+ * 按引用取回附件字节并转成 blob URL。
+ *
+ * 为什么不用 `<img src="...">` / `<a href>` 直接指向路由：面板路由要求同源管理头
+ * （`x-orchestrator-request`），img/a 发不出自定义头；所以统一带头发取，再交给 blob URL。
+ */
+async function attachmentBlobUrl(item: PaneAttachment): Promise<string> {
+  const cacheKey = `${item.attachmentId}/${item.name}`
+  const cached = blobUrls.get(cacheKey)
+  if (cached) return cached
+  const value = token()
+  const query = new URLSearchParams({ id: item.attachmentId, name: item.name })
+  if (value) query.set('token', value)
+  const response = await fetch(`${API}/file?${query.toString()}`, {
+    headers: { 'x-orchestrator-request': '1' }, credentials: 'same-origin', cache: 'no-store',
+  })
+  if (!response.ok) throw new Error(`HTTP ${response.status}`)
+  const url = URL.createObjectURL(await response.blob())
+  blobUrls.set(cacheKey, url)
+  return url
+}
+
+/** 一张图片附件：取回字节后显示缩略图，点击用 blob URL 打开原图。 */
+function AttachmentImage({ item, t }: { item: PaneAttachment; t: Translate }) {
+  const [url, setUrl] = useState('')
+  const [failed, setFailed] = useState(false)
+  useEffect(() => {
+    let live = true
+    void attachmentBlobUrl(item).then(value => { if (live) setUrl(value) })
+      .catch(() => { if (live) setFailed(true) })
+    return () => { live = false }
+  }, [item.attachmentId, item.name])
+  if (failed) return <span data-pane-message-image-failed={item.name} title={item.name}
+    style={{ fontSize: 11, opacity: 0.7 }}>🖼 {item.name}</span>
+  if (!url) return <span data-pane-message-image-loading={item.name}
+    style={{ display: 'inline-block', height: 64, width: 64, borderRadius: 6, background: 'rgba(0,0,0,.2)' }} />
+  return <a href={url} target="_blank" rel="noreferrer" data-pane-message-image={item.name}
+    title={`${t('attachOpen')}：${item.name}`} style={{ display: 'block' }}>
+    <img src={url} alt={item.name} style={{ height: 64, maxWidth: 240, objectFit: 'cover',
+      borderRadius: 6, border: '1px solid rgba(255,255,255,.2)', background: 'rgba(0,0,0,.2)' }} />
+  </a>
+}
+
+/** 一个文件附件：取回字节后以下载链接呈现（docx/txt 等浏览器不能内嵌预览的类型）。 */
+function AttachmentFile({ item, t }: { item: PaneAttachment; t: Translate }) {
+  const [url, setUrl] = useState('')
+  useEffect(() => {
+    let live = true
+    void attachmentBlobUrl(item).then(value => { if (live) setUrl(value) }).catch(() => { /* 失败时仍显示名字与大小 */ })
+    return () => { live = false }
+  }, [item.attachmentId, item.name])
+  return <a {...(url ? { href: url, download: item.name } : {})} data-pane-message-file={item.name}
+    title={`${t('attachDownload')}：${item.name}`}
+    style={{ display: 'flex', alignItems: 'center', gap: 6, maxWidth: 240, height: 40, padding: '0 8px',
+      borderRadius: 6, fontSize: 11, textDecoration: 'none', color: 'inherit', cursor: url ? 'pointer' : 'default',
+      border: '1px solid rgba(255,255,255,.25)', background: 'rgba(0,0,0,.18)' }}>
+    <span style={{ flexShrink: 0 }}>📄</span>
+    <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{item.name}</span>
+    <span style={{ flexShrink: 0, opacity: 0.7 }}>{formatBytes(item.bytes)}</span>
+  </a>
+}
+
+/** 图片类附件按扩展名判断：只有这些在消息流里渲染缩略图。 */
+function isImageAttachment(name: string): boolean {
+  return /\.(png|jpe?g|gif|webp|bmp)$/i.test(name)
+}
+
+/**
+ * 上传一个文件并返回附件引用。用 XHR 而不是 fetch：需要上传进度（大文件、Word/图片都有感）。
+ * 字节直接作为请求体发送，文件名走查询参数（服务端会做与 DSH 附件存储一致的清洗）。
+ */
+function uploadPaneFile(file: File, onProgress: (pct?: number) => void, signal: AbortSignal): Promise<PaneAttachment> {
+  return new Promise((resolve, reject) => {
+    const value = token()
+    const query = new URLSearchParams({ name: file.name || 'file' })
+    if (value) query.set('token', value)
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', `${API}/upload?${query.toString()}`)
+    xhr.setRequestHeader('x-orchestrator-request', '1')
+    xhr.setRequestHeader('content-type', 'application/octet-stream')
+    xhr.upload.onprogress = event => { if (event.lengthComputable) onProgress(Math.round((event.loaded / event.total) * 100)) }
+    xhr.onerror = () => reject(new Error('网络错误'))
+    xhr.onabort = () => reject(new Error('已取消'))
+    xhr.onload = () => {
+      let body: any = {}
+      try { body = JSON.parse(xhr.responseText) } catch { body = {} }
+      if (xhr.status >= 200 && xhr.status < 300 && typeof body?.attachmentId === 'string') resolve(body as PaneAttachment)
+      else reject(new Error(body?.error ?? `HTTP ${xhr.status}`))
+    }
+    signal.addEventListener('abort', () => xhr.abort(), { once: true })
+    xhr.send(file)
+  })
+}
+
+/** 展示用文件名：只留叶子名（浏览器不会给完整路径，这里只是防御）。 */
+function paneLocalName(file: File): string {
+  return (file.name || 'file').replace(/\\/g, '/').split('/').pop() || 'file'
+}
+
+/** 粘贴板里的文件：截图走 `clipboardData.files`，部分浏览器只有 items，两路都取。 */
+function clipboardFiles(data: DataTransfer | null): File[] {
+  if (!data) return []
+  const files = Array.from(data.files ?? [])
+  if (files.length > 0) return files
+  return Array.from(data.items ?? [])
+    .filter(item => item.kind === 'file')
+    .map(item => item.getAsFile())
+    .filter((file): file is File => !!file)
+}
+
+/** 给粘贴进来的图片起个带时间戳的名字：浏览器给的 clipboard 文件常叫 image.png，会互相覆盖展示名。 */
+function namePastedFile(file: File): File {
+  if (file.name && file.name !== 'image.png' && file.name !== 'blob') return file
+  const ext = file.type === 'image/jpeg' ? 'jpg' : file.type === 'image/gif' ? 'gif'
+    : file.type === 'image/webp' ? 'webp' : 'png'
+  const now = new Date()
+  const pad = (value: number) => String(value).padStart(2, '0')
+  const name = `粘贴图片-${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}.${ext}`
+  return new File([file], name, { type: file.type })
+}
+
+const EMPTY_ATTACHMENTS: DraftAttachment[] = []
+
+/** 草稿附件状态：选择/拖拽/粘贴共用，上传完成才允许发送。 */
+function useAttachmentDrafts(t: Translate) {
+  const [items, setItems] = useState<DraftAttachment[]>(EMPTY_ATTACHMENTS)
+  const [error, setError] = useState('')
+  const abortRef = useRef<AbortController | null>(null)
+  /** 当前草稿的快照：连续两次选择/粘贴时也要算准剩余名额（不能依赖异步的 state）。 */
+  const itemsRef = useRef<DraftAttachment[]>(EMPTY_ATTACHMENTS)
+  useEffect(() => () => { abortRef.current?.abort() }, [])
+
+  const update = useCallback((draftId: string, patch: Partial<DraftAttachment>) => {
+    setItems(previous => previous.map(item => item.draftId === draftId ? { ...item, ...patch } : item))
+  }, [])
+
+  const add = useCallback(async (incoming: File[] | FileList) => {
+    const files = Array.from(incoming)
+    if (files.length === 0) return
+    setError('')
+    const controller = abortRef.current ?? new AbortController()
+    abortRef.current = controller
+    // 同一个文件重复选中（拖拽/粘贴/选择框叠加）不要重复入列：按「名字 + 字节数」去重。
+    const seen = new Set(itemsRef.current.filter(item => item.state !== 'error').map(item => `${item.name}/${item.bytes}`))
+    const fresh = files.filter(file => {
+      const identity = `${paneLocalName(file)}/${file.size}`
+      if (seen.has(identity)) return false
+      seen.add(identity)
+      return true
+    })
+    const room = ATTACH_LIMIT - itemsRef.current.length
+    if (fresh.length > room) setError(fill(t('attachLimit'), { n: String(ATTACH_LIMIT) }))
+    const accepted: DraftAttachment[] = fresh.slice(0, Math.max(0, room)).map(file => ({
+      draftId: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      attachmentId: '', name: paneLocalName(file), bytes: file.size, state: 'uploading', pct: undefined,
+    }))
+    if (accepted.length === 0) return
+    itemsRef.current = [...itemsRef.current, ...accepted]
+    setItems(itemsRef.current)
+    // 上传是副作用，放在状态更新之外；每个文件独立成败，失败只影响自己那一条。
+    for (const [index, draft] of accepted.entries()) {
+      void uploadPaneFile(fresh[index]!, pct => update(draft.draftId, { pct }), controller.signal)
+        .then(ref => update(draft.draftId, { ...ref, state: 'done', pct: 100 }))
+        .catch(failure => update(draft.draftId, { state: 'error', error: failure instanceof Error ? failure.message : String(failure) }))
+    }
+  }, [t, update])
+
+  const remove = useCallback((draftId: string) => {
+    itemsRef.current = itemsRef.current.filter(item => item.draftId !== draftId)
+    setItems(itemsRef.current)
+  }, [])
+
+  const clear = useCallback(() => { itemsRef.current = EMPTY_ATTACHMENTS; setItems(EMPTY_ATTACHMENTS); setError('') }, [])
+  /** 已上传完成、可以随消息发送的引用。 */
+  // 只回传存储引用本身（宿主机路径由服务端按引用现算，客户端不能自报路径）。
+  const ready: PaneAttachment[] = items.filter(item => item.state === 'done')
+    .map(item => ({ attachmentId: item.attachmentId, name: item.name, bytes: item.bytes }))
+  return { items, add, remove, clear, ready, error, setError }
+}
+
+/** 草稿附件栏：横向排列的文件卡，上传中显示进度，失败显示原因，悬停放大移除按钮。 */
+function AttachmentRail({ items, onRemove, t }: { items: DraftAttachment[]; onRemove: (draftId: string) => void; t: Translate }) {
+  if (items.length === 0) return null
+  return <div data-pane-attachment-rail="" style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+    {items.map(item => {
+      const failed = item.state === 'error'
+      return <div key={item.draftId} data-pane-attachment-draft={item.name}
+        title={failed ? fill(t('attachFailed'), { error: item.error ?? '' }) : item.path ?? item.name}
+        style={{ display: 'flex', alignItems: 'center', gap: 6, maxWidth: 240, padding: '3px 6px', borderRadius: 6,
+          fontSize: 11, border: `1px solid ${failed ? '#e53e3e' : 'var(--dt-border, #333)'}`,
+          background: 'var(--dt-surface, #2d2d2d)', opacity: item.state === 'uploading' ? 0.75 : 1 }}>
+        <span style={{ flexShrink: 0 }}>{failed ? '⚠' : isImageAttachment(item.name) ? '🖼' : '📄'}</span>
+        <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{item.name}</span>
+        <span style={{ flexShrink: 0, opacity: 0.6 }}>
+          {item.state === 'uploading'
+            ? fill(t('attachUploading'), { pct: String(item.pct ?? 0) })
+            : formatBytes(item.bytes)}
+        </span>
+        <button type="button" data-pane-attachment-remove={item.name} aria-label={t('attachRemove')} title={t('attachRemove')}
+          onClick={() => onRemove(item.draftId)}
+          style={{ flexShrink: 0, background: 'none', border: 'none', cursor: 'pointer', padding: 0, fontSize: 12, color: 'inherit', opacity: 0.6 }}>×</button>
+      </div>
+    })}
+  </div>
+}
+
+/** 消息流里的附件：图片显示缩略图（点击看原图），其它文件显示可下载的文件卡。 */
+function MessageAttachments({ items, t }: { items: PaneAttachment[]; t: Translate }) {
+  if (items.length === 0) return null
+  return <div data-pane-message-attachments="" style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 6 }}>
+    {items.map(item => isImageAttachment(item.name)
+      ? <AttachmentImage key={item.attachmentId + item.name} item={item} t={t} />
+      : <AttachmentFile key={item.attachmentId + item.name} item={item} t={t} />)}
+  </div>
+}
+
+/** 附件按钮 + 隐藏的文件选择框：主输入区与工单意见框共用。 */
+function AttachButton({ disabled, onFiles, t }: { disabled?: boolean; onFiles: (files: FileList) => void; t: Translate }) {
+  const inputRef = useRef<HTMLInputElement | null>(null)
+  return <>
+    <input ref={inputRef} type="file" multiple data-pane-attach-input="" style={{ display: 'none' }}
+      onChange={event => { const files = event.target.files; if (files && files.length) onFiles(files) }} />
+    <button type="button" data-pane-attach="" aria-label={t('attachAdd')} title={t('attachAdd')} disabled={disabled}
+      onClick={() => {
+        // 清空要在「打开选择框之前」：选中后立刻把 value 置空会让刚拿到的 File 失去底层数据，
+        // 上传会永远停在 0%（Firefox 实测）。放在点击前既允许重选同一个文件，也不影响正在上传的 File。
+        if (inputRef.current) inputRef.current.value = ''
+        inputRef.current?.click()
+      }}
+      style={{ height: 24, padding: '0 8px', fontSize: 12, lineHeight: 1, flexShrink: 0,
+        opacity: disabled ? 0.4 : 0.8, cursor: disabled ? 'not-allowed' : 'pointer' }}>📎</button>
+  </>
+}
 
 /** 工具名到文案键的映射；未知工具直接显示原名。 */
 const TOOL_KEYS: Record<string, keyof typeof zh> = {
@@ -628,17 +1095,43 @@ function workSummary(t: Translate, activity: Activity): WorkSummary {
 const DOT_STYLE = `.dsh-pane-dot-running{animation:dsh-pane-pulse 1.6s ease-in-out infinite}@keyframes dsh-pane-pulse{0%,100%{opacity:1}50%{opacity:.35}}`
 
 /** 对话上方的一条工单状态条：哪个工单、到哪一步、worker 此刻在做什么（说人话，详情可展开原始命令）。 */
-function TicketBar({ ticket, activity, t, ccStatus, ccExpanded, onToggleCc, onInterrupt, onClear, ccBusy, health, confirmStop, onClose, onComment, onOpenComment, crew }: {
+function TicketBar({ ticket, activity, t, health, confirmStop, onClose, onComment, onOpenComment, crew, lanePick, laneStatus, onPickLane, onInterruptLane,
+  ccStatus, ccExpanded, onToggleCc, onInterrupt, onClear, ccBusy }: {
   ticket: Ticket; activity: Activity | null; t: Translate
   /** 本工单的协作 lane（来自 /crew）；没有或读不到时 undefined。 */
   crew?: CrewLane[]
+  /** 当前在协作分工里选中查看的 lane；空表示看工单自己的 worker（main）。 */
+  lanePick?: string
+  /** 选中 lane 的实况（/cc/<id>?lane=<lane>）；未选中或还没读到为 null。 */
+  laneStatus?: CcStatus | null
+  /** 点击协作分工的行：选中该 lane；再点同一行则取消选择。 */
+  onPickLane?: (lane: string) => void
+  /** 中止某一条 lane 的执行（POST /cc/<id>/interrupt?lane=）；失败时抛出，由行自己显示状态。 */
+  onInterruptLane?: (lane: string) => Promise<void>
+  /** 工单级 CC 实况（/cc/<id>，即 main 自己的状态）；唯一的 CC 状态块默认显示它。 */
   ccStatus: CcStatus | null; ccExpanded: boolean
   onToggleCc: () => void; onInterrupt: () => void; onClear: () => void; ccBusy: boolean
   health?: Health | null; confirmStop: boolean; onClose: () => void
-  onComment?: (ticket: Ticket, text: string) => Promise<void>
+  onComment?: (ticket: Ticket, text: string, attachments: PaneAttachment[]) => Promise<void>
   onOpenComment?: (ticket: Ticket) => void
 }) {
   const [open, setOpen] = useState(false)
+  /** 每条 lane 自己的中止按钮状态：busy 请求在飞，done/fail 是几秒后自动消失的回执。 */
+  const [laneOps, setLaneOps] = useState<Record<string, 'busy' | 'done' | 'fail'>>({})
+  const abortLane = (lane: string) => {
+    if (!onInterruptLane || laneOps[lane] === 'busy') return
+    setLaneOps(prev => ({ ...prev, [lane]: 'busy' }))
+    const settle = (value: 'done' | 'fail') => {
+      setLaneOps(prev => ({ ...prev, [lane]: value }))
+      setTimeout(() => setLaneOps(prev => {
+        if (prev[lane] !== value) return prev
+        const next = { ...prev }
+        delete next[lane]
+        return next
+      }), 4000)
+    }
+    onInterruptLane(lane).then(() => settle('done'), () => settle('fail'))
+  }
   const stage = ticket.stage ?? 'ended'
   const zombie = health?.health === 'zombie'
   // 默认全折叠：面板刚进来时所有工单只显示单行摘要，不按 stage 自动展开/收起。
@@ -671,14 +1164,19 @@ function TicketBar({ ticket, activity, t, ccStatus, ccExpanded, onToggleCc, onIn
   const [commentDraft, setCommentDraft] = useState('')
   const [commentState, setCommentState] = useState<'idle' | 'busy' | 'ok' | 'error'>('idle')
   const [commentError, setCommentError] = useState('')
+  const [commentDrop, setCommentDrop] = useState(false)
   const commentRef = useRef<HTMLTextAreaElement | null>(null)
+  // 工单意见框的附件：与主输入区同一套草稿状态，只影响这张卡。
+  const commentFiles = useAttachmentDrafts(t)
   const submitComment = async () => {
     const text = commentDraft.trim()
-    if (!text || commentState === 'busy' || !onComment) return
+    if ((!text && commentFiles.ready.length === 0) || commentState === 'busy' || !onComment) return
+    if (commentFiles.items.some(item => item.state === 'uploading')) { commentFiles.setError(fill(t('attachUploading'), { pct: '…' })); return }
     setCommentState('busy'); setCommentError('')
     try {
-      await onComment(ticket, text)
+      await onComment(ticket, text, commentFiles.ready)
       setCommentDraft('')
+      commentFiles.clear()
       setCommentState('ok')
     } catch (failure) {
       setCommentState('error')
@@ -700,16 +1198,34 @@ function TicketBar({ ticket, activity, t, ccStatus, ccExpanded, onToggleCc, onIn
         const lanes = crew ?? []
         if (lanes.length === 0) return null
         const running = lanes.filter(lane => lane.state === 'running').length
+        // 胶囊图注按 owner 口径报裸组合：每个 leader 一段「1-手下数」，末尾补一段散户总数，
+        // 例：单个 leader 带 4 个 + 1 个散户 = `👥 1-4,1`；两个 leader = `👥 1-3,1-2,4`。
+        // 完全没有 leader/受管 worker 时只报散户数量，例：`👥 4`。
+        const scale = crewScale(lanes)
+        const labels = crewLabels(lanes)
+        const team = scale.leaders > 0 || scale.managed > 0
+        // 0 人的分组不报「1-0」：leader 一个手下都没带时没有可报的组合，只剩散户数。
+        const segments = scale.groups.filter(group => group.count > 0).map(group => `1-${group.count}`)
+        if (team && segments.length > 0 && scale.unmanaged > 0) segments.push(String(scale.unmanaged))
+        const caption = segments.length > 0 ? `👥 ${segments.join(',')}` : `👥 ${scale.unmanaged}`
+        const summary = (team
+          ? `这张工单下 ${scale.groups.map(group => `${labels.get(group.leader) ?? group.leader} 带 ${group.count} 个 cc-worker`).join('，')}`
+          : `这张工单下有 ${scale.unmanaged} 条 lane`)
+          + [
+            scale.mains > 0 ? `工单自己的 worker（main）` : '',
+            scale.other > 0 ? `${scale.other} 个 other` : '',
+          ].filter(Boolean).map(x => `，${x}`).join('')
+          + `（${running} 个在跑）：`
+        // 悬浮标题只保留一行汇总：逐 lane 明细已经在下方列表里，不再重复。
         return <span data-pane-ticket-crew={ticket.id}
-          title={`这张工单下有 ${lanes.length} 个 cc-worker（${running} 个在跑）：`
-            + lanes.map(lane => `${laneLabel(lane.lane)} ${lane.state === 'running' ? '运行中' : '空闲'}${lane.task ? ' — ' + lane.task : ''}`).join('；')}
-          style={{ fontSize: 11, fontWeight: 700, padding: '1px 8px', borderRadius: 10, flexShrink: 0,
-            letterSpacing: 0.3, lineHeight: 1.5,
+          title={summary.replace(/：$/, '')}
+          style={{ fontSize: 11, fontWeight: 700, padding: '1px 10px', borderRadius: 10, flexShrink: 0,
+            letterSpacing: 0.8, lineHeight: 1.5,
             border: running > 0 ? '1px solid #4a9eff' : '1px solid #555',
             background: running > 0 ? '#1d4ed8' : '#3a3a3a',
             color: running > 0 ? '#fff' : '#ccc',
             boxShadow: running > 0 ? '0 0 0 2px rgba(74,158,255,.25)' : 'none' }}>
-          👥 协作 {lanes.length}{running > 0 ? ` · ${running} 在跑` : ''}
+          {caption}
         </span>
       })()}
       {!expanded && compact && <span title={compact} style={{ fontSize: 11, opacity: 0.6, flex: '1 1 0', minWidth: 0,
@@ -740,26 +1256,177 @@ function TicketBar({ ticket, activity, t, ccStatus, ccExpanded, onToggleCc, onIn
         background: 'rgba(74, 158, 255, 0.12)', borderLeft: '3px solid #4a9eff',
         display: 'flex', flexDirection: 'column', gap: 3 }}>
       <div style={{ fontSize: 12, fontWeight: 700, color: '#7cb8ff', letterSpacing: 0.2 }}>
-        👥 协作分工 · {(crew ?? []).length} 个 cc-worker
+        {(() => {
+          // 分工明细就是下面一行行 lane，表头只补一个「在跑」数，不再重复胶囊里的分组与数量。
+          const running = (crew ?? []).filter(lane => lane.state === 'running').length
+          return <>👥 协作分工{running > 0 ? ` · ${running} 在跑` : ''}</>
+        })()}
       </div>
-      {(crew ?? []).map(lane => (
-        <div key={lane.lane} style={{ display: 'flex', gap: 6, alignItems: 'baseline', fontSize: 11.5, minWidth: 0 }}>
+      {(() => {
+        const labels = crewLabels(crew ?? [])
+        // 按 leader 分组排成一个有序列表：每组先出 leader 行，再出它管辖的 ccw（带缩进标记）。
+        // 这样「哪些 ccw 由哪个 leader 带」在界面上是结构关系，不是靠一个 👑 去猜。
+        const { groups, loose } = crewGroups(crew ?? [])
+        // level: 1 = 一级标题（leader / 独立身份），2 = 二级条目（leader 的下属）
+        const ordered: { lane: CrewLane; level: 1 | 2; first?: boolean; last?: boolean; section?: string }[] = []
+        for (const group of groups) {
+          ordered.push({ lane: group.leader, level: 1, section: group.members.length ? `${group.members.length} 个下属` : '无下属' })
+          group.members.forEach((member, index) => ordered.push({
+            lane: member, level: 2, first: index === 0, last: index === group.members.length - 1,
+          }))
+        }
+        // 松散身份：不属于任何 leader，单独成段，段前有分隔标题
+        const looseLabel: Record<string, string> = { main: '工单自己的 worker', other: 'oth-minister（非 leader / 非 minister）' }
+        for (const lane of loose) {
+          ordered.push({ lane, level: 1, section: looseLabel[lane.role ?? 'other'] ?? '其它' })
+        }
+        return ordered.map(({ lane, level, first, last, section }) => {
+        // 身份词与编号：图标表达身份，这段灰字表达「身份 + 编号」
+        const kindName = lane.lane === 'orchestrator' ? '切分'
+          : lane.role === 'leader' ? 'leader'
+          : lane.role === 'worker' ? 'minister'
+          : lane.role === 'main' ? 'main' : 'other'
+        const kindNo = labels.get(lane.lane) ?? ''
+        // 灰字 = 编号：leader 写 lN、队员写 MN（owner 口径）。
+        // other 按具体身份命名，直接显示真实 lane 名；切分 / main 没有编号就不写。
+        const kindText = /^[LM]\d+$/.test(kindNo) ? kindNo
+          : (lane.role === 'other' ? lane.lane : '')
+        const kindHint = lane.role === 'leader' ? '统筹：分配任务并在末尾归纳自己那块'
+          : lane.role === 'worker' ? `队员：归 ${labels.get(lane.leader ?? '') ?? lane.leader ?? '?'} 管辖`
+          : lane.lane === 'orchestrator' ? '切分：只把总任务切块分给各 leader，不做末尾归纳'
+          : lane.role === 'main' ? '这张工单自己的 worker（无协作模式时）' : '协作模式下非 leader 非队员的 lane'
+        const indent = level === 2
+        const op = laneOps[lane.lane]
+        // 行本身是 div + role=button：中止按钮必须是它内部真正的 <button>，button 不能嵌套 button。
+        return (
+        <div key={lane.lane} data-pane-lane-pick={lane.lane}
+          data-pane-lane-process={lane.processOnly ? lane.lane : undefined}
+          role="button" tabIndex={0}
+          aria-pressed={lanePick === lane.lane}
+          title={lanePick === lane.lane ? '再点一次取消选择，回到这张工单自己的 worker' : '点击查看这条 lane 自己的实时进度'}
+          onClick={event => { event.stopPropagation(); onPickLane?.(lane.lane) }}
+          onKeyDown={event => {
+            if (event.key !== 'Enter' && event.key !== ' ') return
+            event.preventDefault(); event.stopPropagation(); onPickLane?.(lane.lane)
+          }}
+          style={{
+            display: 'flex', gap: 6, alignItems: 'baseline', minWidth: 0, width: '100%',
+            textAlign: 'left', font: 'inherit', color: 'inherit', borderRadius: 4,
+            // 一级（leader / 独立身份）：字号大一档、加粗感靠 fontWeight、整行上分隔线；
+            // 二级（下属）：缩进两格、字号小一档、左侧竖线贯穿，和标题形成明确的从属层次。
+            fontSize: level === 1 ? 12.5 : 11,
+            fontWeight: level === 1 ? 700 : 400,
+            // 缩进只作用在行首内容区：整行右边界必须落在容器内，否则行尾的中止按钮会被裁掉。
+            // 做法是缩进多少就少多少宽度（border-box），右侧内边距两级统一 6px，
+            // 这样不管缩进与否，按钮的右边缘都停在同一条竖线上。
+            boxSizing: 'border-box',
+            width: indent ? 'calc(100% - 18px)' : '100%',
+            padding: level === 1 ? '4px 6px' : '1px 6px',
+            marginLeft: indent ? 18 : 0,
+            marginTop: level === 1 ? 6 : 0,
+            borderTop: level === 1 ? '1px solid rgba(120,150,200,.35)' : undefined,
+            borderLeft: indent ? '2px solid #5e7030' : undefined,
+            paddingLeft: indent ? 8 : 6,
+            paddingRight: 6,
+            background: lanePick === lane.lane
+              ? 'rgba(74,158,255,.32)'
+              : level === 1 ? 'rgba(255,255,255,.05)' : 'transparent',
+            cursor: onPickLane ? 'pointer' : 'default',
+            boxShadow: lanePick === lane.lane ? 'inset 0 0 0 1px #4a9eff' : undefined,
+          }}>
           <span style={{ flexShrink: 0, fontSize: 9, color: lane.state === 'running' ? '#38a169' : '#777' }}>●</span>
-          <span style={{ flexShrink: 0, width: 58, fontWeight: 600, fontFamily: 'monospace',
-            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+          {indent && <span title="归上面的 leader 管辖" aria-hidden
+            style={{ flexShrink: 0, fontSize: 11, color: '#5e7030', fontFamily: 'monospace', marginLeft: -3 }}>
+            {last ? '└─' : '├─'}
+          </span>}
+          {(lane.role === 'leader' || lane.leader || ROLE_BADGE[lane.role ?? 'other']) && (() => {
+            const role = lane.role ?? 'other'
+            const badge = ROLE_BADGE[role]
+            // 切分（orchestrator）虽是 leader 类，但职责只有切块、不做末尾归纳，徽标单独给紫色
+            if (lane.lane === 'orchestrator') return <span data-pane-lane-role={lane.lane}
+              title="切分：把总任务切成块分给各 leader，不负责末尾归纳（与 leader 的职责不同）"
+              style={{ flexShrink: 0, fontSize: 9.5, padding: '0 5px', borderRadius: 3, lineHeight: 1.5,
+                background: '#3a2a55', color: '#c9b3f0', border: '1px solid #5c4380' }}>
+              ✂ 切分
+            </span>
+            if (role === 'leader' || role === 'worker' || !badge) return <span data-pane-lane-leader={lane.lane}
+              title={role === 'leader' ? '这条 lane 是 leader（统筹），管辖受管辖的 cc-worker' : `这条 cc-worker 归 ${labels.get(lane.leader ?? '') ?? lane.leader} 管辖`}
+              style={{ flexShrink: 0, fontSize: 9.5, padding: '0 5px', borderRadius: 3, lineHeight: 1.5,
+                background: role === 'leader' ? '#5c4600' : '#3d4a1f',
+                color: role === 'leader' ? '#ffd96a' : '#c8e08a',
+                border: '1px solid ' + (role === 'leader' ? '#8a6a00' : '#5e7030') }}>
+              {role === 'leader' ? '👑 leader' : '🎩 minister'}
+            </span>
+            return <span data-pane-lane-role={lane.lane} title={badge.hint}
+              style={{ flexShrink: 0, fontSize: 9.5, padding: '0 5px', borderRadius: 3, lineHeight: 1.5,
+                background: badge.bg, color: badge.fg, border: '1px solid ' + badge.border }}>
+              {badge.label}
+            </span>
+          })()}
+          {/* 灰色文字：身份词 + 编号。图标只表达身份，编号一律放在这里，两件事分开说清。 */}
+          <span data-pane-lane-kind={lane.lane} title={kindHint}
+            style={{ flexShrink: 0, fontSize: 10, opacity: 0.6, fontFamily: 'monospace',
+              whiteSpace: 'nowrap' }}>
+            {kindText}
+          </span>
+          {/* 名字列按内容自适应：普通 lane 名（main-verify / orchestrator / l1_w1）必须完整可见，
+              只有超过 140px 的极端长名才省略，hover 的 title 仍给完整名。 */}
+          {/* 名字列只给 main / other。
+             规则（owner 2026-11-17）：other 之下不再细分角色，身份差异**由 lane 命名体现**
+             （main-verify = 独立验收、w2 = 某次实验产物…），所以这里直接显示真实目录名。
+              leader/worker/切分 的「身份 + 编号」已由徽章和灰字说全，再写一次就成「1 W1」。 */}
+          {lane.role === 'main' && <span style={{ flexShrink: 0, fontWeight: 600,
+            fontFamily: 'monospace', minWidth: 58, maxWidth: 140, whiteSpace: 'nowrap',
+            overflow: 'hidden', textOverflow: 'ellipsis',
             color: lane.state === 'running' ? '#9ae6b4' : '#aaa' }}
-            title={lane.lane}>{laneLabel(lane.lane)}</span>
+            title={lane.lane}>{lane.lane}</span>}
           <span style={{ flexShrink: 0, fontSize: 10, padding: '0 5px', borderRadius: 3,
             background: lane.state === 'running' ? '#1f4d33' : '#333',
             color: lane.state === 'running' ? '#9ae6b4' : '#999' }}>
             {lane.state === 'running' ? '运行中' : '空闲'}
           </span>
+          {(lane.sessions ?? 0) > 1 && <span data-pane-lane-sessions={lane.lane}
+            title={`这个 cc-worker 用了 ${lane.sessions} 个会话（上下文到上限时由 handoff 换会话），计数仍为 1 个 worker`}
+            style={{ flexShrink: 0, fontSize: 10, padding: '0 5px', borderRadius: 3, background: '#2c3e50', color: '#9fb3c8' }}>
+            {lane.sessions} 个 handoff 会话 · 同一 worker
+          </span>}
           <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: '#ddd' }}
-            title={lane.task ?? '该 lane 没有登记任务'}>
-            {lane.task ?? <span style={{ opacity: 0.45 }}>未登记任务</span>}
+            title={lane.task || '没输出'}>
+            {lane.task || <span style={{ opacity: 0.45 }}>没输出</span>}
+          </span>
+          {/* 成员行尾补归属：即使把列表扫成平铺，也能立刻看出这条 ccw 归谁带 */}
+          {indent && lane.leader && <span style={{ flexShrink: 0, fontSize: 9.5, color: '#8a9a5e', opacity: 0.9 }}
+            title={`归 ${labels.get(lane.leader) ?? lane.leader} 管辖`}>
+            ←{labels.get(lane.leader) ?? lane.leader}
+          </span>}
+          {/* 一级行尾的身份/规模注脚：leader 显示带几个下属，独立身份显示它是什么 */}
+          {!indent && section && <span style={{ flexShrink: 0, fontSize: 10, color: '#8ea8c8', opacity: 0.85 }}>
+            （{section}）
+          </span>}
+          {/* 每个成员行都有自己的中止按钮：正在跑时可点，其余状态置灰（保持行结构统一）。
+              行是 div + role=button，这里才是真 button；stopPropagation 防止顺手切换选中 lane。 */}
+          {/* 动作槽固定在最右：不参与缩进、不参与名字列宽度竞争，
+              保证每行的中止按钮落在同一条竖线上且完整留在行内。 */}
+          <span style={{ flex: '0 0 auto', marginLeft: 'auto', display: 'flex', alignItems: 'center' }}>
+          <button type="button" data-pane-lane-interrupt={lane.lane}
+            disabled={lane.state !== 'running' || op === 'busy'}
+            aria-label={`中止 ${labels.get(lane.lane) ?? laneLabel(lane.lane)}`}
+            title={op === 'done' ? '已请求中止' : op === 'fail' ? '中止请求失败'
+              : lane.state === 'running' ? `中止 ${labels.get(lane.lane) ?? laneLabel(lane.lane)} 的执行` : '该 lane 空闲，无需中止'}
+            onClick={event => { event.stopPropagation(); abortLane(lane.lane) }}
+            style={{ flexShrink: 0, font: 'inherit', fontSize: 10, lineHeight: 1.4, whiteSpace: 'nowrap',
+              padding: '0 6px', borderRadius: 3, cursor: lane.state === 'running' && op !== 'busy' ? 'pointer' : 'not-allowed',
+              border: '1px solid ' + (op === 'fail' ? '#8a3030' : op === 'done' ? '#3d6b45' : '#6b3a3a'),
+              background: op === 'fail' ? 'rgba(160,50,50,.35)' : op === 'done' ? 'rgba(60,120,70,.35)' : 'rgba(120,40,40,.25)',
+              color: op === 'fail' ? '#ffb3b3' : op === 'done' ? '#b6e6bf' : '#ffb0b0',
+              opacity: lane.state === 'running' ? (op === 'busy' ? 0.6 : 1) : 0.4 }}>
+            {op === 'busy' ? '中止中…' : op === 'done' ? '已请求中止' : op === 'fail' ? '失败' : '中止'}
+          </button>
           </span>
         </div>
-      ))}
+        )
+        })
+      })()}
     </div>}
     {expanded && work && <div style={{ opacity: 0.88 }}>
       {work.phrase}{work.detail ? `（${work.detail}）` : ''}
@@ -771,8 +1438,23 @@ function TicketBar({ ticket, activity, t, ccStatus, ccExpanded, onToggleCc, onIn
     </div>}
     {expanded && open && work?.raw && <div style={{ fontFamily: 'monospace', fontSize: 11, whiteSpace: 'pre-wrap', wordBreak: 'break-word',
       maxHeight: 140, overflowY: 'auto', background: 'rgba(0,0,0,.25)', padding: '6px 8px', borderRadius: 4, opacity: 0.85 }}>{work.raw}</div>}
-    {expanded && <CcPanel status={ccStatus} expanded={ccExpanded} onToggle={onToggleCc}
-      onInterrupt={onInterrupt} onClear={onClear} busy={ccBusy} />}
+    {/* 全卡唯一的 CC 状态块（owner 决定 2026-11-17）：默认显示这张工单自己的 worker（main），
+        点中某个成员行就切换成那条 lane 的实况，同一时刻只显示一份。 */}
+    {expanded && (() => {
+      // 选中的 lane 已不在分工里（成员下线/换单）时回落到 main，绝不卡在一条不存在的 lane 上。
+      const target = (crew ?? []).find(lane => lane.lane === lanePick)?.lane ?? 'main'
+      // main 直接用工单级响应：不带 ?lane= 读的正是 .cc-worker 根目录，旧服务端也照样是它。
+      // 其它 lane 只认自报同一条 lane 的响应：旧服务端忽略 ?lane= 会返回 main 的状态，
+      // 拿来顶替就是误导；这种情况（以及还没读到时）什么都不显示，也不打占位文案。
+      const status = target === 'main' ? ccStatus : laneStatus?.lane === target ? laneStatus : null
+      if (!status || !status.present) return null
+      return <div data-pane-cc-lane={target}>
+        <CcPanel status={status} expanded={target === 'main' ? ccExpanded : true}
+          onToggle={target === 'main' ? onToggleCc : undefined}
+          onInterrupt={target === 'main' ? onInterrupt : undefined}
+          onClear={target === 'main' ? onClear : undefined} busy={target === 'main' ? ccBusy : false} />
+      </div>
+    })()}
     {zombie && <div style={{ color: '#e53e3e', fontSize: 11 }}>⚠ {health?.detail ?? '执行器卡死，新消息投进去出不来。建议停止该工单后重新派活。'}</div>}
     {/* 展开态就是「展开看全文」：摘要框限高 + 框内滚轮下滑，卡片自身负责折叠。
         运行中（working）也显示已有 summary——worker 在跑不代表报告内容不该看。 */}
@@ -780,27 +1462,44 @@ function TicketBar({ ticket, activity, t, ccStatus, ccExpanded, onToggleCc, onIn
       whiteSpace: 'normal', overflowWrap: 'anywhere', maxHeight: 260, overflowY: 'auto',
       overscrollBehavior: 'contain', scrollbarWidth: 'thin' }}>{summary}</div>}
     {expanded && <div data-pane-ticket-comment-box={ticket.id}
-      style={{ display: 'flex', flexDirection: 'column', gap: 4, borderTop: '1px solid var(--dt-border, #333)', paddingTop: 5 }}>
+      onDragOver={event => { if (Array.from(event.dataTransfer?.types ?? []).includes('Files')) { event.preventDefault(); setCommentDrop(true) } }}
+      onDragLeave={() => setCommentDrop(false)}
+      onDrop={event => {
+        const files = Array.from(event.dataTransfer?.files ?? [])
+        if (files.length === 0) return
+        event.preventDefault(); setCommentDrop(false); void commentFiles.add(files)
+      }}
+      style={{ display: 'flex', flexDirection: 'column', gap: 4, borderTop: '1px solid var(--dt-border, #333)', paddingTop: 5,
+        outline: commentDrop ? '1px dashed var(--dt-accent, #2b6cb0)' : 'none', outlineOffset: 2 }}>
       <div style={{ display: 'flex', gap: 4, alignItems: 'flex-end' }}>
         <textarea ref={commentRef} data-pane-ticket-comment-input={ticket.id}
           value={commentDraft} rows={1} placeholder={t('commentPlaceholder')} aria-label={t('commentPlaceholder')}
           disabled={commentState === 'busy'}
           onChange={event => { setCommentDraft(event.target.value); if (commentState === 'ok' || commentState === 'error') setCommentState('idle') }}
           onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void submitComment() } }}
+          onPaste={event => {
+            const files = clipboardFiles(event.clipboardData)
+            if (files.length === 0) return
+            event.preventDefault()
+            void commentFiles.add(files.map(namePastedFile))
+          }}
           style={{ flex: '1 1 0', minWidth: 0, minHeight: 26, maxHeight: 110, resize: 'vertical', fontSize: 12, padding: '3px 6px',
             border: '1px solid var(--dt-border, #333)', borderRadius: 6, background: 'var(--dt-surface, #2d2d2d)', color: 'inherit' }} />
+        <AttachButton disabled={commentState === 'busy'} onFiles={files => { void commentFiles.add(files) }} t={t} />
         <button type="button" data-pane-ticket-comment-send={ticket.id}
           aria-label={t('commentSend')} title={t('commentSend')}
-          disabled={commentState === 'busy' || !commentDraft.trim()}
+          disabled={commentState === 'busy' || (!commentDraft.trim() && commentFiles.ready.length === 0)}
           onClick={event => { event.stopPropagation(); void submitComment() }}
           style={{ flexShrink: 0, height: 26, padding: '0 8px', fontSize: 12, lineHeight: 1, borderRadius: 6,
             border: '1px solid var(--dt-border, #333)',
-            background: commentState === 'busy' || !commentDraft.trim() ? 'transparent' : 'var(--dt-accent, #2b6cb0)',
-            color: commentState === 'busy' || !commentDraft.trim() ? 'inherit' : '#fff',
-            cursor: commentState === 'busy' || !commentDraft.trim() ? 'not-allowed' : 'pointer' }}>
+            background: commentState === 'busy' || (!commentDraft.trim() && commentFiles.ready.length === 0) ? 'transparent' : 'var(--dt-accent, #2b6cb0)',
+            color: commentState === 'busy' || (!commentDraft.trim() && commentFiles.ready.length === 0) ? 'inherit' : '#fff',
+            cursor: commentState === 'busy' || (!commentDraft.trim() && commentFiles.ready.length === 0) ? 'not-allowed' : 'pointer' }}>
           {commentState === 'busy' ? t('commentSending') : t('commentSend')}
         </button>
       </div>
+      <AttachmentRail items={commentFiles.items} onRemove={commentFiles.remove} t={t} />
+      {commentFiles.error && <span style={{ fontSize: 11, color: '#e53e3e' }}>{commentFiles.error}</span>}
       {commentState === 'ok' && <span data-pane-ticket-comment-status={ticket.id} style={{ fontSize: 11, color: '#38a169', display: 'flex', gap: 6, alignItems: 'baseline' }}>
         {t('commentSent')}
         <button type="button" data-pane-ticket-comment-open={ticket.id}
@@ -1264,13 +1963,22 @@ function PanePanel({ t }: { t: Translate }) {
   const [mode, setMode] = useState<'assign' | 'chat' | 'broadcast'>('assign')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  /** 主输入区的附件草稿（选择/拖拽/粘贴共用一套）。 */
+  const draftFiles = useAttachmentDrafts(t)
+  /** 拖拽文件悬停在主输入区时的提示态。 */
+  const [draftDrop, setDraftDrop] = useState(false)
   /** 每张工单的协作 lane 明细（/crew）：直接显示在各自工单卡上，不再走右上角汇总。 */
   const [crew, setCrew] = useState<Crew | null>(null)
   const [tickets, setTickets] = useState<Ticket[]>([])
   const [activities, setActivities] = useState<Record<string, Activity>>({})
+  /** 每张工单自己的 worker（main）的 Claude Code 实况：卡片上唯一的 CC 状态块的默认内容。 */
   const [ccStatuses, setCcStatuses] = useState<Record<string, CcStatus>>({})
   const [ccExpanded, setCcExpanded] = useState(false)
   const [ccBusy, setCcBusy] = useState(false)
+  /** 每张工单在协作分工里选中查看的 lane（点行选中，再点同一行取消）。 */
+  const [lanePicks, setLanePicks] = useState<Record<string, string>>({})
+  /** 被选中 lane 的实况，键是「工单 id:lane」，与工单级聚合互不影响。 */
+  const [laneStatuses, setLaneStatuses] = useState<Record<string, CcStatus>>({})
   const [healths, setHealths] = useState<Record<string, Health>>({})
   /** 用户在面板里删掉（只是从下拉隐藏）的对话名，持久在 localStorage。 */
   const [removedConversations, setRemovedConversations] = useState<string[]>(() => rememberedRemovedConversations())
@@ -1307,10 +2015,20 @@ function PanePanel({ t }: { t: Translate }) {
     let alive = true
     const tick = () => {
       void call('/crew')
-        .then(next => {
+        .then(async next => {
           if (!alive) return
           const body = next as Crew
-          if (body && Array.isArray(body.items)) setCrew(body)
+          if (!body || !Array.isArray(body.items)) return
+          // 老进程的 /crew 没有 role：补一次 team-plan 关系（有缓存，60 秒内不重复读）。
+          const needsRoles = body.items.some(item => (item.lanes ?? []).some(lane => !lane.role))
+          if (needsRoles) {
+            const map = await rolesFromGovernance().catch(() => null)
+            if (!alive) return
+            setCrew(map ? withLaneRoles(body, map)
+              : { ...body, items: (body.items ?? []).map(item => ({ ...item, lanes: (item.lanes ?? []).map(normalizeLane) })) })
+            return
+          }
+          setCrew({ ...body, items: (body.items ?? []).map(item => ({ ...item, lanes: (item.lanes ?? []).map(normalizeLane) })) })
         })
         .catch(() => { /* 读不到就保持上次 */ })
     }
@@ -1478,7 +2196,7 @@ function PanePanel({ t }: { t: Translate }) {
         }
       }
       setActivities(next)
-      // Claude Code 的执行实况：每个工单单独读，失败不影响工单本身。
+      // 工单级 CC 实况（= main 自己的状态）：卡片上唯一的 CC 状态块的默认内容，逐个工单读，失败不影响工单本身。
       const cc: Record<string, CcStatus> = {}
       for (const item of list) {
         if (!item.id) continue
@@ -1530,13 +2248,56 @@ function PanePanel({ t }: { t: Translate }) {
     if (element && pinnedRef.current) element.scrollTop = element.scrollHeight
   }, [items])
 
-  /** 中止请求：写 interrupt 标记并立刻刷新一次。 */
+  /** 协作分工的行被点击：选中该 lane；再点同一行则取消，回到工单级聚合视图。 */
+  const pickLane = useCallback((ticketId: string, lane: string) => {
+    setLanePicks(prev => {
+      if (prev[ticketId] === lane) { const next = { ...prev }; delete next[ticketId]; return next }
+      return { ...prev, [ticketId]: lane }
+    })
+  }, [])
+
+  // 只给「被选中的非 main lane」单独轮询：main 就是工单级响应本身，不用重复请求；
+  // 取消选择后不再请求（已读到的留着不显示）。
+  const laneKey = Object.entries(lanePicks).filter(([, lane]) => lane !== 'main').map(([id, lane]) => `${id}:${lane}`).sort().join('|')
+  useEffect(() => {
+    const picks = Object.entries(lanePicks).filter(([, lane]) => lane !== 'main')
+    if (picks.length === 0) return
+    let live = true
+    const read = async () => {
+      for (const [ticketId, lane] of picks) {
+        try {
+          const info = await request(`${API}/cc/${encodeURIComponent(ticketId)}?lane=${encodeURIComponent(lane)}`)
+          if (!live) return
+          // 把响应自报的 lane 附到状态上：旧服务端忽略 ?lane= 时不带该字段，渲染端据此拒绝拿工单级状态冒充 lane。
+          if (info?.cc) setLaneStatuses(prev => ({
+            ...prev,
+            [`${ticketId}:${lane}`]: { ...(info.cc as CcStatus), lane: typeof info?.lane === 'string' ? info.lane : undefined },
+          }))
+        } catch { /* 单个 lane 读不到就保持上一轮，不打扰用户 */ }
+      }
+    }
+    void read()
+    const timer = setInterval(() => { if (live) void read() }, 2500)
+    return () => { live = false; clearInterval(timer) }
+  }, [laneKey])
+
+  /** 中止/取消中止：写 interrupt 标记并立刻刷新一次（只对 main 那一份工单级状态开放）。 */
   const ccCommand = useCallback(async (ticketId: string, action: 'interrupt' | 'clear') => {
     setCcBusy(true)
     try {
       await call(`/cc/${encodeURIComponent(ticketId)}/${action}`, { method: 'POST', body: '{}' })
       await pollStatus()
     } catch { /* 失败就保持现状，下一轮轮询会如实反映 */ } finally { setCcBusy(false) }
+  }, [pollStatus])
+
+  /**
+   * 中止某一条 lane 的执行：POST /cc/<id>/interrupt?lane=<lane>（lane=main 即工单自己的 worker）。
+   * 成功后立刻刷新一次工单级状态；失败向上抛，让行上的按钮显示「失败」。
+   */
+  const interruptLane = useCallback(async (ticketId: string, lane: string) => {
+    await call(`/cc/${encodeURIComponent(ticketId)}/interrupt?lane=${encodeURIComponent(lane)}`,
+      { method: 'POST', body: JSON.stringify({ lane }) })
+    await pollStatus()
   }, [pollStatus])
 
   /**
@@ -1569,11 +2330,15 @@ function PanePanel({ t }: { t: Translate }) {
 
   const send = async () => {
     const text = draft.trim()
-    if (!text || busy) return
+    const attachments = draftFiles.ready
+    if ((!text && attachments.length === 0) || busy) return
+    if (draftFiles.items.some(item => item.state === 'uploading')) { setError(fill(t('attachUploading'), { pct: '…' })); return }
     setBusy(true); setError(null)
     try {
-      const sent = await call('/message', { method: 'POST', body: JSON.stringify({ conversation, text, mode }) })
+      const sent = await call('/message', { method: 'POST', body: JSON.stringify({ conversation, text, mode,
+        ...(attachments.length ? { attachments } : {}) }) })
       setDraft('')
+      draftFiles.clear()
       // 服务端只在会话线程的工单卡死时把派活消息改投子线程，如实提示一次；没分流则清掉上次的提示。
       setDivertedNotice(typeof sent?.diverted === 'string' ? sent.diverted : '')
       // 自己刚发的消息必须能看见：重新钉回底部，让下面的 load() 跟随到底。
@@ -1588,9 +2353,10 @@ function PanePanel({ t }: { t: Translate }) {
 
   /** 把「给某张工单的意见」发到这张工单专属的意见会话 t<id>：该线程没有工单订阅，消息不会广播给同对话其它工单，
    *  只走 Eval → 路由器按文本里的工单 id 挂到那一张。 */
-  const commentOnTicket = useCallback(async (ticket: Ticket, text: string) => {
+  const commentOnTicket = useCallback(async (ticket: Ticket, text: string, attachments: PaneAttachment[] = []) => {
     const composed = `【给工单「${ticket.title}」(${ticket.id}) 的意见，请交给该工单的 worker，不要新建工单】\n${text}`
-    const sent = await call('/message', { method: 'POST', body: JSON.stringify({ conversation: commentConversation(ticket.id), text: composed, mode: 'note' }) })
+    const sent = await call('/message', { method: 'POST', body: JSON.stringify({ conversation: commentConversation(ticket.id), text: composed, mode: 'note',
+      ...(attachments.length ? { attachments } : {}) }) })
     setDivertedNotice(typeof sent?.diverted === 'string' ? sent.diverted : '')
     pinnedRef.current = true
     await load()
@@ -1648,11 +2414,15 @@ function PanePanel({ t }: { t: Translate }) {
           crew={crew?.items.find(item => item.ticketId === ticket.id)?.lanes}
           activity={ticket.sessionId ? activities[ticket.sessionId] ?? null : null} t={t}
           ccStatus={ccStatuses[ticket.id] ?? null} ccExpanded={ccExpanded}
-          health={healths[ticket.id] ?? null}
+          lanePick={lanePicks[ticket.id]}
+          laneStatus={lanePicks[ticket.id] ? laneStatuses[`${ticket.id}:${lanePicks[ticket.id]}`] ?? null : null}
+          onPickLane={lane => pickLane(ticket.id, lane)}
+          onInterruptLane={lane => interruptLane(ticket.id, lane)}
           onToggleCc={() => setCcExpanded(value => !value)}
           ccBusy={ccBusy}
           onInterrupt={() => { void ccCommand(ticket.id, 'interrupt') }}
           onClear={() => { void ccCommand(ticket.id, 'clear') }}
+          health={healths[ticket.id] ?? null}
           onComment={commentOnTicket}
           onOpenComment={ticket => { setConversation(commentConversation(ticket.id)); setItems([]) }}
           confirmStop={confirmStop === ticket.id}
@@ -1681,6 +2451,7 @@ function PanePanel({ t }: { t: Translate }) {
             )}
           </div>
           {item.text}
+          <MessageAttachments items={item.attachments ?? []} t={t} />
         </div>
       ))}
     </div>
@@ -1695,14 +2466,31 @@ function PanePanel({ t }: { t: Translate }) {
         return working ? fill(t('waitingBusy'), { time }) : fill(t('waitingReply'), { n: String(pending.length), time })
       })()}
     </div>}
-    <div style={{ display: 'flex', gap: 8, alignItems: 'stretch' }}>
-      <textarea value={draft} onChange={event => setDraft(event.target.value)}
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}
+      onDragOver={event => { if (Array.from(event.dataTransfer?.types ?? []).includes('Files')) { event.preventDefault(); setDraftDrop(true) } }}
+      onDragLeave={() => setDraftDrop(false)}
+      onDrop={event => {
+        const files = Array.from(event.dataTransfer?.files ?? [])
+        if (files.length === 0) return
+        event.preventDefault(); setDraftDrop(false); void draftFiles.add(files)
+      }}>
+      <AttachmentRail items={draftFiles.items} onRemove={draftFiles.remove} t={t} />
+      {draftFiles.error && <div role="alert" style={{ fontSize: 11, color: '#e53e3e' }}>{draftFiles.error}</div>}
+      <div style={{ display: 'flex', gap: 8, alignItems: 'stretch' }}>
+      <textarea data-pane-draft="" value={draft} onChange={event => setDraft(event.target.value)}
         placeholder={mode === 'chat' ? t('placeholderChat')
           : mode === 'broadcast' ? t('placeholderBroadcast') : t('placeholder')} rows={3}
         onKeyDown={event => {
           if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void send() }
         }}
-        style={{ flex: 1, resize: 'vertical', padding: 8 }} />
+        onPaste={event => {
+          const files = clipboardFiles(event.clipboardData)
+          if (files.length === 0) return
+          event.preventDefault()
+          void draftFiles.add(files.map(namePastedFile))
+        }}
+        style={{ flex: 1, resize: 'vertical', padding: 8,
+          outline: draftDrop ? '1px dashed var(--dt-accent, #2b6cb0)' : 'none', outlineOffset: 2 }} />
       <div style={{ display: 'flex', flexDirection: 'column', gap: 6, justifyContent: 'space-between' }}>
         <div style={{ display: 'flex', border: '1px solid var(--dt-border, #333)', borderRadius: 6, overflow: 'hidden' }}>
           {(['assign', 'broadcast', 'chat'] as const).map(item => (
@@ -1714,10 +2502,15 @@ function PanePanel({ t }: { t: Translate }) {
             </button>
           ))}
         </div>
-        <button type="button" style={{ padding: '6px 12px' }} disabled={busy || !draft.trim()} onClick={() => { void send() }}>
-          {busy ? t('sending') : t('send')}
-        </button>
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+          <AttachButton disabled={busy} onFiles={files => { void draftFiles.add(files) }} t={t} />
+          <button type="button" data-pane-send="" style={{ padding: '6px 12px', flex: 1 }}
+            disabled={busy || (!draft.trim() && draftFiles.ready.length === 0)} onClick={() => { void send() }}>
+            {busy ? t('sending') : t('send')}
+          </button>
+        </div>
       </div>
+    </div>
     </div>
     {mode === 'chat' && <div style={{ fontSize: 11, opacity: 0.6 }}>{t('chatBusyHint')}</div>}
     {mode === 'broadcast' && <div style={{ fontSize: 11, opacity: 0.6 }}>{t('broadcastHint')}</div>}

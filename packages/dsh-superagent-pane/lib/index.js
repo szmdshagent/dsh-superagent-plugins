@@ -1,6 +1,6 @@
 import { n as logKey$1, t as appendLog$1 } from "./log-Co3EtYpg.js";
 import { randomUUID } from "node:crypto";
-import { closeSync, existsSync, openSync, readFileSync, readSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, openSync, readFileSync, readSync, readdirSync, readlinkSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
 import { key } from "dsh-superagent";
@@ -208,30 +208,30 @@ function parseLines(text, partialHead) {
 	}
 	return events;
 }
-/** 中断标记路径。 */
-const interruptPath = (dir) => join(dir, ".cc-worker", "interrupt");
-/** 请求中断：写标记，cc-worker 的旁路监视会杀掉 claude。 */
-function requestInterrupt(dir) {
+/** 中断标记路径：main → `.cc-worker/interrupt`，其它 lane → `.cc-worker/lanes/<lane>/interrupt`。 */
+const interruptPath = (dir, lane) => join(workerDir(dir, lane), "interrupt");
+/** 请求中断：写标记，cc-worker 的旁路监视会杀掉 claude。lane 省略 / 'main' 时写工单自己的 worker。 */
+function requestInterrupt(dir, lane) {
 	try {
-		writeFileSync(interruptPath(dir), (/* @__PURE__ */ new Date()).toISOString());
+		writeFileSync(interruptPath(dir, lane), (/* @__PURE__ */ new Date()).toISOString());
 		return true;
 	} catch {
 		return false;
 	}
 }
 /** 清除中断标记（新一轮开始前）。 */
-function clearInterrupt(dir) {
+function clearInterrupt(dir, lane) {
 	try {
-		if (existsSync(interruptPath(dir))) {
-			unlinkSync(interruptPath(dir));
+		if (existsSync(interruptPath(dir, lane))) {
+			unlinkSync(interruptPath(dir, lane));
 			return true;
 		}
 	} catch {}
 	return false;
 }
-/** 读 cc-worker 的 stderr.log 最后一条有意义的内容。 */
-function stderrHint(dir) {
-	const path = join(dir, ".cc-worker", "stderr.log");
+/** 读 cc-worker 的 stderr.log 最后一条有意义的内容；入参是 lane 的工作根（workerDir）。 */
+function stderrHint(base) {
+	const path = join(base, "stderr.log");
 	try {
 		const stat = statSync(path);
 		const length = Math.min(stat.size, 4096);
@@ -251,8 +251,13 @@ function stderrHint(dir) {
 		return;
 	}
 }
-/** 汇总一个工单目录的 CC 执行状态。 */
-function readCcStatus(dir) {
+/**
+* 汇总一个工单目录的 CC 执行状态。
+*
+* `lane` 省略 / 'main' 时读 `.cc-worker`（与旧行为完全一致）；其它 lane 读 `.cc-worker/lanes/<lane>`，
+* 这样面板可以单独查看某个 worker 的执行实况。
+*/
+function readCcStatus(dir, lane) {
 	const empty = {
 		present: false,
 		state: "none",
@@ -261,20 +266,22 @@ function readCcStatus(dir) {
 		alert: "none"
 	};
 	if (!dir) return empty;
-	const file = latestEventFile(dir);
+	const base = workerDir(dir, lane);
+	const interrupt = join(base, "interrupt");
+	const file = latestEventFile(dir, lane);
 	if (!file) return {
 		...empty,
-		interruptRequested: existsSync(interruptPath(dir))
+		interruptRequested: existsSync(interrupt)
 	};
 	const { events, mtime } = readTail(file);
 	if (!events.length) return {
 		...empty,
 		present: true,
-		interruptRequested: existsSync(interruptPath(dir))
+		interruptRequested: existsSync(interrupt)
 	};
 	const described = describe(events);
 	const ageMs = Math.max(0, Date.now() - mtime);
-	const interruptRequested = existsSync(interruptPath(dir));
+	const interruptRequested = existsSync(interrupt);
 	let state = described.state;
 	let alert = "none";
 	let alertText;
@@ -305,7 +312,7 @@ function readCcStatus(dir) {
 		interruptRequested,
 		alert,
 		alertText,
-		error: described.error ?? (state === "error" || alert === "critical" ? stderrHint(dir) : void 0)
+		error: described.error ?? (state === "error" || alert === "critical" ? stderrHint(base) : void 0)
 	};
 }
 /** 探测一个工单目录的执行活跃度；目录缺失/无产物时返回空对象（不编造信号）。 */
@@ -597,7 +604,8 @@ const inject = [
 	"orchestrator",
 	"sessionPersistence",
 	"webServer",
-	"workspaceRegistry"
+	"workspaceRegistry",
+	"attachments"
 ];
 /** Source id；Thread 键为 `pane:<对话>`。 */
 const SOURCE = "pane";
@@ -923,18 +931,122 @@ async function collectExecutorSignals(ctx, ticket) {
 	return signals;
 }
 /**
-* 读一张工单目录下的协作 lane 状态。
+* 正在跑的 cc-worker 进程 → 它们各自属于哪条 lane。
 *
-* lane 布局（cc-worker --lane 引入，2026-11-11）：
-*   <dir>/.cc-worker/{lock,session_id,...}             → lane = main（传统单 worker）
-*   <dir>/.cc-worker/lanes/<name>/{lock,session_id,...} → lane = <name>（协作子 worker）
+* 为什么需要：面板原来只认 `work/<工单>/.cc-worker/lanes/<lane>` 目录。用 `cc-worker run --dir <工单目录>`
+* 直接起的 worker、lane 目录还没建出来或跑完已被清掉的 worker，都真实在消耗额度，却一个行都不显示，
+* 看起来「明明在跑却没有员工」。这里直接读 /proc 兜底。
 *
-* 「在跑」的判据与面板其它地方一致：claude.pid 存在且该 pid 的命令行含 claude。
-* 只读目录，不改任何东西；读不到就当没有 lane。
+* 判据：cmdline 含 claude（cc-worker 的 bash 包装、python 旁路进程不算 worker 本体），
+* 且 cwd 或 cmdline 里出现该工单目录。识别不出的 lane 名退回 cwd 末段；工单自己的执行者记为 main。
 */
-function readLanes(dir) {
+function runningProcessLanes(dir) {
+	if (!dir) return [];
+	const names = [];
+	const laneFrom = (text) => {
+		const hit = /\/\.cc-worker\/lanes\/([^/\s]+)/.exec(text);
+		return hit ? hit[1] : "";
+	};
+	let pids = [];
+	try {
+		pids = readdirSync("/proc");
+	} catch {
+		return [];
+	}
+	for (const pid of pids) {
+		if (!/^\d+$/.test(pid)) continue;
+		let raw = "";
+		try {
+			raw = readFileSync(`/proc/${pid}/cmdline`, "utf8");
+		} catch {
+			continue;
+		}
+		const argv = raw.split("\0").filter(Boolean);
+		if (!argv.some((arg) => /(^|\/)claude$/.test(arg) || /(^|\/)cc-worker$/.test(arg))) continue;
+		const cmdline = argv.join(" ").trim();
+		let cwd = "";
+		try {
+			cwd = readlinkSync(`/proc/${pid}/cwd`);
+		} catch {}
+		if (!cwd.includes(dir) && !cmdline.includes(dir)) continue;
+		const atRoot = cwd === dir || cwd === join(dir, ".cc-worker");
+		const name = laneFrom(cwd) || laneFrom(cmdline) || (atRoot ? "main" : cwd.split("/").filter(Boolean).pop() ?? "main");
+		if (!names.includes(name)) names.push(name);
+	}
+	return names;
+}
+/** 本 lane 的会话谱系：session-lineage.jsonl + switch.log + 当前 session_id，去重后计数。 */
+function sessionChain(base) {
+	const ids = /* @__PURE__ */ new Set();
+	let current = "";
+	try {
+		current = readFileSync(join(base, "session_id"), "utf8").trim();
+	} catch {}
+	if (current) ids.add(current);
+	try {
+		for (const line of readFileSync(join(base, "session-lineage.jsonl"), "utf8").split("\n")) {
+			if (!line.trim()) continue;
+			try {
+				const rec = JSON.parse(line);
+				for (const key of ["from", "to"]) if (typeof rec?.[key] === "string" && rec[key]) ids.add(rec[key]);
+			} catch {}
+		}
+	} catch {}
+	try {
+		for (const line of readFileSync(join(base, "switch.log"), "utf8").split("\n")) {
+			const hit = /\bswitch to ([0-9a-fA-F-]{8,64})\b/.exec(line);
+			if (hit) ids.add(hit[1]);
+		}
+	} catch {}
+	return {
+		sessionId: current || void 0,
+		sessions: ids.size
+	};
+}
+/**
+* 把 team-plan 里的派活原文压成约 10-14 个汉字的一行任务登记。
+*
+* 派活原文通常长这样：`统计 /tmp/x/A 的文件数（只读）。做法：… 验收：… 禁止：…`，
+* 面板只需要第一句「要做什么」：取第一个完整短句、去掉括号里的补充说明、
+* 把长路径压成末段（既保留 A/B/C 这种区分词，又不让路径吃掉整行预算），
+* 仍然超长就在词边界截断并加省略号。
+*/
+function summarizeTask(text) {
+	const flat = String(text ?? "").replace(/`/g, "").replace(/[（(][^）)]*[）)]/g, " ").replace(/\s+/g, " ").trim();
+	if (!flat) return "";
+	const sentences = flat.split(/[。！？；;\n]/).map((part) => part.trim()).filter((part) => part.length >= 4);
+	const line = (sentences.find((part) => /[一-鿿]/.test(part)) ?? sentences[0] ?? flat).replace(/[A-Za-z0-9_.~\-]*(?:\/[A-Za-z0-9_.~\-]+)+/g, (token) => token.split("/").filter(Boolean).pop() ?? token).trim();
+	if (!line) return "";
+	const chars = [...line];
+	const limit = 46;
+	if (chars.length <= 48) return line;
+	const head = chars.slice(0, 48).join("");
+	const cut = Math.max(head.lastIndexOf(" "), head.lastIndexOf("、"), head.lastIndexOf("，"));
+	return cut > 4 ? `${head.slice(0, cut)}…` : `${chars.slice(0, limit).join("")}…`;
+}
+/** 导出仅为可验证：面板运行时只经 /crew 间接调用它。 */
+function readLanes(dir, ownTask = "") {
 	if (!dir) return [];
 	const out = [];
+	const root = join(dir, ".cc-worker");
+	const planned = () => {
+		const map = /* @__PURE__ */ new Map();
+		try {
+			const data = JSON.parse(readFileSync(join(root, "team-plan.json"), "utf8"));
+			if (Array.isArray(data)) {
+				const lanes = data.map((item) => typeof item?.lane === "string" ? item.lane.trim() : "").filter(Boolean);
+				if (lanes.length > 0) map.set("lead", lanes);
+				return map;
+			}
+			if (data && typeof data === "object") for (const [key, members] of Object.entries(data)) {
+				const leader = key.trim();
+				if (!leader || !Array.isArray(members)) continue;
+				const lanes = members.map((member) => typeof member === "string" ? member.trim() : member && typeof member === "object" && typeof member.lane === "string" ? member.lane.trim() : "").filter(Boolean);
+				map.set(leader, lanes);
+			}
+		} catch {}
+		return map;
+	};
 	const alive = (base) => {
 		try {
 			const pid = Number(readFileSync(join(base, "claude.pid"), "utf8").trim());
@@ -944,28 +1056,84 @@ function readLanes(dir) {
 			return false;
 		}
 	};
-	const taskOf = (base) => {
+	const assignedTasks = () => {
+		const map = /* @__PURE__ */ new Map();
 		try {
-			const text = readFileSync(join(base, "task.txt"), "utf8").replace(/\s+/g, " ").trim();
-			return text ? text.slice(0, 160) : void 0;
+			const data = JSON.parse(readFileSync(join(root, "team-plan.json"), "utf8"));
+			const entries = Array.isArray(data) ? data : data && typeof data === "object" ? Object.values(data).flatMap((members) => Array.isArray(members) ? members : []) : [];
+			for (const entry of entries) {
+				const lane = typeof entry?.lane === "string" ? entry.lane.trim() : typeof entry === "string" ? entry.trim() : "";
+				if (lane) map.set(lane, typeof entry?.task === "string" ? entry.task : "");
+			}
+		} catch {}
+		return map;
+	};
+	const registered = (base) => {
+		try {
+			return readFileSync(join(base, "task.txt"), "utf8");
 		} catch {
-			return;
+			return "";
 		}
 	};
+	const taskOf = (base, lane, assigned, ownTask = "") => {
+		return summarizeTask(assigned.get(lane) || registered(base) || (lane === "main" ? ownTask : "")) || "没输出";
+	};
+	const workerIdOf = (base, lane) => {
+		try {
+			const text = readFileSync(join(base, "worker-id"), "utf8").trim();
+			if (text) return text;
+		} catch {}
+		return `${dir}#${lane}`;
+	};
+	const view = (base, lane, state, role, assigned, ownTask, leader) => ({
+		lane,
+		state,
+		task: taskOf(base, lane, assigned, ownTask),
+		workerId: workerIdOf(base, lane),
+		...sessionChain(base),
+		role,
+		...role === "worker" && leader ? { leader } : {}
+	});
 	try {
-		const root = join(dir, ".cc-worker");
-		if (alive(root)) out.push({
-			lane: "main",
-			state: "running",
-			task: taskOf(root)
-		});
-		for (const name of readdirSync(join(root, "lanes"), { withFileTypes: true })) {
-			if (!name.isDirectory()) continue;
-			const base = join(root, "lanes", name.name);
+		const plan = planned();
+		const assigned = assignedTasks();
+		const leaderOf = (lane) => {
+			for (const [leader, members] of plan) if (members.includes(lane)) return leader;
+		};
+		let hasLeader = plan.size > 0;
+		if (!hasLeader) try {
+			hasLeader = readdirSync(join(root, "lanes"), { withFileTypes: true }).some((entry) => entry.isDirectory() && (entry.name === "lead" || entry.name === "orchestrator"));
+		} catch {}
+		let cooperative = plan.size > 0;
+		if (!cooperative) try {
+			cooperative = readdirSync(join(root, "lanes"), { withFileTypes: true }).some((entry) => entry.isDirectory() && alive(join(root, "lanes", entry.name)));
+		} catch {}
+		if (!cooperative && alive(root)) out.push(view(root, "main", "running", "main", assigned, ownTask));
+		let laneDirs = [];
+		try {
+			laneDirs = readdirSync(join(root, "lanes"), { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => entry.name);
+		} catch {}
+		for (const name of laneDirs) {
+			const base = join(root, "lanes", name);
+			const leader = leaderOf(name);
+			let role;
+			if (name === "orchestrator" || name === "lead" || plan.has(name)) role = "leader";
+			else if (leader) role = "worker";
+			else role = hasLeader ? "other" : "main";
+			out.push(view(base, name, alive(base) ? "running" : "idle", role, assigned, ownTask, leader));
+		}
+		for (const name of runningProcessLanes(dir)) {
+			if (out.some((lane) => lane.lane === name)) continue;
+			const role = name === "main" ? "main" : name === "orchestrator" || name === "lead" || plan.has(name) ? "leader" : hasLeader ? "other" : "main";
+			const task = summarizeTask(assigned.get(name) || (name === "main" ? ownTask : "") || registered(join(root, "lanes", name))) || "没输出";
 			out.push({
-				lane: name.name,
-				state: alive(base) ? "running" : "idle",
-				task: taskOf(base)
+				lane: name,
+				state: "running",
+				task,
+				role,
+				workerId: `${dir}#${name}`,
+				sessions: 0,
+				processOnly: true
 			});
 		}
 	} catch {}
@@ -1044,6 +1212,90 @@ function composeText(mode, text) {
 	if (mode === "note" || mode === "broadcast") return text;
 	if (mode === "chat") return "【对话模式：只回答这个问题，不要新建工单、不要 attach 工单、不要派 worker、不要改代码。能直接答就直接答；需要动代码或长期工作的事，建议我用「派活」重发。重要：如果我重复问了同一个问题，说明我没看到你上次的回答——请把答案简短再说一遍，不要因为「已答过」而忽略。】\n" + text;
 	return "【派活模式：这是我明确要你去做的任务。若它是本对话进行中工单的补充/追问/修正，就 attach 给那张工单的 worker 继续做；若要动代码、要交付结果、且没有可接手的工单，就新建工单并派给 worker。只答疑、不动代码的问题请直接回答，不必建单。】\n" + text;
+}
+/** 文件名清洗：与 DSH 附件存储同规则（去掉路径、控制字符与 Windows 非法字符）。 */
+function paneFileName(value) {
+	if (typeof value !== "string") return "file";
+	const clean = value.slice(Math.max(value.lastIndexOf("/"), value.lastIndexOf("\\")) + 1).replace(/[\u0000-\u001f\u007f]/g, "").replace(/[<>:"|?*]/g, "_").trim().replace(/[. ]+$/u, "").slice(0, 200);
+	return clean === "" || clean === "." || clean === ".." ? "file" : clean;
+}
+/** 回读附件时的 content-type：只按扩展名给图片/文本，其余一律 octet-stream（不猜、不放行 HTML）。 */
+function fileContentType(name) {
+	return {
+		png: "image/png",
+		jpg: "image/jpeg",
+		jpeg: "image/jpeg",
+		gif: "image/gif",
+		webp: "image/webp",
+		txt: "text/plain; charset=utf-8",
+		md: "text/plain; charset=utf-8",
+		log: "text/plain; charset=utf-8",
+		json: "application/json; charset=utf-8",
+		csv: "text/plain; charset=utf-8"
+	}[(/\.([a-z0-9]+)$/i.exec(name)?.[1] ?? "").toLowerCase()] ?? "application/octet-stream";
+}
+/** 附件引用校验：只接受 `sha256:<hex>` + 名字 + 字节数，且存储后端确实能给出宿主机路径。 */
+const AttachmentSchema = z.object({
+	attachmentId: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+	name: z.string().min(1).max(200),
+	bytes: z.number().int().positive()
+}).strict();
+/**
+* 把面板上传的字节交给 DSH 附件存储落盘。
+*
+* 为什么不用 DSH 的 `fileUpload.upload()`：那条路按 **Agent Session** 绑定暂存凭证，凭证只在 prompt 准入时
+* 解析；面板消息走的是 superagent 的 Trigger，不经过 prompt 准入，凭证永远不会被消费。存储层
+* （`ctx.attachments`，内容寻址 + 原样字节）与面板需求完全一致，所以只复用这一层。
+*/
+async function savePaneUpload(ctx, req, name) {
+	const store = ctx?.attachments;
+	if (!store || typeof store.saveFileStream !== "function") throw new PaneRefusal(503, "宿主没有提供附件存储（attachments）");
+	const ref = await store.saveFileStream({
+		data: req,
+		name: paneFileName(name)
+	});
+	const path = typeof store.fileHostPath === "function" ? store.fileHostPath(ref) : void 0;
+	return {
+		attachmentId: String(ref.attachmentId),
+		name: String(ref.name),
+		bytes: Number(ref.bytes),
+		...path ? { path } : {}
+	};
+}
+/** 把客户端回传的附件引用补上宿主机路径；引用不合法或对象不在盘上就拒绝整条消息。 */
+function resolvePaneAttachments(ctx, input) {
+	if (!Array.isArray(input) || input.length === 0) return [];
+	if (input.length > 20) throw new PaneRefusal(400, "一条消息最多 20 个附件");
+	const store = ctx?.attachments;
+	const resolved = [];
+	for (const raw of input) {
+		const ref = AttachmentSchema.parse(raw);
+		let path;
+		try {
+			path = store?.fileHostPath?.(ref);
+		} catch {
+			path = void 0;
+		}
+		if (!path || !existsSync(path)) throw new PaneRefusal(400, `附件「${ref.name}」不存在或已失效，请重新上传`);
+		resolved.push({
+			attachmentId: ref.attachmentId,
+			name: ref.name,
+			bytes: ref.bytes,
+			path
+		});
+	}
+	return resolved;
+}
+/**
+* 附件清单正文：拼在用户原话之后交给 worker。
+*
+* worker（cc-worker / DSH 执行器）与宿主同机，正文里的绝对路径可以直接用 Read / Bash 打开；
+* 同时保留 `attachmentId`，与 DSH 会话历史里的引用格式一致，便于追溯同一份字节。
+*/
+function attachmentNote(attachments) {
+	if (attachments.length === 0) return "";
+	const lines = attachments.map((item, index) => `${index + 1}. ${item.name}（${item.bytes} 字节，attachmentId ${item.attachmentId}）\n   路径：${item.path ?? "（存储后端未提供宿主机路径）"}`);
+	return `\n\n【附件 ${attachments.length} 个：已保存在本机 DSH 附件存储，可直接按下面的路径读取，不要重新索要文件】\n${lines.join("\n")}`;
 }
 /**
 * 面板路由。
@@ -1380,7 +1632,7 @@ function selectBroadcastTargets(tickets, text, explicitKeyword) {
 * `orchestrator_route attach` 走同一条路径，不经过 Eval、不依赖模型分诊。`channel` 仍指回用户发消息
 * 的原对话，worker 的回复会显示在那里。
 */
-async function broadcastByTitle(ctx, conversation, keyword, text) {
+async function broadcastByTitle(ctx, conversation, keyword, text, note = "") {
 	const store = ctx?.orchestrator?.store;
 	const engine = ctx?.orchestrator?.engine;
 	if (typeof store?.tickets?.list !== "function" || typeof store?.triggers?.save !== "function" || typeof engine?.attach !== "function") throw new Error("宿主未提供广播所需的工单/引擎接口");
@@ -1392,7 +1644,7 @@ async function broadcastByTitle(ctx, conversation, keyword, text) {
 	for (const ticket of targets) {
 		const title = String(ticket.title).trim();
 		const trigger = paneTrigger(conversation, `【广播给工单「${title}」(${ticket.id})：这条消息按${scope}筛选后同时投给了多张工单，请按本工单的上下文处理，不要新建工单】
-${text}`, OWNER, "note", { thread: `t${ticket.id}` });
+${text}${note}`, OWNER, "note", { thread: `t${ticket.id}` });
 		try {
 			store.triggers.save(trigger);
 			engine.attach(ticket.id, trigger.id, `面板广播（${scope}）`);
@@ -1446,6 +1698,8 @@ function deleteSchedule(state, id) {
 */
 async function dispatchPaneMessage(ctx, body, origin = "panel") {
 	const mode = body.mode === "dispatch" ? "assign" : body.mode;
+	const attachments = resolvePaneAttachments(ctx, body.attachments);
+	const withAttachments = (text) => `${text}${attachmentNote(attachments)}`;
 	const source = ctx.orchestrator.context({
 		kind: SOURCE,
 		health: ["pane"]
@@ -1456,7 +1710,7 @@ async function dispatchPaneMessage(ctx, body, origin = "panel") {
 		const content = (matched ? matched[2] : body.text).trim();
 		if (mode === "assign" && !keyword) throw new Error("广播关键词不能为空：请写成 @广播[关键词] 正文");
 		if (!content) throw new Error(mode === "broadcast" ? "广播内容不能为空" : "广播内容不能为空：请写成 @广播[关键词] 正文");
-		const result = await broadcastByTitle(ctx, body.conversation, keyword, content);
+		const result = await broadcastByTitle(ctx, body.conversation, keyword, content, attachmentNote(attachments));
 		const at = (/* @__PURE__ */ new Date()).toISOString();
 		const basis = [result.criteria.timeLabel ? `时间窗「${result.criteria.timeLabel}」` : "", result.criteria.tokens.length ? `关键词「${result.criteria.tokens.join("、")}」` : ""].filter(Boolean).join(" + ");
 		const notice = result.delivered.length ? `已广播给 ${result.delivered.length} 张工单：${result.delivered.map((item) => `「${item.title}」`).join("、")}` + (result.criteria.mode === "all" ? "（范围内全部工单）" : basis ? `（筛选依据：${basis}）` : "") + (result.autoAll ? `（${basis || "默认范围"}内全部工单，含已结束可唤醒的）` : "") + (result.stopped ? `；另有 ${result.stopped} 张已被人停止、无法唤醒，未投递` : "") + (result.ended ? `；另有 ${result.ended} 张不符合条件，未投递` : "") + (result.overLimit ? `；超过单次上限 ${result.overLimit} 张未投递` : "") + (result.failed.length ? `；投递失败 ${result.failed.length} 张：${result.failed.map((item) => `「${item.title}」`).join("、")}` : "") : result.noMatch ? `没有工单匹配${basis ? `（${basis}）` : ""}，未广播` : result.matched ? `范围内的 ${result.matched} 张工单都已结束且无法唤醒${result.stopped ? `（其中 ${result.stopped} 张被人停止）` : ""}，未广播` : `${basis || "最近 12 小时"}内没有符合条件的工单，未广播`;
@@ -1466,6 +1720,7 @@ async function dispatchPaneMessage(ctx, body, origin = "panel") {
 			at,
 			text: body.text,
 			mode: "broadcast",
+			...attachments.length ? { attachments } : {},
 			...origin === "schedule" ? { status: "scheduled" } : {}
 		});
 		appendLog(source, body.conversation, {
@@ -1486,13 +1741,14 @@ async function dispatchPaneMessage(ctx, body, origin = "panel") {
 	const conversation = body.conversation;
 	const diverted = mode === "assign" ? await divertDispatch(ctx, conversation) : void 0;
 	await wakeThreadSessions(ctx, conversation);
-	const trigger = paneTrigger(conversation, composeText(mode, body.text), OWNER, mode, diverted ? { thread: diverted.thread } : {});
+	const trigger = paneTrigger(conversation, withAttachments(composeText(mode, body.text)), OWNER, mode, diverted ? { thread: diverted.thread } : {});
 	appendLog(source, conversation, {
 		id: trigger.id,
 		direction: "in",
 		at: trigger.at,
 		text: body.text,
 		mode,
+		...attachments.length ? { attachments } : {},
 		...origin === "schedule" ? { status: "scheduled" } : {}
 	});
 	const received = await source.receive(trigger);
@@ -1562,8 +1818,50 @@ function paneHandler(ctx) {
 						"broadcast",
 						"assign",
 						"note"
-					]).default("dispatch")
+					]).default("dispatch"),
+					attachments: z.array(AttachmentSchema).max(20).optional()
 				}).parse(await readJson(req)), "panel"));
+				return;
+			}
+			if (req.method === "POST" && url.pathname === "/orchestrator/api/pane/upload") {
+				const rawName = url.searchParams.get("name") || req.headers["x-pane-filename"] || "";
+				let name = "file";
+				try {
+					name = decodeURIComponent(String(rawName));
+				} catch {
+					name = String(rawName);
+				}
+				sendJson(res, 200, await savePaneUpload(ctx, req, name));
+				return;
+			}
+			if (req.method === "GET" && url.pathname === "/orchestrator/api/pane/file") {
+				const id = String(url.searchParams.get("id") ?? "");
+				const name = paneFileName(url.searchParams.get("name") ?? "");
+				const store = ctx.attachments;
+				const located = AttachmentSchema.parse({
+					attachmentId: id,
+					name,
+					bytes: 1
+				});
+				const path = store?.fileHostPath?.(located);
+				if (!path || !existsSync(path)) {
+					sendJson(res, 404, { error: "附件不存在或已失效" });
+					return;
+				}
+				const ref = {
+					...located,
+					bytes: statSync(path).size
+				};
+				const chunks = [];
+				for await (const chunk of store.readFileStream(ref)) chunks.push(Buffer.from(chunk));
+				const bytes = Buffer.concat(chunks);
+				res.writeHead(200, {
+					"content-type": fileContentType(name),
+					"content-length": String(bytes.length),
+					"cache-control": "private, max-age=3600",
+					"x-content-type-options": "nosniff"
+				});
+				res.end(bytes);
 				return;
 			}
 			const activityMatch = /^\/orchestrator\/api\/pane\/activity\/([A-Za-z0-9_-]+)$/.exec(url.pathname);
@@ -1696,7 +1994,7 @@ function paneHandler(ctx) {
 						const assignments = Array.isArray(ticket.assignments) ? ticket.assignments : [];
 						const last = assignments.length ? assignments[assignments.length - 1] : void 0;
 						const state = String(last?.state ?? "idle");
-						const lanes = readLanes(String(ticket.execution?.directory ?? ""));
+						const lanes = readLanes(String(ticket.execution?.directory ?? ""), typeof ticket.execution?.assignment === "string" && ticket.execution.assignment.trim() ? ticket.execution.assignment : String(ticket.title ?? ""));
 						const ended = !!ticket?.ended;
 						if (ended && lanes.length === 0) continue;
 						live.push({
@@ -1754,6 +2052,35 @@ function paneHandler(ctx) {
 					return;
 				}
 				const dir = String(ticket.execution?.directory ?? "");
+				const laneParam = url.searchParams.get("lane");
+				if (laneParam) {
+					const lane = normalizeLane(laneParam);
+					if (!dir) {
+						sendJson(res, 200, {
+							ticketId,
+							directory: "",
+							lane,
+							sessionId: void 0,
+							cc: {
+								present: false,
+								state: "none",
+								steps: [],
+								interruptRequested: false,
+								alert: "none"
+							}
+						});
+						return;
+					}
+					const cc = readCcStatus(dir, lane);
+					sendJson(res, 200, {
+						ticketId,
+						directory: dir,
+						lane,
+						sessionId: cc.sessionId,
+						cc
+					});
+					return;
+				}
 				if (!dir) {
 					sendJson(res, 200, {
 						ticketId,
@@ -1787,10 +2114,17 @@ function paneHandler(ctx) {
 					sendJson(res, 400, { error: "ticket has no execution directory" });
 					return;
 				}
-				const ok = ccStop[2] === "interrupt" ? requestInterrupt(dir) : clearInterrupt(dir);
+				let bodyLane = "";
+				try {
+					const body = await readJson(req);
+					if (typeof body?.lane === "string") bodyLane = body.lane;
+				} catch {}
+				const lane = normalizeLane(bodyLane || url.searchParams.get("lane"));
+				const ok = ccStop[2] === "interrupt" ? requestInterrupt(dir, lane) : clearInterrupt(dir, lane);
 				sendJson(res, 200, {
 					ticketId: ccStop[1],
 					action: ccStop[2],
+					lane,
 					ok
 				});
 				return;
@@ -2232,4 +2566,4 @@ function apply(ctx) {
 		};
 	}, "pane: scheduled dispatch");
 }
-export { apply, inject, name, paneTrigger };
+export { apply, inject, name, paneTrigger, readLanes, summarizeTask };

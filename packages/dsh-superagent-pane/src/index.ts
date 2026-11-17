@@ -7,13 +7,13 @@
  */
 import type { Context } from '@deepseek-ai/cordis'
 import { randomUUID } from 'node:crypto'
-import { readFileSync, readdirSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, readlinkSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { z } from 'zod'
 import { key, type Trigger } from 'dsh-superagent'
-import { readCcStatus, requestInterrupt, clearInterrupt, probeExecutor } from './ccvis.ts'
+import { readCcStatus, requestInterrupt, clearInterrupt, probeExecutor, normalizeLane } from './ccvis.ts'
 import { ticketHealth, type ExecutorSignals } from './health.ts'
-import { appendLog as appendLogShared, logKey as logKeyShared } from './log.ts'
+import { appendLog as appendLogShared, logKey as logKeyShared, type PaneAttachment } from './log.ts'
 import { nextOccurrence, scheduleKey, SCHEDULE_PREFIX, type PaneSchedule, type ScheduleSpec } from './schedule.ts'
 import { recoverStuck, STUCK_SWEEP_MS } from './stuck.ts'
 import { COLLAB_SYNC_MS, dissolveDueGroups, shareReadyReports } from './collab/sync.ts'
@@ -73,14 +73,26 @@ declare module '@deepseek-ai/cordis' {
         close(): Promise<void>
       }>
     }
+    /**
+     * DSH 自带的附件存储（`@deepseek-ai/dsh-attachment-local` 提供）。面板复用它保存消息附件：
+     * 内容寻址、按字节原样落盘，`fileHostPath` 给出宿主机绝对路径，worker 直接按路径读取。
+     */
+    attachments: {
+      saveFileStream(input: { data: AsyncIterable<Uint8Array>; name?: string; signal?: AbortSignal }): Promise<PaneFileRef>
+      readFileStream(ref: PaneFileRef, signal?: AbortSignal): AsyncIterable<Uint8Array>
+      fileHostPath(ref: PaneFileRef): string | undefined
+    }
   }
 }
+
+/** DSH 附件引用（与 `@deepseek-ai/dsh-attachment` 的 FileAttachmentRef 同形）。 */
+type PaneFileRef = { attachmentId: string; name: string; bytes: number }
 
 /** 只读消费的会话事件形状；只关心 `type`/`time`/`data`，其余字段不理会。 */
 type PaneSessionEvent = { type?: string; time?: number; data?: any }
 
 export const name = 'dsh-superagent-pane'
-export const inject = ['orchestrator', 'sessionPersistence', 'webServer', 'workspaceRegistry']
+export const inject = ['orchestrator', 'sessionPersistence', 'webServer', 'workspaceRegistry', 'attachments']
 
 /** Source id；Thread 键为 `pane:<对话>`。 */
 const SOURCE = 'pane'
@@ -378,9 +390,173 @@ async function collectExecutorSignals(ctx: any, ticket: any): Promise<ExecutorSi
  * 「在跑」的判据与面板其它地方一致：claude.pid 存在且该 pid 的命令行含 claude。
  * 只读目录，不改任何东西；读不到就当没有 lane。
  */
-function readLanes(dir: string): { lane: string; state: 'running' | 'idle'; task?: string }[] {
+/**
+ * lane 在协作里的身份（owner 2026-11-17 定义，只分四种，不再细分）：
+ *   leader  统筹者。多 leader 里每个 leaderK 是它，顶层切分者 orchestrator 也归它
+ *   worker  被 leader 带领的 ccworker
+ *   main    没有协作模式时，这张工单自己的 worker
+ *   other   协作模式下，既不是 leader 也不是 ccworker 的一切（含独立验收 lane 等）
+ */
+export type LaneRole = 'leader' | 'worker' | 'main' | 'other'
+
+export type CrewLaneView = {
+  lane: string
+  state: 'running' | 'idle'
+  task?: string
+  /** 协作身份；没有 team-plan、也没有 lead lane 的工单全是 other。 */
+  role: LaneRole
+  /** 这条 lane 归谁管辖（team 模式下是 lead 的名字）；不受管辖时没有该字段。 */
+  leader?: string
+  /** 逻辑 cc worker id：handoff 换会话保持不变（cc-worker 写的 worker-id，旧数据回退到「目录#lane」）。 */
+  workerId: string
+  /** 本 lane 当前的 Claude Code 会话 id。 */
+  sessionId?: string
+  /** 本 lane 用过的会话数；>1 说明中间发生过 handoff 换会话，但仍是一个 cc worker。 */
+  sessions: number
+  /**
+   * 这条行不是由 lane 目录得出来的，而是从「正在跑的 cc-worker 进程」补出来的：
+   * 进程确实在跑，但工单目录下还没有对应 lane 目录（--dir 直接起、lane 目录还没建/已清掉）。
+   * 面板据此知道这一行的依据是进程，不是磁盘记录。
+   */
+  processOnly?: boolean
+}
+
+/**
+ * 正在跑的 cc-worker 进程 → 它们各自属于哪条 lane。
+ *
+ * 为什么需要：面板原来只认 `work/<工单>/.cc-worker/lanes/<lane>` 目录。用 `cc-worker run --dir <工单目录>`
+ * 直接起的 worker、lane 目录还没建出来或跑完已被清掉的 worker，都真实在消耗额度，却一个行都不显示，
+ * 看起来「明明在跑却没有员工」。这里直接读 /proc 兜底。
+ *
+ * 判据：cmdline 含 claude（cc-worker 的 bash 包装、python 旁路进程不算 worker 本体），
+ * 且 cwd 或 cmdline 里出现该工单目录。识别不出的 lane 名退回 cwd 末段；工单自己的执行者记为 main。
+ */
+function runningProcessLanes(dir: string): string[] {
   if (!dir) return []
-  const out: { lane: string; state: 'running' | 'idle'; task?: string }[] = []
+  const names: string[] = []
+  // 一个 lane 至少两个进程（timeout 包装 + claude 本体），按 lane 名去重。
+  const laneFrom = (text: string): string => {
+    const hit = /\/\.cc-worker\/lanes\/([^/\s]+)/.exec(text)
+    return hit ? hit[1]! : ''
+  }
+  let pids: string[] = []
+  try { pids = readdirSync('/proc') } catch { return [] }
+  for (const pid of pids) {
+    if (!/^\d+$/.test(pid)) continue
+    let raw = ''
+    try { raw = readFileSync(`/proc/${pid}/cmdline`, 'utf8') } catch { continue }
+    // 必须有一个 argv 项的 basename 就是 claude / cc-worker：只看「整条命令行里出现过 claude」太松，
+    // 任何脚本、grep、带工单路径的提示词文本都会把无关进程算进来（实测把别的 shell 误判成 worker）。
+    const argv = raw.split('\0').filter(Boolean)
+    if (!argv.some(arg => /(^|\/)claude$/.test(arg) || /(^|\/)cc-worker$/.test(arg))) continue
+    const cmdline = argv.join(' ').trim()
+    let cwd = ''
+    try { cwd = readlinkSync(`/proc/${pid}/cwd`) } catch { /* 权限/已退出：只用 cmdline 判断 */ }
+    if (!cwd.includes(dir) && !cmdline.includes(dir)) continue
+    // cwd 落在 `.cc-worker` 根（或就是工单目录）→ 这张工单自己的 worker，记 main。
+    const atRoot = cwd === dir || cwd === join(dir, '.cc-worker')
+    const name = laneFrom(cwd) || laneFrom(cmdline) || (atRoot ? 'main' : (cwd.split('/').filter(Boolean).pop() ?? 'main'))
+    if (!names.includes(name)) names.push(name)
+  }
+  return names
+}
+
+/** 本 lane 的会话谱系：session-lineage.jsonl + switch.log + 当前 session_id，去重后计数。 */
+function sessionChain(base: string): { sessionId?: string; sessions: number } {
+  const ids = new Set<string>()
+  let current = ''
+  try { current = readFileSync(join(base, 'session_id'), 'utf8').trim() } catch { /* 从未跑过 */ }
+  if (current) ids.add(current)
+  try {
+    for (const line of readFileSync(join(base, 'session-lineage.jsonl'), 'utf8').split('\n')) {
+      if (!line.trim()) continue
+      try {
+        const rec: any = JSON.parse(line)
+        for (const key of ['from', 'to']) if (typeof rec?.[key] === 'string' && rec[key]) ids.add(rec[key])
+      } catch { /* 半行，跳过 */ }
+    }
+  } catch { /* 旧数据没有谱系文件 */ }
+  try {
+    // 旧数据兜底：switch.log 里每次换会话都留了 "cctrim [trim then] switch to <sid>"。
+    for (const line of readFileSync(join(base, 'switch.log'), 'utf8').split('\n')) {
+      const hit = /\bswitch to ([0-9a-fA-F-]{8,64})\b/.exec(line)
+      if (hit) ids.add(hit[1]!)
+    }
+  } catch { /* 没有 switch.log */ }
+  return { sessionId: current || undefined, sessions: ids.size }
+}
+
+/**
+ * 把 team-plan 里的派活原文压成约 10-14 个汉字的一行任务登记。
+ *
+ * 派活原文通常长这样：`统计 /tmp/x/A 的文件数（只读）。做法：… 验收：… 禁止：…`，
+ * 面板只需要第一句「要做什么」：取第一个完整短句、去掉括号里的补充说明、
+ * 把长路径压成末段（既保留 A/B/C 这种区分词，又不让路径吃掉整行预算），
+ * 仍然超长就在词边界截断并加省略号。
+ */
+export function summarizeTask(text: string): string {
+  const flat = String(text ?? '')
+    .replace(/`/g, '')
+    .replace(/[（(][^）)]*[）)]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!flat) return ''
+  const sentences = flat.split(/[。！？；;\n]/).map(part => part.trim()).filter(part => part.length >= 4)
+  // 摘要要的是「10-14 个汉字」，所以优先挑第一个中文短句：派活原文常以英文工单标题开头，
+  // 直接取第一句会把整行占满英文。整段没有中文时才退回第一句。
+  const first = sentences.find(part => /[一-鿿]/.test(part)) ?? sentences[0] ?? flat
+  // 路径只留末段：/tmp/crew-demo/A → A；/home/szm/src/dsh-pane → dsh-pane
+  const line = first.replace(/[A-Za-z0-9_.~\-]*(?:\/[A-Za-z0-9_.~\-]+)+/g,
+    token => token.split('/').filter(Boolean).pop() ?? token).trim()
+  if (!line) return ''
+  const chars = [...line]
+  // 46 字：足够看清「派 1 个 ccw 用 find 口径统计 A 目录文件数」这种完整任务，
+  // 又不至于把整段派活原文铺满一行。原值 14 会把任务截成「派 1 个 ccw 以…」，等于没说。
+  const limit = 46
+  if (chars.length <= limit + 2) return line
+  const head = chars.slice(0, limit + 2).join('')
+  const cut = Math.max(head.lastIndexOf(' '), head.lastIndexOf('、'), head.lastIndexOf('，'))
+  return cut > 4 ? `${head.slice(0, cut)}…` : `${chars.slice(0, limit).join('')}…`
+}
+
+/** 导出仅为可验证：面板运行时只经 /crew 间接调用它。 */
+export function readLanes(dir: string, ownTask = ''): CrewLaneView[] {
+  if (!dir) return []
+  const out: CrewLaneView[] = []
+  const root = join(dir, '.cc-worker')
+  // team 模式由 cc-worker 的阶段 1 写出 team-plan.json。两种写法都认，都是「leader lane → 它管辖的 lane」：
+  //   数组 [{lane,task}]       → 这些 lane 全归名为 lead 的统筹 lane 管（旧格式，单 leader）
+  //   对象 {lead1:[ccw1,…]}    → 每个键都是一个 leader lane，值归它管（多 leader）
+  // 计划文件不存在（历史单/非 team 单）时所有 lane 都算 other，面板上不显示 leader。
+  const planned = (): Map<string, string[]> => {
+    const map = new Map<string, string[]>()
+    try {
+      const data: any = JSON.parse(readFileSync(join(root, 'team-plan.json'), 'utf8'))
+      if (Array.isArray(data)) {
+        const lanes = data.map(item => (typeof item?.lane === 'string' ? item.lane.trim() : '')).filter(Boolean)
+        if (lanes.length > 0) map.set('lead', lanes)
+        return map
+      }
+      if (data && typeof data === 'object') {
+        for (const [key, members] of Object.entries(data)) {
+          const leader = key.trim()
+          if (!leader || !Array.isArray(members)) continue
+          // 成员有两种合法写法，都必须认（2026-11-17 修：只认字符串数组会把对象数组全滤掉，
+          // 于是 leader→成员 关系为空，所有 worker 掉进 other，面板上就是「3 个 leader + 6 个散户」）：
+          //   ["ccw1", "ccw2"]                     ← 手写/旧格式
+          //   [{lane:"ccw1", task:"…"}, ...]        ← cc-worker 合并器实际写出的格式
+          const lanes = members
+            .map((member: unknown) => typeof member === 'string'
+              ? member.trim()
+              : (member && typeof member === 'object' && typeof (member as any).lane === 'string'
+                ? (member as any).lane.trim() : ''))
+            .filter(Boolean)
+          map.set(leader, lanes)
+        }
+      }
+    } catch { /* 没有或坏文件：当作没有计划 */ }
+    return map
+  }
   const alive = (base: string): boolean => {
     try {
       const pid = Number(readFileSync(join(base, 'claude.pid'), 'utf8').trim())
@@ -389,20 +565,113 @@ function readLanes(dir: string): { lane: string; state: 'running' | 'idle'; task
       return readFileSync(`/proc/${pid}/cmdline`, 'utf8').includes('claude')
     } catch { return false }
   }
-  // 任务分配：team 调度时由 cc-worker 写入 lanes/<name>/task.txt；没有就不给该字段。
-  const taskOf = (base: string): string | undefined => {
+  // 任务登记（owner 口径，2026-11-17）：行内只显示「这名队员被分配的任务」的短概括，
+  // 不再显示实时命令步，也不再用「最近一步做了什么」倒推。数据源就是 team-plan.json 里该 lane 的 task
+  // （main 用 .cc-worker/task.txt，那是这张工单自己的派活原文）；没有分配任务 → 「没输出」。
+  const assignedTasks = (): Map<string, string> => {
+    const map = new Map<string, string>()
     try {
-      const text = readFileSync(join(base, 'task.txt'), 'utf8').replace(/\s+/g, ' ').trim()
-      return text ? text.slice(0, 160) : undefined
-    } catch { return undefined }
+      const data: any = JSON.parse(readFileSync(join(root, 'team-plan.json'), 'utf8'))
+      const entries: any[] = Array.isArray(data)
+        ? data
+        : data && typeof data === 'object'
+          ? Object.values(data).flatMap(members => (Array.isArray(members) ? members : []))
+          : []
+      // 数组格式的顶层也可能带前导键；对象成员与字符串成员都要能读出 lane
+      for (const entry of entries) {
+        const lane = typeof entry?.lane === 'string' ? entry.lane.trim() : typeof entry === 'string' ? entry.trim() : ''
+        if (lane) map.set(lane, typeof entry?.task === 'string' ? entry.task : '')
+      }
+    } catch { /* 没有或坏文件：没有分配任务 */ }
+    return map
   }
+  const registered = (base: string): string => {
+    try { return readFileSync(join(base, 'task.txt'), 'utf8') } catch { return '' }
+  }
+  // main 行代表这张工单自己的 worker：.cc-worker/task.txt 只有派活时带了 --task 才有，
+  // 更多时候真正的「被分配任务」在工单上（execution.assignment 的路由备注，或派活消息原文），由调用方传进来。
+  const taskOf = (base: string, lane: string, assigned: Map<string, string>, ownTask = ''): string => {
+    const source = assigned.get(lane) || registered(base) || (lane === 'main' ? ownTask : '')
+    return summarizeTask(source) || '没输出'
+  }
+  const workerIdOf = (base: string, lane: string): string => {
+    try {
+      const text = readFileSync(join(base, 'worker-id'), 'utf8').trim()
+      if (text) return text
+    } catch { /* 旧数据没有 worker-id */ }
+    // 旧数据回退：目录 + lane 是稳定的逻辑 worker 键，与用过几个会话无关。
+    return `${dir}#${lane}`
+  }
+  const view = (base: string, lane: string, state: 'running' | 'idle', role: LaneRole, assigned: Map<string, string>, ownTask: string, leader?: string): CrewLaneView =>
+    ({ lane, state, task: taskOf(base, lane, assigned, ownTask), workerId: workerIdOf(base, lane), ...sessionChain(base), role, ...(role === 'worker' && leader ? { leader } : {}) })
   try {
-    const root = join(dir, '.cc-worker')
-    if (alive(root)) out.push({ lane: 'main', state: 'running', task: taskOf(root) })
-    for (const name of readdirSync(join(root, 'lanes'), { withFileTypes: true })) {
-      if (!name.isDirectory()) continue
-      const base = join(root, 'lanes', name.name)
-      out.push({ lane: name.name, state: alive(base) ? 'running' : 'idle', task: taskOf(base) })
+    const plan = planned()
+    const assigned = assignedTasks()
+    const leaderOf = (lane: string): string | undefined => {
+      for (const [leader, members] of plan) if (members.includes(lane)) return leader
+      return undefined
+    }
+    // 这张单是否存在 leader：team-plan 非空，或 lanes 里有名为 lead / orchestrator 的目录。
+    // 决定"没有 leader 时 other 一律显示成 main"这条规则。
+    let hasLeader = plan.size > 0
+    if (!hasLeader) {
+      try {
+        hasLeader = readdirSync(join(root, 'lanes'), { withFileTypes: true })
+          .some(entry => entry.isDirectory() && (entry.name === 'lead' || entry.name === 'orchestrator'))
+      } catch { /* 没有 lanes 目录就是没有 leader */ }
+    }
+    // 工单自己的 worker：**只在没有协作模式时**显示为 main。
+    // 协作模式的判据是有 team-plan.json，或 lanes/ 下存在协作 lane（leader / ccw 都算）。
+    // 原来只看根目录 claude.pid 是否活着，而协作工单的根目录也可能残留这个文件，
+    // 于是协作单里凭空多出一行 main。
+    // 协作模式判据：有 team-plan.json，或 lanes/ 下存在**活着的** lane。
+    //
+    // 曾经写成「lanes/ 下有目录就算协作」——这是个回归：一张单跑完后 lane 目录会留在磁盘上，
+    // 下次这张单再派活时，那些历史目录把工单误判成协作单，真正的执行者（root 的 main）
+    // 就被隐藏了，界面上只剩几个昨天的死 lane 显示「空闲」，看起来「明明在跑却没有任何员工」。
+    // 判据必须看「有没有人在跑」，不是「有没有历史目录」。
+    let cooperative = plan.size > 0
+    if (!cooperative) {
+      try {
+        cooperative = readdirSync(join(root, 'lanes'), { withFileTypes: true })
+          .some(entry => entry.isDirectory() && alive(join(root, 'lanes', entry.name)))
+      } catch { /* 没有 lanes 目录就是非协作 */ }
+    }
+    if (!cooperative && alive(root)) out.push(view(root, 'main', 'running', 'main', assigned, ownTask))
+    // lanes 目录可能根本不存在（用 --dir 直接起的 worker 就是这样）：单独吞掉这个 readdir 的错，
+    // 否则会跳出整个 try，后面的进程兜底也跟着被跳过，正是最需要兜底的那张单没有兜底。
+    let laneDirs: string[] = []
+    try { laneDirs = readdirSync(join(root, 'lanes'), { withFileTypes: true }).filter(entry => entry.isDirectory()).map(entry => entry.name) } catch { /* 没有 lanes 目录 */ }
+    for (const name of laneDirs) {
+      const base = join(root, 'lanes', name)
+      // 名为 lead 的 lane 仍是历史约定里的统筹 lane，即使没有 team-plan 也按 leader 显示。
+      const leader = leaderOf(name)
+      // 身份判定（owner 口径，四种）：
+      //   orchestrator / lead / team-plan 的 key → leader（统筹者，不区分谁统谁）
+      //   被某个 leader 带领 → worker
+      //   其余（含 main-verify 这类验收 lane）→ other
+      // 身份判定（owner 口径）：
+      //   orchestrator / lead / team-plan 的 key → leader（统筹者，不区分谁统谁）
+      //   被某个 leader 带领 → worker
+      //   其余：**这张单有 leader 时叫 other（平民），没有任何 leader 时一律叫 main**
+      // owner 要求：没有 leader 就不要出现 other。因为「平民」只有在有等级差时才成立——
+      // 一张单根本没有 leader，就不存在上下级，把它的执行者标成"平民"等于凭空造了一个身份。
+      let role: LaneRole
+      if (name === 'orchestrator' || name === 'lead' || plan.has(name)) role = 'leader'
+      else if (leader) role = 'worker'
+      else role = hasLeader ? 'other' : 'main'
+      out.push(view(base, name, alive(base) ? 'running' : 'idle', role, assigned, ownTask, leader))
+    }
+    // 兜底：进程在跑但这张工单下没有对应 lane 记录（--dir 直接起、lane 目录未建或已清）。
+    // 只追加磁盘上不存在的 lane 名，绝不覆盖已有行的 role/leader/state —— 磁盘记录比进程更可信。
+    for (const name of runningProcessLanes(dir)) {
+      if (out.some(lane => lane.lane === name)) continue
+      // 身份沿用 crewLabels() 的规则：main 命名 → main，orchestrator/lead → leader，其余按有没有 leader 定。
+      const role: LaneRole = name === 'main' ? 'main'
+        : (name === 'orchestrator' || name === 'lead' || plan.has(name)) ? 'leader'
+        : hasLeader ? 'other' : 'main'
+      const task = summarizeTask(assigned.get(name) || (name === 'main' ? ownTask : '') || registered(join(root, 'lanes', name))) || '没输出'
+      out.push({ lane: name, state: 'running', task, role, workerId: `${dir}#${name}`, sessions: 0, processOnly: true })
     }
   } catch { /* 目录不存在或不可读：没有 lane */ }
   return out
@@ -501,6 +770,78 @@ function composeText(mode: PaneMode, text: string): string {
   return "【派活模式：这是我明确要你去做的任务。若它是本对话进行中工单的补充/追问/修正，"
     + "就 attach 给那张工单的 worker 继续做；若要动代码、要交付结果、且没有可接手的工单，"
     + "就新建工单并派给 worker。只答疑、不动代码的问题请直接回答，不必建单。】\n" + text
+}
+
+// ——— 消息附件：复用 DSH 自带的附件存储 ———
+
+/** 文件名清洗：与 DSH 附件存储同规则（去掉路径、控制字符与 Windows 非法字符）。 */
+function paneFileName(value: unknown): string {
+  if (typeof value !== 'string') return 'file'
+  const clean = value.slice(Math.max(value.lastIndexOf('/'), value.lastIndexOf('\\')) + 1)
+    .replace(/[\u0000-\u001f\u007f]/g, '').replace(/[<>:"|?*]/g, '_').trim().replace(/[. ]+$/u, '').slice(0, 200)
+  return clean === '' || clean === '.' || clean === '..' ? 'file' : clean
+}
+
+/** 回读附件时的 content-type：只按扩展名给图片/文本，其余一律 octet-stream（不猜、不放行 HTML）。 */
+function fileContentType(name: string): string {
+  const ext = (/\.([a-z0-9]+)$/i.exec(name)?.[1] ?? '').toLowerCase()
+  const known: Record<string, string> = {
+    png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp',
+    txt: 'text/plain; charset=utf-8', md: 'text/plain; charset=utf-8', log: 'text/plain; charset=utf-8',
+    json: 'application/json; charset=utf-8', csv: 'text/plain; charset=utf-8',
+  }
+  return known[ext] ?? 'application/octet-stream'
+}
+
+/** 附件引用校验：只接受 `sha256:<hex>` + 名字 + 字节数，且存储后端确实能给出宿主机路径。 */
+const AttachmentSchema = z.object({
+  attachmentId: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+  name: z.string().min(1).max(200),
+  bytes: z.number().int().positive(),
+}).strict()
+
+/**
+ * 把面板上传的字节交给 DSH 附件存储落盘。
+ *
+ * 为什么不用 DSH 的 `fileUpload.upload()`：那条路按 **Agent Session** 绑定暂存凭证，凭证只在 prompt 准入时
+ * 解析；面板消息走的是 superagent 的 Trigger，不经过 prompt 准入，凭证永远不会被消费。存储层
+ * （`ctx.attachments`，内容寻址 + 原样字节）与面板需求完全一致，所以只复用这一层。
+ */
+async function savePaneUpload(ctx: any, req: any, name: string): Promise<PaneAttachment> {
+  const store = ctx?.attachments
+  if (!store || typeof store.saveFileStream !== 'function') throw new PaneRefusal(503, '宿主没有提供附件存储（attachments）')
+  const ref = await store.saveFileStream({ data: req as AsyncIterable<Uint8Array>, name: paneFileName(name) })
+  const path = typeof store.fileHostPath === 'function' ? store.fileHostPath(ref) : undefined
+  return { attachmentId: String(ref.attachmentId), name: String(ref.name), bytes: Number(ref.bytes), ...(path ? { path } : {}) }
+}
+
+/** 把客户端回传的附件引用补上宿主机路径；引用不合法或对象不在盘上就拒绝整条消息。 */
+function resolvePaneAttachments(ctx: any, input: unknown): PaneAttachment[] {
+  if (!Array.isArray(input) || input.length === 0) return []
+  if (input.length > 20) throw new PaneRefusal(400, '一条消息最多 20 个附件')
+  const store = ctx?.attachments
+  const resolved: PaneAttachment[] = []
+  for (const raw of input) {
+    const ref = AttachmentSchema.parse(raw)
+    let path: string | undefined
+    try { path = store?.fileHostPath?.(ref) } catch { path = undefined }
+    if (!path || !existsSync(path)) throw new PaneRefusal(400, `附件「${ref.name}」不存在或已失效，请重新上传`)
+    resolved.push({ attachmentId: ref.attachmentId, name: ref.name, bytes: ref.bytes, path })
+  }
+  return resolved
+}
+
+/**
+ * 附件清单正文：拼在用户原话之后交给 worker。
+ *
+ * worker（cc-worker / DSH 执行器）与宿主同机，正文里的绝对路径可以直接用 Read / Bash 打开；
+ * 同时保留 `attachmentId`，与 DSH 会话历史里的引用格式一致，便于追溯同一份字节。
+ */
+function attachmentNote(attachments: PaneAttachment[]): string {
+  if (attachments.length === 0) return ''
+  const lines = attachments.map((item, index) =>
+    `${index + 1}. ${item.name}（${item.bytes} 字节，attachmentId ${item.attachmentId}）\n   路径：${item.path ?? '（存储后端未提供宿主机路径）'}`)
+  return `\n\n【附件 ${attachments.length} 个：已保存在本机 DSH 附件存储，可直接按下面的路径读取，不要重新索要文件】\n${lines.join('\n')}`
 }
 
 /**
@@ -792,7 +1133,7 @@ function selectBroadcastTargets(tickets: any[], text: string, explicitKeyword: s
  * `orchestrator_route attach` 走同一条路径，不经过 Eval、不依赖模型分诊。`channel` 仍指回用户发消息
  * 的原对话，worker 的回复会显示在那里。
  */
-async function broadcastByTitle(ctx: any, conversation: string, keyword: string, text: string): Promise<BroadcastResult> {
+async function broadcastByTitle(ctx: any, conversation: string, keyword: string, text: string, note = ''): Promise<BroadcastResult> {
   const store = ctx?.orchestrator?.store
   const engine = ctx?.orchestrator?.engine
   if (typeof store?.tickets?.list !== 'function' || typeof store?.triggers?.save !== 'function'
@@ -818,7 +1159,7 @@ async function broadcastByTitle(ctx: any, conversation: string, keyword: string,
     const title = String(ticket.title).trim()
     const composed = `【广播给工单「${title}」(${ticket.id})：这条消息按${scope}筛选后同时投给了多张工单，`
       + `请按本工单的上下文处理，不要新建工单】
-${text}`
+${text}${note}`
     // 独立 Trigger + 每单一条：共享线程会被 ambiguous 吃掉，同一条 Trigger 也不能 attach 给多张工单。
     // note：正文已自带「广播给工单 X」前缀，不能再叠一层模式约束。
     const trigger = paneTrigger(conversation, composed, OWNER, 'note', { thread: `t${ticket.id}` })
@@ -870,10 +1211,13 @@ function deleteSchedule(state: any, id: string): void { state.set(scheduleKey(id
  *
  * 定时来源会在入站日志上标 `status: 'scheduled'`，面板据此显示「定时」徽标。
  */
-async function dispatchPaneMessage(ctx: any, body: { conversation: string; text: string; mode: PaneMode | 'dispatch' },
+async function dispatchPaneMessage(ctx: any, body: { conversation: string; text: string; mode: PaneMode | 'dispatch'; attachments?: PaneAttachment[] },
   origin: 'panel' | 'schedule' = 'panel'): Promise<any> {
   // 旧客户端仍发 `dispatch`，语义就是「路由器分配」。
   const mode: PaneMode = body.mode === 'dispatch' ? 'assign' : body.mode
+  // 附件先解析成带宿主机路径的引用，再拼进正文；正文对 worker 有 600 字截断，所以只放清单不放字节。
+  const attachments = resolvePaneAttachments(ctx, body.attachments)
+  const withAttachments = (text: string) => `${text}${attachmentNote(attachments)}`
   const source = ctx.orchestrator.context({ kind: SOURCE, health: ['pane'] })
   // 广播有两条入口：
   //   1) 派活模式下写 `@广播[关键词] 正文`（显式指定关键词，多个用逗号分隔，只投给匹配的工单）；
@@ -886,7 +1230,7 @@ async function dispatchPaneMessage(ctx: any, body: { conversation: string; text:
       const content = (matched ? matched[2]! : body.text).trim()
       if (mode === 'assign' && !keyword) throw new Error('广播关键词不能为空：请写成 @广播[关键词] 正文')
       if (!content) throw new Error(mode === 'broadcast' ? '广播内容不能为空' : '广播内容不能为空：请写成 @广播[关键词] 正文')
-      const result = await broadcastByTitle(ctx, body.conversation, keyword, content)
+      const result = await broadcastByTitle(ctx, body.conversation, keyword, content, attachmentNote(attachments))
       const at = new Date().toISOString()
       const basis = [
         result.criteria.timeLabel ? `时间窗「${result.criteria.timeLabel}」` : '',
@@ -906,7 +1250,8 @@ async function dispatchPaneMessage(ctx: any, body: { conversation: string; text:
                 ? `范围内的 ${result.matched} 张工单都已结束且无法唤醒${result.stopped ? `（其中 ${result.stopped} 张被人停止）` : ''}，未广播`
                 : `${basis || '最近 12 小时'}内没有符合条件的工单，未广播`))
       appendLog(source, body.conversation, { id: `broadcast-${randomUUID()}`, direction: 'in', at,
-        text: body.text, mode: 'broadcast', ...(origin === 'schedule' ? { status: 'scheduled' } : {}) })
+        text: body.text, mode: 'broadcast', ...(attachments.length ? { attachments } : {}),
+        ...(origin === 'schedule' ? { status: 'scheduled' } : {}) })
       appendLog(source, body.conversation, { id: `broadcast-notice-${randomUUID()}`, direction: 'out', at, text: notice, kind: 'broadcast' })
       return { broadcast: true, thread: `${SOURCE}:${body.conversation}`,
         received: result.delivered.length ? 'stored' : 'none', notice, ...result }
@@ -921,11 +1266,11 @@ async function dispatchPaneMessage(ctx: any, body: { conversation: string; text:
   // 投递前先手解档：跟进可能唤醒已结束的工单，而它的 worker 会话可能已被收尾归档
   // （被归档的会话跑不了回合，投递只会秒 blocked、消息丢失）。详见 wakeThreadSessions。
   await wakeThreadSessions(ctx, conversation)
-  const trigger = paneTrigger(conversation, composeText(mode, body.text), OWNER, mode,
+  const trigger = paneTrigger(conversation, withAttachments(composeText(mode, body.text)), OWNER, mode,
     diverted ? { thread: diverted.thread } : {})
-  // 日志里存用户原话（不含约束前缀），面板显示才干净。
+  // 日志里存用户原话（不含约束前缀与附件清单），面板显示才干净；附件引用单独存一份供消息流渲染。
   appendLog(source, conversation, { id: trigger.id, direction: 'in', at: trigger.at, text: body.text,
-    mode, ...(origin === 'schedule' ? { status: 'scheduled' } : {}) })
+    mode, ...(attachments.length ? { attachments } : {}), ...(origin === 'schedule' ? { status: 'scheduled' } : {}) })
   const received = await source.receive(trigger)
   return { triggerId: trigger.id, thread: `${SOURCE}:${trigger.threads[0]!.id}`, received, mode,
     ...(diverted ? { diverted: diverted.reason } : {}) }
@@ -973,8 +1318,42 @@ function paneHandler(ctx: any) {
       // POST /orchestrator/api/pane/message —— 派出一条消息（默认派活；mode=chat 交给 router）。
       if (req.method === 'POST' && url.pathname === '/orchestrator/api/pane/message') {
         const body = z.object({ conversation: ConversationSchema, text: TextSchema,
-          mode: z.enum(['dispatch', 'chat', 'broadcast', 'assign', 'note']).default('dispatch') }).parse(await readJson(req))
+          mode: z.enum(['dispatch', 'chat', 'broadcast', 'assign', 'note']).default('dispatch'),
+          attachments: z.array(AttachmentSchema).max(20).optional() }).parse(await readJson(req))
         sendJson(res, 200, await dispatchPaneMessage(ctx, body, 'panel'))
+        return
+      }
+      // POST /orchestrator/api/pane/upload —— 上传一个消息附件，落到 DSH 附件存储。
+      // 请求体是文件原始字节（不做 multipart，避免额外解析依赖）；文件名走 `x-pane-filename`（URL 编码）。
+      if (req.method === 'POST' && url.pathname === '/orchestrator/api/pane/upload') {
+        const rawName = url.searchParams.get('name') || req.headers['x-pane-filename'] || ''
+        let name = 'file'
+        try { name = decodeURIComponent(String(rawName)) } catch { name = String(rawName) }
+        sendJson(res, 200, await savePaneUpload(ctx, req, name))
+        return
+      }
+      // GET /orchestrator/api/pane/file?id=<sha256:...>&name=<name> —— 按引用回读附件原字节。
+      // 消息流里的图片缩略图与「查看原图」都走这里，权限与面板其它路由一致（同源头 + 页面令牌）。
+      if (req.method === 'GET' && url.pathname === '/orchestrator/api/pane/file') {
+        const id = String(url.searchParams.get('id') ?? '')
+        const name = paneFileName(url.searchParams.get('name') ?? '')
+        const store = ctx.attachments
+        // 先只用 id+name 定位对象，再按磁盘上的真实大小构造引用：`readFileStream` 会校验字节数与摘要，
+        // 客户端自报的字节数不可信，所以这里以 stat 为准（摘要不匹配时仍然会被它拒掉）。
+        const located = AttachmentSchema.parse({ attachmentId: id, name, bytes: 1 })
+        const path = store?.fileHostPath?.(located)
+        if (!path || !existsSync(path)) { sendJson(res, 404, { error: '附件不存在或已失效' }); return }
+        const ref = { ...located, bytes: statSync(path).size }
+        const chunks: Buffer[] = []
+        for await (const chunk of store.readFileStream(ref)) chunks.push(Buffer.from(chunk))
+        const bytes = Buffer.concat(chunks)
+        res.writeHead(200, {
+          'content-type': fileContentType(name),
+          'content-length': String(bytes.length),
+          'cache-control': 'private, max-age=3600',
+          'x-content-type-options': 'nosniff',
+        })
+        res.end(bytes)
         return
       }
       // GET /orchestrator/api/pane/activity/<会话 id> —— worker 当前在做什么。
@@ -1115,7 +1494,12 @@ function paneHandler(ctx: any) {
             const dir = String(ticket.execution?.directory ?? '')
             // 一张工单下的协作 lane：main 是传统单 worker，lanes/* 是 --lane 起的并行 worker。
             // 已结束的工单只有留下 lane 目录（真协作过）才上报，避免几百张历史单刷屏。
-            const lanes = readLanes(dir)
+            // main 行 = 这张工单自己的 worker：它「被分配的任务」就是工单本身。
+            // execution.assignment 是执行器收到的任务正文（派活路由备注/消息原文），没有时退回标题。
+            const ownTask = typeof ticket.execution?.assignment === 'string' && ticket.execution.assignment.trim()
+              ? ticket.execution.assignment
+              : String(ticket.title ?? '')
+            const lanes = readLanes(dir, ownTask)
             const ended = !!ticket?.ended
             if (ended && lanes.length === 0) continue
             live.push({
@@ -1161,25 +1545,42 @@ function paneHandler(ctx: any) {
         return
       }
       // GET /orchestrator/api/pane/cc/<工单 id> —— 该工单交给 Claude Code 的执行实况（只读）。
+      // 带 ?lane=<lane> 时只看这一条 lane 的实况：main → .cc-worker，其它 → .cc-worker/lanes/<lane>。
+      // 不带 lane 时行为与以前完全一致（工单级聚合）。
       const ccMatch = /^\/orchestrator\/api\/pane\/cc\/([A-Za-z0-9_-]+)$/.exec(url.pathname)
       if (req.method === 'GET' && ccMatch) {
         const ticketId = ccMatch[1]!
         const ticket = findTicket(ctx, ticketId)
         if (!ticket) { sendJson(res, 404, { error: 'ticket not found' }); return }
         const dir = String(ticket.execution?.directory ?? '')
+        const laneParam = url.searchParams.get('lane')
+        if (laneParam) {
+          const lane = normalizeLane(laneParam)
+          if (!dir) { sendJson(res, 200, { ticketId, directory: '', lane, sessionId: undefined,
+            cc: { present: false, state: 'none', steps: [], interruptRequested: false, alert: 'none' } }); return }
+          const cc = readCcStatus(dir, lane)
+          sendJson(res, 200, { ticketId, directory: dir, lane, sessionId: cc.sessionId, cc })
+          return
+        }
         if (!dir) { sendJson(res, 200, { ticketId, directory: '', cc: { present: false, state: 'none', steps: [], interruptRequested: false, alert: 'none' } }); return }
         sendJson(res, 200, { ticketId, directory: dir, cc: readCcStatus(dir) })
         return
       }
-      // POST /orchestrator/api/pane/cc/<工单 id>/interrupt —— 请求中止 CC 执行。
+      // POST /orchestrator/api/pane/cc/<工单 id>/interrupt[?lane=<lane>] —— 请求中止 CC 执行。
+      // 带 lane 时只中止这一条 lane 的 worker：main → .cc-worker，其它 → .cc-worker/lanes/<lane>；
+      // 不带 lane 时行为与以前完全一致（工单自己的 main）。lane 也可以放在 JSON body 里。
       const ccStop = /^\/orchestrator\/api\/pane\/cc\/([A-Za-z0-9_-]+)\/(interrupt|clear)$/.exec(url.pathname)
       if (req.method === 'POST' && ccStop) {
         const ticket = findTicket(ctx, ccStop[1]!)
         if (!ticket) { sendJson(res, 404, { error: 'ticket not found' }); return }
         const dir = String(ticket.execution?.directory ?? '')
         if (!dir) { sendJson(res, 400, { error: 'ticket has no execution directory' }); return }
-        const ok = ccStop[2] === 'interrupt' ? requestInterrupt(dir) : clearInterrupt(dir)
-        sendJson(res, 200, { ticketId: ccStop[1], action: ccStop[2], ok })
+        // body 可有可无（面板发的是 '{}'）：读不到或不是 JSON 就只看 query。
+        let bodyLane = ''
+        try { const body = await readJson(req) as { lane?: unknown } | null; if (typeof body?.lane === 'string') bodyLane = body.lane } catch { /* 没有 body 或不是 JSON */ }
+        const lane = normalizeLane(bodyLane || url.searchParams.get('lane'))
+        const ok = ccStop[2] === 'interrupt' ? requestInterrupt(dir, lane) : clearInterrupt(dir, lane)
+        sendJson(res, 200, { ticketId: ccStop[1], action: ccStop[2], lane, ok })
         return
       }
       // ——— 定时派活：列表 / 创建 / 启停 / 立即执行 / 删除 ———
