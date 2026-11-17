@@ -1313,12 +1313,18 @@ function TicketBar({ ticket, activity, t, health, confirmStop, onClose, onCommen
             // 二级（下属）：缩进两格、字号小一档、左侧竖线贯穿，和标题形成明确的从属层次。
             fontSize: level === 1 ? 12.5 : 11,
             fontWeight: level === 1 ? 700 : 400,
-            padding: level === 1 ? '4px 6px' : '1px 3px',
+            // 缩进只作用在行首内容区：整行右边界必须落在容器内，否则行尾的中止按钮会被裁掉。
+            // 做法是缩进多少就少多少宽度（border-box），右侧内边距两级统一 6px，
+            // 这样不管缩进与否，按钮的右边缘都停在同一条竖线上。
+            boxSizing: 'border-box',
+            width: indent ? 'calc(100% - 18px)' : '100%',
+            padding: level === 1 ? '4px 6px' : '1px 6px',
             marginLeft: indent ? 18 : 0,
             marginTop: level === 1 ? 6 : 0,
             borderTop: level === 1 ? '1px solid rgba(120,150,200,.35)' : undefined,
             borderLeft: indent ? '2px solid #5e7030' : undefined,
             paddingLeft: indent ? 8 : 6,
+            paddingRight: 6,
             background: lanePick === lane.lane
               ? 'rgba(74,158,255,.32)'
               : level === 1 ? 'rgba(255,255,255,.05)' : 'transparent',
@@ -1396,13 +1402,16 @@ function TicketBar({ ticket, activity, t, health, confirmStop, onClose, onCommen
           </span>}
           {/* 每个成员行都有自己的中止按钮：正在跑时可点，其余状态置灰（保持行结构统一）。
               行是 div + role=button，这里才是真 button；stopPropagation 防止顺手切换选中 lane。 */}
+          {/* 动作槽固定在最右：不参与缩进、不参与名字列宽度竞争，
+              保证每行的中止按钮落在同一条竖线上且完整留在行内。 */}
+          <span style={{ flex: '0 0 auto', marginLeft: 'auto', display: 'flex', alignItems: 'center' }}>
           <button type="button" data-pane-lane-interrupt={lane.lane}
             disabled={lane.state !== 'running' || op === 'busy'}
             aria-label={`中止 ${labels.get(lane.lane) ?? laneLabel(lane.lane)}`}
             title={op === 'done' ? '已请求中止' : op === 'fail' ? '中止请求失败'
               : lane.state === 'running' ? `中止 ${labels.get(lane.lane) ?? laneLabel(lane.lane)} 的执行` : '该 lane 空闲，无需中止'}
             onClick={event => { event.stopPropagation(); abortLane(lane.lane) }}
-            style={{ flexShrink: 0, marginLeft: 'auto', font: 'inherit', fontSize: 10, lineHeight: 1.4,
+            style={{ flexShrink: 0, font: 'inherit', fontSize: 10, lineHeight: 1.4, whiteSpace: 'nowrap',
               padding: '0 6px', borderRadius: 3, cursor: lane.state === 'running' && op !== 'busy' ? 'pointer' : 'not-allowed',
               border: '1px solid ' + (op === 'fail' ? '#8a3030' : op === 'done' ? '#3d6b45' : '#6b3a3a'),
               background: op === 'fail' ? 'rgba(160,50,50,.35)' : op === 'done' ? 'rgba(60,120,70,.35)' : 'rgba(120,40,40,.25)',
@@ -1410,6 +1419,7 @@ function TicketBar({ ticket, activity, t, health, confirmStop, onClose, onCommen
               opacity: lane.state === 'running' ? (op === 'busy' ? 0.6 : 1) : 0.4 }}>
             {op === 'busy' ? '中止中…' : op === 'done' ? '已请求中止' : op === 'fail' ? '失败' : '中止'}
           </button>
+          </span>
         </div>
         )
         })

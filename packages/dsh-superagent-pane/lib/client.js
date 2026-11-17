@@ -1759,12 +1759,15 @@ window.__ModuleLoader__.load({
 										borderRadius: 4,
 										fontSize: level === 1 ? 12.5 : 11,
 										fontWeight: level === 1 ? 700 : 400,
-										padding: level === 1 ? "4px 6px" : "1px 3px",
+										boxSizing: "border-box",
+										width: indent ? "calc(100% - 18px)" : "100%",
+										padding: level === 1 ? "4px 6px" : "1px 6px",
 										marginLeft: indent ? 18 : 0,
 										marginTop: level === 1 ? 6 : 0,
 										borderTop: level === 1 ? "1px solid rgba(120,150,200,.35)" : void 0,
 										borderLeft: indent ? "2px solid #5e7030" : void 0,
 										paddingLeft: indent ? 8 : 6,
+										paddingRight: 6,
 										background: lanePick === lane.lane ? "rgba(74,158,255,.32)" : level === 1 ? "rgba(255,255,255,.05)" : "transparent",
 										cursor: onPickLane ? "pointer" : "default",
 										boxShadow: lanePick === lane.lane ? "inset 0 0 0 1px #4a9eff" : void 0
@@ -1927,31 +1930,39 @@ window.__ModuleLoader__.load({
 												"）"
 											]
 										}),
-										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
-											type: "button",
-											"data-pane-lane-interrupt": lane.lane,
-											disabled: lane.state !== "running" || op === "busy",
-											"aria-label": `中止 ${labels.get(lane.lane) ?? laneLabel(lane.lane)}`,
-											title: op === "done" ? "已请求中止" : op === "fail" ? "中止请求失败" : lane.state === "running" ? `中止 ${labels.get(lane.lane) ?? laneLabel(lane.lane)} 的执行` : "该 lane 空闲，无需中止",
-											onClick: (event) => {
-												event.stopPropagation();
-												abortLane(lane.lane);
-											},
+										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 											style: {
-												flexShrink: 0,
+												flex: "0 0 auto",
 												marginLeft: "auto",
-												font: "inherit",
-												fontSize: 10,
-												lineHeight: 1.4,
-												padding: "0 6px",
-												borderRadius: 3,
-												cursor: lane.state === "running" && op !== "busy" ? "pointer" : "not-allowed",
-												border: "1px solid " + (op === "fail" ? "#8a3030" : op === "done" ? "#3d6b45" : "#6b3a3a"),
-												background: op === "fail" ? "rgba(160,50,50,.35)" : op === "done" ? "rgba(60,120,70,.35)" : "rgba(120,40,40,.25)",
-												color: op === "fail" ? "#ffb3b3" : op === "done" ? "#b6e6bf" : "#ffb0b0",
-												opacity: lane.state === "running" ? op === "busy" ? .6 : 1 : .4
+												display: "flex",
+												alignItems: "center"
 											},
-											children: op === "busy" ? "中止中…" : op === "done" ? "已请求中止" : op === "fail" ? "失败" : "中止"
+											children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+												type: "button",
+												"data-pane-lane-interrupt": lane.lane,
+												disabled: lane.state !== "running" || op === "busy",
+												"aria-label": `中止 ${labels.get(lane.lane) ?? laneLabel(lane.lane)}`,
+												title: op === "done" ? "已请求中止" : op === "fail" ? "中止请求失败" : lane.state === "running" ? `中止 ${labels.get(lane.lane) ?? laneLabel(lane.lane)} 的执行` : "该 lane 空闲，无需中止",
+												onClick: (event) => {
+													event.stopPropagation();
+													abortLane(lane.lane);
+												},
+												style: {
+													flexShrink: 0,
+													font: "inherit",
+													fontSize: 10,
+													lineHeight: 1.4,
+													whiteSpace: "nowrap",
+													padding: "0 6px",
+													borderRadius: 3,
+													cursor: lane.state === "running" && op !== "busy" ? "pointer" : "not-allowed",
+													border: "1px solid " + (op === "fail" ? "#8a3030" : op === "done" ? "#3d6b45" : "#6b3a3a"),
+													background: op === "fail" ? "rgba(160,50,50,.35)" : op === "done" ? "rgba(60,120,70,.35)" : "rgba(120,40,40,.25)",
+													color: op === "fail" ? "#ffb3b3" : op === "done" ? "#b6e6bf" : "#ffb0b0",
+													opacity: lane.state === "running" ? op === "busy" ? .6 : 1 : .4
+												},
+												children: op === "busy" ? "中止中…" : op === "done" ? "已请求中止" : op === "fail" ? "失败" : "中止"
+											})
 										})
 									]
 								}, lane.lane);
