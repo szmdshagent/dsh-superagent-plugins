@@ -1286,15 +1286,21 @@ function paneHandler(ctx: any) {
         sendJson(res, 200, { ticketId, directory: dir, cc: readCcStatus(dir) })
         return
       }
-      // POST /orchestrator/api/pane/cc/<工单 id>/interrupt —— 请求中止 CC 执行。
+      // POST /orchestrator/api/pane/cc/<工单 id>/interrupt[?lane=<lane>] —— 请求中止 CC 执行。
+      // 带 lane 时只中止这一条 lane 的 worker：main → .cc-worker，其它 → .cc-worker/lanes/<lane>；
+      // 不带 lane 时行为与以前完全一致（工单自己的 main）。lane 也可以放在 JSON body 里。
       const ccStop = /^\/orchestrator\/api\/pane\/cc\/([A-Za-z0-9_-]+)\/(interrupt|clear)$/.exec(url.pathname)
       if (req.method === 'POST' && ccStop) {
         const ticket = findTicket(ctx, ccStop[1]!)
         if (!ticket) { sendJson(res, 404, { error: 'ticket not found' }); return }
         const dir = String(ticket.execution?.directory ?? '')
         if (!dir) { sendJson(res, 400, { error: 'ticket has no execution directory' }); return }
-        const ok = ccStop[2] === 'interrupt' ? requestInterrupt(dir) : clearInterrupt(dir)
-        sendJson(res, 200, { ticketId: ccStop[1], action: ccStop[2], ok })
+        // body 可有可无（面板发的是 '{}'）：读不到或不是 JSON 就只看 query。
+        let bodyLane = ''
+        try { const body = await readJson(req) as { lane?: unknown } | null; if (typeof body?.lane === 'string') bodyLane = body.lane } catch { /* 没有 body 或不是 JSON */ }
+        const lane = normalizeLane(bodyLane || url.searchParams.get('lane'))
+        const ok = ccStop[2] === 'interrupt' ? requestInterrupt(dir, lane) : clearInterrupt(dir, lane)
+        sendJson(res, 200, { ticketId: ccStop[1], action: ccStop[2], lane, ok })
         return
       }
       // ——— 定时派活：列表 / 创建 / 启停 / 立即执行 / 删除 ———

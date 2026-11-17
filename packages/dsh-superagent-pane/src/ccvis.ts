@@ -257,17 +257,17 @@ function parseLines(text: string, partialHead: boolean): CcEvent[] {
   return events
 }
 
-/** 中断标记路径。 */
-export const interruptPath = (dir: string) => join(dir, '.cc-worker', 'interrupt')
+/** 中断标记路径：main → `.cc-worker/interrupt`，其它 lane → `.cc-worker/lanes/<lane>/interrupt`。 */
+export const interruptPath = (dir: string, lane?: string | null) => join(workerDir(dir, lane), 'interrupt')
 
-/** 请求中断：写标记，cc-worker 的旁路监视会杀掉 claude。 */
-export function requestInterrupt(dir: string): boolean {
-  try { writeFileSync(interruptPath(dir), new Date().toISOString()) ; return true } catch { return false }
+/** 请求中断：写标记，cc-worker 的旁路监视会杀掉 claude。lane 省略 / 'main' 时写工单自己的 worker。 */
+export function requestInterrupt(dir: string, lane?: string | null): boolean {
+  try { writeFileSync(interruptPath(dir, lane), new Date().toISOString()) ; return true } catch { return false }
 }
 
 /** 清除中断标记（新一轮开始前）。 */
-export function clearInterrupt(dir: string): boolean {
-  try { if (existsSync(interruptPath(dir))) { unlinkSync(interruptPath(dir)); return true } } catch { /* 忽略 */ }
+export function clearInterrupt(dir: string, lane?: string | null): boolean {
+  try { if (existsSync(interruptPath(dir, lane))) { unlinkSync(interruptPath(dir, lane)); return true } } catch { /* 忽略 */ }
   return false
 }
 

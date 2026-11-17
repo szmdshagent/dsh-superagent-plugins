@@ -208,22 +208,22 @@ function parseLines(text, partialHead) {
 	}
 	return events;
 }
-/** 中断标记路径。 */
-const interruptPath = (dir) => join(dir, ".cc-worker", "interrupt");
-/** 请求中断：写标记，cc-worker 的旁路监视会杀掉 claude。 */
-function requestInterrupt(dir) {
+/** 中断标记路径：main → `.cc-worker/interrupt`，其它 lane → `.cc-worker/lanes/<lane>/interrupt`。 */
+const interruptPath = (dir, lane) => join(workerDir(dir, lane), "interrupt");
+/** 请求中断：写标记，cc-worker 的旁路监视会杀掉 claude。lane 省略 / 'main' 时写工单自己的 worker。 */
+function requestInterrupt(dir, lane) {
 	try {
-		writeFileSync(interruptPath(dir), (/* @__PURE__ */ new Date()).toISOString());
+		writeFileSync(interruptPath(dir, lane), (/* @__PURE__ */ new Date()).toISOString());
 		return true;
 	} catch {
 		return false;
 	}
 }
 /** 清除中断标记（新一轮开始前）。 */
-function clearInterrupt(dir) {
+function clearInterrupt(dir, lane) {
 	try {
-		if (existsSync(interruptPath(dir))) {
-			unlinkSync(interruptPath(dir));
+		if (existsSync(interruptPath(dir, lane))) {
+			unlinkSync(interruptPath(dir, lane));
 			return true;
 		}
 	} catch {}
@@ -1871,10 +1871,17 @@ function paneHandler(ctx) {
 					sendJson(res, 400, { error: "ticket has no execution directory" });
 					return;
 				}
-				const ok = ccStop[2] === "interrupt" ? requestInterrupt(dir) : clearInterrupt(dir);
+				let bodyLane = "";
+				try {
+					const body = await readJson(req);
+					if (typeof body?.lane === "string") bodyLane = body.lane;
+				} catch {}
+				const lane = normalizeLane(bodyLane || url.searchParams.get("lane"));
+				const ok = ccStop[2] === "interrupt" ? requestInterrupt(dir, lane) : clearInterrupt(dir, lane);
 				sendJson(res, 200, {
 					ticketId: ccStop[1],
 					action: ccStop[2],
+					lane,
 					ok
 				});
 				return;

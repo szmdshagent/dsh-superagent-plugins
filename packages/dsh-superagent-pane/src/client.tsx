@@ -712,7 +712,7 @@ function workSummary(t: Translate, activity: Activity): WorkSummary {
 const DOT_STYLE = `.dsh-pane-dot-running{animation:dsh-pane-pulse 1.6s ease-in-out infinite}@keyframes dsh-pane-pulse{0%,100%{opacity:1}50%{opacity:.35}}`
 
 /** 对话上方的一条工单状态条：哪个工单、到哪一步、worker 此刻在做什么（说人话，详情可展开原始命令）。 */
-function TicketBar({ ticket, activity, t, health, confirmStop, onClose, onComment, onOpenComment, crew, lanePick, laneStatus, onPickLane,
+function TicketBar({ ticket, activity, t, health, confirmStop, onClose, onComment, onOpenComment, crew, lanePick, laneStatus, onPickLane, onInterruptLane,
   ccStatus, ccExpanded, onToggleCc, onInterrupt, onClear, ccBusy }: {
   ticket: Ticket; activity: Activity | null; t: Translate
   /** 本工单的协作 lane（来自 /crew）；没有或读不到时 undefined。 */
@@ -723,6 +723,8 @@ function TicketBar({ ticket, activity, t, health, confirmStop, onClose, onCommen
   laneStatus?: CcStatus | null
   /** 点击协作分工的行：选中该 lane；再点同一行则取消选择。 */
   onPickLane?: (lane: string) => void
+  /** 中止某一条 lane 的执行（POST /cc/<id>/interrupt?lane=）；失败时抛出，由行自己显示状态。 */
+  onInterruptLane?: (lane: string) => Promise<void>
   /** 工单级 CC 实况（/cc/<id>，即 main 自己的状态）；唯一的 CC 状态块默认显示它。 */
   ccStatus: CcStatus | null; ccExpanded: boolean
   onToggleCc: () => void; onInterrupt: () => void; onClear: () => void; ccBusy: boolean
@@ -731,6 +733,22 @@ function TicketBar({ ticket, activity, t, health, confirmStop, onClose, onCommen
   onOpenComment?: (ticket: Ticket) => void
 }) {
   const [open, setOpen] = useState(false)
+  /** 每条 lane 自己的中止按钮状态：busy 请求在飞，done/fail 是几秒后自动消失的回执。 */
+  const [laneOps, setLaneOps] = useState<Record<string, 'busy' | 'done' | 'fail'>>({})
+  const abortLane = (lane: string) => {
+    if (!onInterruptLane || laneOps[lane] === 'busy') return
+    setLaneOps(prev => ({ ...prev, [lane]: 'busy' }))
+    const settle = (value: 'done' | 'fail') => {
+      setLaneOps(prev => ({ ...prev, [lane]: value }))
+      setTimeout(() => setLaneOps(prev => {
+        if (prev[lane] !== value) return prev
+        const next = { ...prev }
+        delete next[lane]
+        return next
+      }), 4000)
+    }
+    onInterruptLane(lane).then(() => settle('done'), () => settle('fail'))
+  }
   const stage = ticket.stage ?? 'ended'
   const zombie = health?.health === 'zombie'
   // 默认全折叠：面板刚进来时所有工单只显示单行摘要，不按 stage 自动展开/收起。
@@ -853,11 +871,19 @@ function TicketBar({ ticket, activity, t, health, confirmStop, onClose, onCommen
       </div>
       {(() => {
         const labels = crewLabels(crew ?? [])
-        return (crew ?? []).map(lane => (
-        <button type="button" key={lane.lane} data-pane-lane-pick={lane.lane}
+        return (crew ?? []).map(lane => {
+        const op = laneOps[lane.lane]
+        // 行本身是 div + role=button：中止按钮必须是它内部真正的 <button>，button 不能嵌套 button。
+        return (
+        <div key={lane.lane} data-pane-lane-pick={lane.lane}
+          role="button" tabIndex={0}
           aria-pressed={lanePick === lane.lane}
           title={lanePick === lane.lane ? '再点一次取消选择，回到这张工单自己的 worker' : '点击查看这条 lane 自己的实时进度'}
           onClick={event => { event.stopPropagation(); onPickLane?.(lane.lane) }}
+          onKeyDown={event => {
+            if (event.key !== 'Enter' && event.key !== ' ') return
+            event.preventDefault(); event.stopPropagation(); onPickLane?.(lane.lane)
+          }}
           style={{ display: 'flex', gap: 6, alignItems: 'baseline', fontSize: 11.5, minWidth: 0, width: '100%',
             textAlign: 'left', font: 'inherit', color: 'inherit', padding: '1px 3px', borderRadius: 4,
             cursor: onPickLane ? 'pointer' : 'default',
@@ -886,8 +912,25 @@ function TicketBar({ ticket, activity, t, health, confirmStop, onClose, onCommen
             title={lane.task || '没输出'}>
             {lane.task || <span style={{ opacity: 0.45 }}>没输出</span>}
           </span>
-        </button>
-        ))
+          {/* 每个成员行都有自己的中止按钮：正在跑时可点，其余状态置灰（保持行结构统一）。
+              行是 div + role=button，这里才是真 button；stopPropagation 防止顺手切换选中 lane。 */}
+          <button type="button" data-pane-lane-interrupt={lane.lane}
+            disabled={lane.state !== 'running' || op === 'busy'}
+            aria-label={`中止 ${labels.get(lane.lane) ?? laneLabel(lane.lane)}`}
+            title={op === 'done' ? '已请求中止' : op === 'fail' ? '中止请求失败'
+              : lane.state === 'running' ? `中止 ${labels.get(lane.lane) ?? laneLabel(lane.lane)} 的执行` : '该 lane 空闲，无需中止'}
+            onClick={event => { event.stopPropagation(); abortLane(lane.lane) }}
+            style={{ flexShrink: 0, marginLeft: 'auto', font: 'inherit', fontSize: 10, lineHeight: 1.4,
+              padding: '0 6px', borderRadius: 3, cursor: lane.state === 'running' && op !== 'busy' ? 'pointer' : 'not-allowed',
+              border: '1px solid ' + (op === 'fail' ? '#8a3030' : op === 'done' ? '#3d6b45' : '#6b3a3a'),
+              background: op === 'fail' ? 'rgba(160,50,50,.35)' : op === 'done' ? 'rgba(60,120,70,.35)' : 'rgba(120,40,40,.25)',
+              color: op === 'fail' ? '#ffb3b3' : op === 'done' ? '#b6e6bf' : '#ffb0b0',
+              opacity: lane.state === 'running' ? (op === 'busy' ? 0.6 : 1) : 0.4 }}>
+            {op === 'busy' ? '中止中…' : op === 'done' ? '已请求中止' : op === 'fail' ? '失败' : '中止'}
+          </button>
+        </div>
+        )
+        })
       })()}
     </div>}
     {expanded && work && <div style={{ opacity: 0.88 }}>
@@ -1731,6 +1774,16 @@ function PanePanel({ t }: { t: Translate }) {
   }, [pollStatus])
 
   /**
+   * 中止某一条 lane 的执行：POST /cc/<id>/interrupt?lane=<lane>（lane=main 即工单自己的 worker）。
+   * 成功后立刻刷新一次工单级状态；失败向上抛，让行上的按钮显示「失败」。
+   */
+  const interruptLane = useCallback(async (ticketId: string, lane: string) => {
+    await call(`/cc/${encodeURIComponent(ticketId)}/interrupt?lane=${encodeURIComponent(lane)}`,
+      { method: 'POST', body: JSON.stringify({ lane }) })
+    await pollStatus()
+  }, [pollStatus])
+
+  /**
    * 关闭一张工单卡。已结束的直接收起（记进名单，不动工单）；进行中的先停止——两步确认，
    * 第一次点击变成「确认停止？」，5 秒没有下文自动还原，再点一次才真的停，避免误杀正在跑的 worker。
    * 停完立刻把 id 记进名单，否则它作为「最近一张已结束」会马上又冒出来。
@@ -1842,6 +1895,7 @@ function PanePanel({ t }: { t: Translate }) {
           lanePick={lanePicks[ticket.id]}
           laneStatus={lanePicks[ticket.id] ? laneStatuses[`${ticket.id}:${lanePicks[ticket.id]}`] ?? null : null}
           onPickLane={lane => pickLane(ticket.id, lane)}
+          onInterruptLane={lane => interruptLane(ticket.id, lane)}
           onToggleCc={() => setCcExpanded(value => !value)}
           ccBusy={ccBusy}
           onInterrupt={() => { void ccCommand(ticket.id, 'interrupt') }}
