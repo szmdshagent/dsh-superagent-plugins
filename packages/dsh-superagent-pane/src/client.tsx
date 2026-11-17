@@ -1020,8 +1020,10 @@ function TicketBar({ ticket, activity, t, health, confirmStop, onClose, onCommen
                 background: role === 'leader' ? '#5c4600' : '#3d4a1f',
                 color: role === 'leader' ? '#ffd96a' : '#c8e08a',
                 border: '1px solid ' + (role === 'leader' ? '#8a6a00' : '#5e7030') }}>
-              {/* 受管辖行只留 👑，leader 名字已在 leader 行的徽标里；leader 行徽标自带别名，行内不再重复一次。 */}
-              👑{role === 'leader' ? ` ${labels.get(lane.lane) ?? 'leader'}` : ''}
+              {/* leader 显示 leaderN，队员显示 ccwN —— 徽标本身就说明是哪种角色，不用再去对照名字列 */}
+              👑{role === 'leader'
+                ? ` ${labels.get(lane.lane) ?? 'leader'}`
+                : ` ${labels.get(lane.lane) ?? ''}`}
             </span>
             return <span data-pane-lane-role={lane.lane} title={badge.hint}
               style={{ flexShrink: 0, fontSize: 9.5, padding: '0 5px', borderRadius: 3, lineHeight: 1.5,
