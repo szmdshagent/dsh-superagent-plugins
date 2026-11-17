@@ -540,9 +540,13 @@ function crewLabels(lanes: CrewLane[]): Map<string, string> {
     for (const lane of lanes) if (lane.role === 'worker' && lane.leader === leader.lane) workerOrder.push(lane.lane)
   }
   for (const lane of lanes) if (lane.role === 'worker' && !workerOrder.includes(lane.lane)) workerOrder.push(lane.lane)
-  // 所有 leader 都编号（含 orchestrator 这个总任务切分 agent）：
-  // 统筹就是 leader，不因为「暂时没有下属」就被降级成别的东西。
-  leaders.forEach((lane, index) => labels.set(lane.lane, `leader${index + 1}`))
+  // orchestrator 单独叫「切分」：它只把总任务切成块分给各 leader，不做末尾归纳，
+  // 与 leader（带队 + 归纳自己那块）是两种不同职责，共用一个名字会混淆。
+  // 其余 leader 按顺序编号 leader1、leader2…
+  let leaderNo = 0
+  for (const lane of leaders) {
+    labels.set(lane.lane, lane.lane === 'orchestrator' ? '切分' : `leader${++leaderNo}`)
+  }
   workerOrder.forEach((lane, index) => labels.set(lane.lane, `ccw${index + 1}`))
   // 剩余两类：main（无协作时的工单 worker，只有一个）与 other（协作下的其它一切）。
   // other 不再起合成别名（oth-ccwN 看不出是谁），直接显示真实 lane 目录名，
@@ -577,6 +581,9 @@ function crewGroups(lanes: CrewLane[]) {
     if (groups.some(group => group.leader.lane === lane.leader)) continue
     groups.push({ leader: { lane: lane.leader, state: 'idle', role: 'lead' }, members: [lane] })
   }
+  // 总任务切分者排最前：它是流程的第一步，排在 leader1..N 之后会让阅读顺序与执行顺序相反。
+  // 其余 leader 保持原有顺序（lane 目录的字母序），不重排以免每次刷新跳动。
+  groups.sort((a, b) => Number(b.leader.lane === 'orchestrator') - Number(a.leader.lane === 'orchestrator'))
   const loose = lanes.filter(lane => lane.role !== 'leader' && lane.role !== 'worker')
   return { groups, loose }
 }
@@ -1014,6 +1021,13 @@ function TicketBar({ ticket, activity, t, health, confirmStop, onClose, onCommen
             // lead/worker 走原来的 👑 体系（保持既有观感）；其余四类各用一个固定徽标。
             const role = lane.role ?? 'other'
             const badge = ROLE_BADGE[role]
+            // 切分（orchestrator）虽是 leader 类，但职责只有切块、不做末尾归纳，徽标单独给紫色
+            if (lane.lane === 'orchestrator') return <span data-pane-lane-role={lane.lane}
+              title="切分：把总任务切成块分给各 leader，不负责末尾归纳（与 leader 的职责不同）"
+              style={{ flexShrink: 0, fontSize: 9.5, padding: '0 5px', borderRadius: 3, lineHeight: 1.5,
+                background: '#3a2a55', color: '#c9b3f0', border: '1px solid #5c4380' }}>
+              ✂ 切分
+            </span>
             if (role === 'leader' || role === 'worker' || !badge) return <span data-pane-lane-leader={lane.lane}
               title={role === 'leader' ? '这条 lane 是 leader（统筹），管辖受管辖的 cc-worker' : `这条 cc-worker 归 ${labels.get(lane.leader ?? '') ?? lane.leader} 管辖`}
               style={{ flexShrink: 0, fontSize: 9.5, padding: '0 5px', borderRadius: 3, lineHeight: 1.5,
