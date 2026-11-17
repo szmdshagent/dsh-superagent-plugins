@@ -1140,8 +1140,9 @@ window.__ModuleLoader__.load({
 								const scale = crewScale(lanes);
 								const labels = crewLabels(lanes);
 								const team = scale.leaders > 0 || scale.managed > 0;
-								const extras = [scale.mains > 0 ? `M${scale.mains}` : "", scale.other > 0 ? `O${scale.other}` : ""].filter(Boolean);
-								const caption = team ? `👥 G ${scale.groups.map((group) => `1-${group.count}`).join(",")}${extras.length ? ` · ${extras.join(" ")}` : ""}` : `👥 协作 ${scale.unmanaged}`;
+								const segments = scale.groups.map((group) => `1-${group.count}`);
+								if (team && scale.unmanaged > 0) segments.push(String(scale.unmanaged));
+								const caption = team ? `👥 ${segments.join(",")}` : `👥 ${scale.unmanaged}`;
 								const summary = (team ? `这张工单下 ${scale.groups.map((group) => `${labels.get(group.leader) ?? group.leader} 带 ${group.count} 个 cc-worker`).join("，")}` : `这张工单下有 ${scale.unmanaged} 条 lane`) + [scale.mains > 0 ? `工单自己的 worker（main）` : "", scale.other > 0 ? `${scale.other} 个 other` : ""].filter(Boolean).map((x) => `，${x}`).join("") + `（${running} 个在跑）：`;
 								return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 									"data-pane-ticket-crew": ticket.id,
