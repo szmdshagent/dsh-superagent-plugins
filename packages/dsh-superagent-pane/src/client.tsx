@@ -540,11 +540,9 @@ function crewLabels(lanes: CrewLane[]): Map<string, string> {
     for (const lane of lanes) if (lane.role === 'worker' && lane.leader === leader.lane) workerOrder.push(lane.lane)
   }
   for (const lane of lanes) if (lane.role === 'worker' && !workerOrder.includes(lane.lane)) workerOrder.push(lane.lane)
-  // 编号只给真正带下属的 leader；不带下属的统筹 lane（orchestrator / 空转 lead）叫 lead，
-  // 否则它会占掉 leader1 这个位置，让真正带人的 leader 全部后移一位。
-  const hasMembers = (lane: CrewLane) => lanes.some(item => item.role === 'worker' && item.leader === lane.lane)
-  let leaderNo = 0
-  for (const lane of leaders) labels.set(lane.lane, hasMembers(lane) ? `leader${++leaderNo}` : 'lead')
+  // 所有 leader 都编号（含 orchestrator 这个总任务切分 agent）：
+  // 统筹就是 leader，不因为「暂时没有下属」就被降级成别的东西。
+  leaders.forEach((lane, index) => labels.set(lane.lane, `leader${index + 1}`))
   workerOrder.forEach((lane, index) => labels.set(lane.lane, `ccw${index + 1}`))
   // 剩余两类：main（无协作时的工单 worker，只有一个）与 other（协作下的其它一切）。
   // other 不再起合成别名（oth-ccwN 看不出是谁），直接显示真实 lane 目录名，
