@@ -707,7 +707,7 @@ window.__ModuleLoader__.load({
 		* lane 目录名 → 显示名，按身份分属不同命名空间，互不撞名（2026-11-17 分细身份）：
 		*   leader → leader1/2…；worker → ccw1/2…（跨 leader 连续编号）
 		*   main → main（这张工单自己的 worker）
-		*   other → oth-ccw1/oth-ccw2…（other + Claude Code worker 的缩写组合）
+		*   other → 直接用真实 lane 目录名（main-verify / orchestrator / l1_w1…），owner 要求能看清是谁
 		*/
 		function crewLabels(lanes) {
 			const labels = /* @__PURE__ */ new Map();
@@ -720,11 +720,10 @@ window.__ModuleLoader__.load({
 			for (const lane of leaders) labels.set(lane.lane, hasMembers(lane) ? `leader${++leaderNo}` : "lead");
 			workerOrder.forEach((lane, index) => labels.set(lane.lane, `ccw${index + 1}`));
 			let mainN = 0;
-			let otherN = 0;
 			for (const lane of lanes) {
 				if (lane.role === "leader" || lane.role === "worker" || labels.has(lane.lane)) continue;
 				if (lane.role === "main") labels.set(lane.lane, mainN++ === 0 ? "main" : `main${mainN}`);
-				else labels.set(lane.lane, `oth-ccw${++otherN}`);
+				else labels.set(lane.lane, lane.lane);
 			}
 			return labels;
 		}
@@ -1392,12 +1391,13 @@ window.__ModuleLoader__.load({
 										lane.role !== "leader" && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 											style: {
 												flexShrink: 0,
-												width: 58,
 												fontWeight: 600,
 												fontFamily: "monospace",
+												minWidth: 58,
+												maxWidth: 140,
+												whiteSpace: "nowrap",
 												overflow: "hidden",
 												textOverflow: "ellipsis",
-												whiteSpace: "nowrap",
 												color: lane.state === "running" ? "#9ae6b4" : "#aaa"
 											},
 											title: lane.lane,

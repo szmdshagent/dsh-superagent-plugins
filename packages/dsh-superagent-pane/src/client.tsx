@@ -530,7 +530,7 @@ function laneLabel(name: string): string {
  * lane 目录名 → 显示名，按身份分属不同命名空间，互不撞名（2026-11-17 分细身份）：
  *   leader → leader1/2…；worker → ccw1/2…（跨 leader 连续编号）
  *   main → main（这张工单自己的 worker）
- *   other → oth-ccw1/oth-ccw2…（other + Claude Code worker 的缩写组合）
+ *   other → 直接用真实 lane 目录名（main-verify / orchestrator / l1_w1…），owner 要求能看清是谁
  */
 function crewLabels(lanes: CrewLane[]): Map<string, string> {
   const labels = new Map<string, string>()
@@ -547,13 +547,13 @@ function crewLabels(lanes: CrewLane[]): Map<string, string> {
   for (const lane of leaders) labels.set(lane.lane, hasMembers(lane) ? `leader${++leaderNo}` : 'lead')
   workerOrder.forEach((lane, index) => labels.set(lane.lane, `ccw${index + 1}`))
   // 剩余两类：main（无协作时的工单 worker，只有一个）与 other（协作下的其它一切）。
-  // other 的显示名用 other + Claude Code worker 的缩写组合成 oth-ccw1、oth-ccw2…，
-  // 与 ccwN 同族：既看得出是「另一类 worker」，也不会和 leader/ccw 混淆。
-  let mainN = 0; let otherN = 0
+  // other 不再起合成别名（oth-ccwN 看不出是谁），直接显示真实 lane 目录名，
+  // 名字列按内容自适应宽度，main-verify / orchestrator / l1_w1 这类名字可以完整读到。
+  let mainN = 0
   for (const lane of lanes) {
     if (lane.role === 'leader' || lane.role === 'worker' || labels.has(lane.lane)) continue
     if (lane.role === 'main') labels.set(lane.lane, mainN++ === 0 ? 'main' : `main${mainN}`)
-    else labels.set(lane.lane, `oth-ccw${++otherN}`)
+    else labels.set(lane.lane, lane.lane)
   }
   return labels
 }
@@ -1031,8 +1031,11 @@ function TicketBar({ ticket, activity, t, health, confirmStop, onClose, onCommen
               {badge.label}
             </span>
           })()}
-          {lane.role !== 'leader' && <span style={{ flexShrink: 0, width: 58, fontWeight: 600, fontFamily: 'monospace',
-            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+          {/* 名字列按内容自适应：普通 lane 名（main-verify / orchestrator / l1_w1）必须完整可见，
+              只有超过 140px 的极端长名才省略，hover 的 title 仍给完整名。 */}
+          {lane.role !== 'leader' && <span style={{ flexShrink: 0, fontWeight: 600, fontFamily: 'monospace',
+            minWidth: 58, maxWidth: 140, whiteSpace: 'nowrap',
+            overflow: 'hidden', textOverflow: 'ellipsis',
             color: lane.state === 'running' ? '#9ae6b4' : '#aaa' }}
             title={lane.lane}>{labels.get(lane.lane) ?? laneLabel(lane.lane)}</span>}
           <span style={{ flexShrink: 0, fontSize: 10, padding: '0 5px', borderRadius: 3,
