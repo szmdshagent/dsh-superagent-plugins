@@ -512,23 +512,23 @@ const ROLE_BADGE: Record<string, { label: string; hint: string; bg: string; fg: 
 }
 
 /**
- * lane 的显示名：统一叫 ccwN。
- * 历史 lane 目录名是 w1/w2（2026-11-11 之前的演示），显示时映射成 ccw1/ccw2，
- * 不改磁盘目录，避免破坏已有记录；新起的 lane 直接命名 ccwN。
+ * lane 的显示名：统一叫 minister N。
+ * 历史 lane 目录名是 w1/w2（2026-11-11 之前的演示），显示时映射成 minister1/minister2，
+ * 不改磁盘目录，避免破坏已有记录；新起的 lane 直接命名 minister N。
  */
 function laneLabel(name: string): string {
   const match = /^w(\d+)$/.exec(name)
-  return match ? `ccw${match[1]}` : name
+  return match ? `minister${match[1]}` : name
 }
 
 /**
  * lane 目录名 → 显示名（owner 口径，四种身份）：
- *   leader1/leader2…（统筹者，多 leader 按顺序）、ccw1/ccw2…（跨 leader 连续编号）、
+ *   leader → L1/L2…（统筹者，多 leader 按顺序）、minister → M1/M2…（跨 leader 连续编号）、
  *   main（无协作时工单自己的 worker）、other/other1…（协作下其余一切）
  */
 /**
  * lane 目录名 → 显示名，按身份分属不同命名空间，互不撞名（2026-11-17 分细身份）：
- *   leader → leader1/2…；worker → ccw1/2…（跨 leader 连续编号）
+ *   leader → L1/L2…；worker → M1/M2…（跨 leader 连续编号）
  *   main → main（这张工单自己的 worker）
  *   other → 直接用真实 lane 目录名（main-verify / orchestrator / l1_w1…），owner 要求能看清是谁
  */
@@ -545,9 +545,9 @@ function crewLabels(lanes: CrewLane[]): Map<string, string> {
   // 其余 leader 按顺序编号 leader1、leader2…
   let leaderNo = 0
   for (const lane of leaders) {
-    labels.set(lane.lane, lane.lane === 'orchestrator' ? '切分' : `l${++leaderNo}`)
+    labels.set(lane.lane, lane.lane === 'orchestrator' ? '切分' : `L${++leaderNo}`)
   }
-  workerOrder.forEach((lane, index) => labels.set(lane.lane, `w${index + 1}`))
+  workerOrder.forEach((lane, index) => labels.set(lane.lane, `M${index + 1}`))
   // 剩余两类：main（无协作时的工单 worker，只有一个）与 other（协作下的其它一切）。
   // other 不再起合成别名（oth-ccwN 看不出是谁），直接显示真实 lane 目录名，
   // 名字列按内容自适应宽度，main-verify / orchestrator / l1_w1 这类名字可以完整读到。
@@ -982,7 +982,7 @@ function TicketBar({ ticket, activity, t, health, confirmStop, onClose, onCommen
           }))
         }
         // 松散身份：不属于任何 leader，单独成段，段前有分隔标题
-        const looseLabel: Record<string, string> = { main: '工单自己的 worker', other: 'oth-ccw（非 leader / 非 ccworker）' }
+        const looseLabel: Record<string, string> = { main: '工单自己的 worker', other: 'oth-minister（非 leader / 非 minister）' }
         for (const lane of loose) {
           ordered.push({ lane, level: 1, section: looseLabel[lane.role ?? 'other'] ?? '其它' })
         }
@@ -990,12 +990,12 @@ function TicketBar({ ticket, activity, t, health, confirmStop, onClose, onCommen
         // 身份词与编号：图标表达身份，这段灰字表达「身份 + 编号」
         const kindName = lane.lane === 'orchestrator' ? '切分'
           : lane.role === 'leader' ? 'leader'
-          : lane.role === 'worker' ? 'ccw'
+          : lane.role === 'worker' ? 'minister'
           : lane.role === 'main' ? 'main' : 'other'
         const kindNo = labels.get(lane.lane) ?? ''
-        // 灰字 = 编号：leader 写 lN、队员写 wN（owner 口径）。
+        // 灰字 = 编号：leader 写 lN、队员写 MN（owner 口径）。
         // other 按具体身份命名，直接显示真实 lane 名；切分 / main 没有编号就不写。
-        const kindText = /^l\d+$|^w\d+$|^切分$/.test(kindNo) ? (kindNo === '切分' ? '' : kindNo)
+        const kindText = /^[LM]\d+$/.test(kindNo) ? kindNo
           : (lane.role === 'other' ? lane.lane : '')
         const kindHint = lane.role === 'leader' ? '统筹：分配任务并在末尾归纳自己那块'
           : lane.role === 'worker' ? `队员：归 ${labels.get(lane.leader ?? '') ?? lane.leader ?? '?'} 管辖`
@@ -1054,7 +1054,7 @@ function TicketBar({ ticket, activity, t, health, confirmStop, onClose, onCommen
                 background: role === 'leader' ? '#5c4600' : '#3d4a1f',
                 color: role === 'leader' ? '#ffd96a' : '#c8e08a',
                 border: '1px solid ' + (role === 'leader' ? '#8a6a00' : '#5e7030') }}>
-              {role === 'leader' ? '👑 leader' : '🎩 ccw'}
+              {role === 'leader' ? '👑 leader' : '🎩 minister'}
             </span>
             return <span data-pane-lane-role={lane.lane} title={badge.hint}
               style={{ flexShrink: 0, fontSize: 9.5, padding: '0 5px', borderRadius: 3, lineHeight: 1.5,
@@ -1073,7 +1073,7 @@ function TicketBar({ ticket, activity, t, health, confirmStop, onClose, onCommen
           {/* 名字列只给 main / other。
              规则（owner 2026-11-17）：other 之下不再细分角色，身份差异**由 lane 命名体现**
              （main-verify = 独立验收、w2 = 某次实验产物…），所以这里直接显示真实目录名。
-              leader/worker/切分 的「身份 + 编号」已由徽章和灰字说全，再写一次就成「1 ccw1」。 */}
+              leader/worker/切分 的「身份 + 编号」已由徽章和灰字说全，再写一次就成「1 W1」。 */}
           {lane.role === 'main' && <span style={{ flexShrink: 0, fontWeight: 600,
             fontFamily: 'monospace', minWidth: 58, maxWidth: 140, whiteSpace: 'nowrap',
             overflow: 'hidden', textOverflow: 'ellipsis',
