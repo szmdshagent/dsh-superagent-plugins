@@ -675,14 +675,14 @@ window.__ModuleLoader__.load({
 		*/
 		const ROLE_BADGE = {
 			main: {
-				label: "main",
+				label: "⏺",
 				hint: "这张工单自己的 worker（没有协作模式时由它执行）",
 				bg: "#1b2f52",
 				fg: "#9cc0f0",
 				border: "#2f4f7d"
 			},
 			other: {
-				label: "oth-ccw",
+				label: "·",
 				hint: "协作模式下既不是 leader 也不是 ccworker 的 Claude Code worker（如独立验收）",
 				bg: "#333",
 				fg: "#aaa",
@@ -1293,6 +1293,10 @@ window.__ModuleLoader__.load({
 								section: looseLabel[lane.role ?? "other"] ?? "其它"
 							});
 							return ordered.map(({ lane, level, first, last, section }) => {
+								const kindName = lane.lane === "orchestrator" ? "切分" : lane.role === "leader" ? "leader" : lane.role === "worker" ? "ccw" : lane.role === "main" ? "main" : "other";
+								const kindNo = labels.get(lane.lane) ?? "";
+								const kindText = kindName === "other" ? kindNo || lane.lane : kindNo.startsWith(kindName) ? kindNo : `${kindName} ${kindNo}`.trim();
+								const kindHint = lane.role === "leader" ? "统筹：分配任务并在末尾归纳自己那块" : lane.role === "worker" ? `队员：归 ${labels.get(lane.leader ?? "") ?? lane.leader ?? "?"} 管辖` : lane.lane === "orchestrator" ? "切分：只把总任务切块分给各 leader，不做末尾归纳" : lane.role === "main" ? "这张工单自己的 worker（无协作模式时）" : "协作模式下非 leader 非队员的 lane";
 								const indent = level === 2;
 								const op = laneOps[lane.lane];
 								return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
@@ -1370,9 +1374,9 @@ window.__ModuleLoader__.load({
 													color: "#c9b3f0",
 													border: "1px solid #5c4380"
 												},
-												children: "✂ 切分"
+												children: "✂"
 											});
-											if (role === "leader" || role === "worker" || !badge) return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+											if (role === "leader" || role === "worker" || !badge) return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 												"data-pane-lane-leader": lane.lane,
 												title: role === "leader" ? "这条 lane 是 leader（统筹），管辖受管辖的 cc-worker" : `这条 cc-worker 归 ${labels.get(lane.leader ?? "") ?? lane.leader} 管辖`,
 												style: {
@@ -1385,7 +1389,7 @@ window.__ModuleLoader__.load({
 													color: role === "leader" ? "#ffd96a" : "#c8e08a",
 													border: "1px solid " + (role === "leader" ? "#8a6a00" : "#5e7030")
 												},
-												children: ["👑", role === "leader" ? ` ${labels.get(lane.lane) ?? "leader"}` : ` ${labels.get(lane.lane) ?? "ccw"}`]
+												children: "👑"
 											});
 											return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 												"data-pane-lane-role": lane.lane,
@@ -1403,6 +1407,18 @@ window.__ModuleLoader__.load({
 												children: badge.label
 											});
 										})(),
+										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											"data-pane-lane-kind": lane.lane,
+											title: kindHint,
+											style: {
+												flexShrink: 0,
+												fontSize: 10,
+												opacity: .6,
+												fontFamily: "monospace",
+												whiteSpace: "nowrap"
+											},
+											children: kindText
+										}),
 										lane.role !== "leader" && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 											style: {
 												flexShrink: 0,
