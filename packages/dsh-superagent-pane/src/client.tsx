@@ -897,9 +897,10 @@ function TicketBar({ ticket, activity, t, health, confirmStop, onClose, onCommen
         const scale = crewScale(lanes)
         const labels = crewLabels(lanes)
         const team = scale.leaders > 0 || scale.managed > 0
-        const segments = scale.groups.map(group => `1-${group.count}`)
-        if (team && scale.unmanaged > 0) segments.push(String(scale.unmanaged))
-        const caption = team ? `👥 ${segments.join(',')}` : `👥 ${scale.unmanaged}`
+        // 0 人的分组不报「1-0」：leader 一个手下都没带时没有可报的组合，只剩散户数。
+        const segments = scale.groups.filter(group => group.count > 0).map(group => `1-${group.count}`)
+        if (team && segments.length > 0 && scale.unmanaged > 0) segments.push(String(scale.unmanaged))
+        const caption = segments.length > 0 ? `👥 ${segments.join(',')}` : `👥 ${scale.unmanaged}`
         const summary = (team
           ? `这张工单下 ${scale.groups.map(group => `${labels.get(group.leader) ?? group.leader} 带 ${group.count} 个 cc-worker`).join('，')}`
           : `这张工单下有 ${scale.unmanaged} 条 lane`)
