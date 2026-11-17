@@ -135,5 +135,14 @@ type CrewLaneView = {
   /** 这条 lane 归谁管辖（team 模式下是 lead 的名字）；不受管辖时没有该字段。 */
   leader?: string;
 };
+/**
+ * 把 team-plan 里的派活原文压成约 10-14 个汉字的一行任务登记。
+ *
+ * 派活原文通常长这样：`统计 /tmp/x/A 的文件数（只读）。做法：… 验收：… 禁止：…`，
+ * 面板只需要第一句「要做什么」：取第一个完整短句、去掉括号里的补充说明、
+ * 把长路径压成末段（既保留 A/B/C 这种区分词，又不让路径吃掉整行预算），
+ * 仍然超长就在词边界截断并加省略号。
+ */
+declare function summarizeTask(text: string): string;
 declare function apply(ctx: Context): void;
-export { CrewLaneView, LaneRole, PaneMode, apply, inject, name, paneTrigger };
+export { CrewLaneView, LaneRole, PaneMode, apply, inject, name, paneTrigger, summarizeTask };

@@ -917,7 +917,7 @@ window.__ModuleLoader__.load({
 		/** 状态条里的圆点：运行中呼吸闪烁，其余静态。 */
 		const DOT_STYLE = `.dsh-pane-dot-running{animation:dsh-pane-pulse 1.6s ease-in-out infinite}@keyframes dsh-pane-pulse{0%,100%{opacity:1}50%{opacity:.35}}`;
 		/** 对话上方的一条工单状态条：哪个工单、到哪一步、worker 此刻在做什么（说人话，详情可展开原始命令）。 */
-		function TicketBar({ ticket, activity, t, ccStatus, ccExpanded, onToggleCc, onInterrupt, onClear, ccBusy, health, confirmStop, onClose, onComment, onOpenComment, crew, lanePick, laneStatus, onPickLane }) {
+		function TicketBar({ ticket, activity, t, health, confirmStop, onClose, onComment, onOpenComment, crew, lanePick, laneStatus, onPickLane }) {
 			const [open, setOpen] = (0, react.useState)(false);
 			const stage = ticket.stage ?? "ended";
 			const zombie = health?.health === "zombie";
@@ -1326,14 +1326,6 @@ window.__ModuleLoader__.load({
 							opacity: .85
 						},
 						children: work.raw
-					}),
-					expanded && !(crew ?? []).some((lane) => lane.lane === lanePick) && /* @__PURE__ */ (0, react_jsx_runtime.jsx)(CcPanel, {
-						status: ccStatus,
-						expanded: ccExpanded,
-						onToggle: onToggleCc,
-						onInterrupt,
-						onClear,
-						busy: ccBusy
 					}),
 					zombie && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 						style: {
@@ -2100,9 +2092,6 @@ window.__ModuleLoader__.load({
 			const [crew, setCrew] = (0, react.useState)(null);
 			const [tickets, setTickets] = (0, react.useState)([]);
 			const [activities, setActivities] = (0, react.useState)({});
-			const [ccStatuses, setCcStatuses] = (0, react.useState)({});
-			const [ccExpanded, setCcExpanded] = (0, react.useState)(false);
-			const [ccBusy, setCcBusy] = (0, react.useState)(false);
 			/** 每张工单在协作分工里选中查看的 lane（点行选中，再点同一行取消）。 */
 			const [lanePicks, setLanePicks] = (0, react.useState)({});
 			/** 被选中 lane 的实况，键是「工单 id:lane」，与工单级聚合互不影响。 */
@@ -2305,15 +2294,6 @@ window.__ModuleLoader__.load({
 						if (info?.activity) next[item.sessionId] = info.activity;
 					} catch {}
 					setActivities(next);
-					const cc = {};
-					for (const item of list) {
-						if (!item.id) continue;
-						try {
-							const info = await request(`${API}/cc/${encodeURIComponent(item.id)}`);
-							if (info?.cc) cc[item.id] = info.cc;
-						} catch {}
-					}
-					setCcStatuses(cc);
 					const hs = {};
 					for (const item of list) {
 						if (!item.id) continue;
@@ -2399,19 +2379,6 @@ window.__ModuleLoader__.load({
 					clearInterval(timer);
 				};
 			}, [laneKey]);
-			/** 中止请求：写 interrupt 标记并立刻刷新一次。 */
-			const ccCommand = (0, react.useCallback)(async (ticketId, action) => {
-				setCcBusy(true);
-				try {
-					await call(`/cc/${encodeURIComponent(ticketId)}/${action}`, {
-						method: "POST",
-						body: "{}"
-					});
-					await pollStatus();
-				} catch {} finally {
-					setCcBusy(false);
-				}
-			}, [pollStatus]);
 			/**
 			* 关闭一张工单卡。已结束的直接收起（记进名单，不动工单）；进行中的先停止——两步确认，
 			* 第一次点击变成「确认停止？」，5 秒没有下文自动还原，再点一次才真的停，避免误杀正在跑的 worker。
@@ -2632,20 +2599,10 @@ window.__ModuleLoader__.load({
 							crew: crew?.items.find((item) => item.ticketId === ticket.id)?.lanes,
 							activity: ticket.sessionId ? activities[ticket.sessionId] ?? null : null,
 							t,
-							ccStatus: ccStatuses[ticket.id] ?? null,
-							ccExpanded,
 							lanePick: lanePicks[ticket.id],
 							laneStatus: lanePicks[ticket.id] ? laneStatuses[`${ticket.id}:${lanePicks[ticket.id]}`] ?? null : null,
 							onPickLane: (lane) => pickLane(ticket.id, lane),
 							health: healths[ticket.id] ?? null,
-							onToggleCc: () => setCcExpanded((value) => !value),
-							ccBusy,
-							onInterrupt: () => {
-								ccCommand(ticket.id, "interrupt");
-							},
-							onClear: () => {
-								ccCommand(ticket.id, "clear");
-							},
 							onComment: commentOnTicket,
 							onOpenComment: (ticket) => {
 								setConversation(commentConversation(ticket.id));

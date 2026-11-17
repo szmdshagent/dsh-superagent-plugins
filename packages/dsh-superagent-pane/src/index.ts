@@ -391,7 +391,38 @@ export type CrewLaneView = {
   leader?: string
 }
 
-function readLanes(dir: string): CrewLaneView[] {
+/**
+ * 把 team-plan 里的派活原文压成约 10-14 个汉字的一行任务登记。
+ *
+ * 派活原文通常长这样：`统计 /tmp/x/A 的文件数（只读）。做法：… 验收：… 禁止：…`，
+ * 面板只需要第一句「要做什么」：取第一个完整短句、去掉括号里的补充说明、
+ * 把长路径压成末段（既保留 A/B/C 这种区分词，又不让路径吃掉整行预算），
+ * 仍然超长就在词边界截断并加省略号。
+ */
+export function summarizeTask(text: string): string {
+  const flat = String(text ?? '')
+    .replace(/`/g, '')
+    .replace(/[（(][^）)]*[）)]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!flat) return ''
+  const sentences = flat.split(/[。！？；;\n]/).map(part => part.trim()).filter(part => part.length >= 4)
+  // 摘要要的是「10-14 个汉字」，所以优先挑第一个中文短句：派活原文常以英文工单标题开头，
+  // 直接取第一句会把整行占满英文。整段没有中文时才退回第一句。
+  const first = sentences.find(part => /[一-鿿]/.test(part)) ?? sentences[0] ?? flat
+  // 路径只留末段：/tmp/crew-demo/A → A；/home/szm/src/dsh-pane → dsh-pane
+  const line = first.replace(/[A-Za-z0-9_.~\-]*(?:\/[A-Za-z0-9_.~\-]+)+/g,
+    token => token.split('/').filter(Boolean).pop() ?? token).trim()
+  if (!line) return ''
+  const chars = [...line]
+  const limit = 14
+  if (chars.length <= limit + 2) return line
+  const head = chars.slice(0, limit + 2).join('')
+  const cut = Math.max(head.lastIndexOf(' '), head.lastIndexOf('、'), head.lastIndexOf('，'))
+  return cut > 4 ? `${head.slice(0, cut)}…` : `${chars.slice(0, limit).join('')}…`
+}
+
+function readLanes(dir: string, ownTask = ''): CrewLaneView[] {
   if (!dir) return []
   const out: CrewLaneView[] = []
   const root = join(dir, '.cc-worker')
@@ -426,54 +457,51 @@ function readLanes(dir: string): CrewLaneView[] {
       return readFileSync(`/proc/${pid}/cmdline`, 'utf8').includes('claude')
     } catch { return false }
   }
-  // 行内任务文本分三种情况（owner 口径）：
-  //   在跑 → 实时当前步「第 N 步 · 工具: 详情」；
-  //   空闲但跑过 → 最近任务的一行短概括（约 14 个汉字，超出加省略号）；
-  //   从没跑过 / 没有任何输出 → 「没输出」。
-  // 日志读取复用 ccvis（runs/<时间戳>.jsonl 增量尾部缓存），轮询时跟着面板刷新。
-  const clipText = (text: string, max: number): string => {
-    const one = text.replace(/\s+/g, ' ').trim()
-    return one.length > max ? `${one.slice(0, max)}…` : one
+  // 任务登记（owner 口径，2026-11-17）：行内只显示「这名队员被分配的任务」的短概括，
+  // 不再显示实时命令步，也不再用「最近一步做了什么」倒推。数据源就是 team-plan.json 里该 lane 的 task
+  // （main 用 .cc-worker/task.txt，那是这张工单自己的派活原文）；没有分配任务 → 「没输出」。
+  const assignedTasks = (): Map<string, string> => {
+    const map = new Map<string, string>()
+    try {
+      const data: any = JSON.parse(readFileSync(join(root, 'team-plan.json'), 'utf8'))
+      const entries: any[] = Array.isArray(data)
+        ? data
+        : data && typeof data === 'object'
+          ? Object.values(data).flatMap(members => (Array.isArray(members) ? members : []))
+          : []
+      for (const entry of entries) {
+        const lane = typeof entry?.lane === 'string' ? entry.lane.trim() : typeof entry === 'string' ? entry.trim() : ''
+        if (lane) map.set(lane, typeof entry?.task === 'string' ? entry.task : '')
+      }
+    } catch { /* 没有或坏文件：没有分配任务 */ }
+    return map
   }
-  // team 派活时 cc-worker 写入 lanes/<name>/task.txt，是「它负责什么」的静态登记。
-  const registeredTask = (base: string): string => {
+  const registered = (base: string): string => {
     try { return readFileSync(join(base, 'task.txt'), 'utf8') } catch { return '' }
   }
-  const taskOf = (base: string, lane: string, state: 'running' | 'idle'): string => {
-    try {
-      const cc = readCcStatus(dir, lane)
-      if (!cc.present) return '没输出'
-      const last = cc.current ?? cc.steps[cc.steps.length - 1]
-      // 只有真在跑（模型思考/执行中）才给实时步骤；进程活着但已出结果 = 等下一单，按空闲概括。
-      const active = state === 'running' && (cc.state === 'running' || cc.state === 'thinking')
-      if (active) {
-        if (last) return clipText(`第 ${last.step} 步 · ${last.tool ?? '工具'}${last.detail ? `: ${last.detail}` : ''}`, 160)
-        if (cc.state === 'error') return '执行报错'
-        if (cc.state === 'done') return '已完成'
-        return cc.state === 'running' ? '执行中' : '思考中'
-      }
-      if (cc.state === 'error') return '执行报错'
-      // 空闲但跑过：优先任务登记，其次最近一步的动作，压成一行短概括而不是「空闲」。
-      const source = registeredTask(base) || last?.detail || last?.tool || ''
-      return source ? clipText(source, 14) : '没输出'
-    } catch { return '没输出' }
+  // main 行代表这张工单自己的 worker：.cc-worker/task.txt 只有派活时带了 --task 才有，
+  // 更多时候真正的「被分配任务」在工单上（execution.assignment 的路由备注，或派活消息原文），由调用方传进来。
+  const taskOf = (base: string, lane: string, assigned: Map<string, string>, ownTask = ''): string => {
+    const source = assigned.get(lane) || registered(base) || (lane === 'main' ? ownTask : '')
+    return summarizeTask(source) || '没输出'
   }
-  const view = (base: string, lane: string, state: 'running' | 'idle', role: LaneRole, leader?: string): CrewLaneView =>
-    ({ lane, state, task: taskOf(base, lane, state), role, ...(role === 'worker' && leader ? { leader } : {}) })
+  const view = (base: string, lane: string, state: 'running' | 'idle', role: LaneRole, assigned: Map<string, string>, ownTask: string, leader?: string): CrewLaneView =>
+    ({ lane, state, task: taskOf(base, lane, assigned, ownTask), role, ...(role === 'worker' && leader ? { leader } : {}) })
   try {
     const plan = planned()
+    const assigned = assignedTasks()
     const leaderOf = (lane: string): string | undefined => {
       for (const [leader, members] of plan) if (members.includes(lane)) return leader
       return undefined
     }
-    if (alive(root)) out.push(view(root, 'main', 'running', 'other'))
+    if (alive(root)) out.push(view(root, 'main', 'running', 'other', assigned, ownTask))
     for (const name of readdirSync(join(root, 'lanes'), { withFileTypes: true })) {
       if (!name.isDirectory()) continue
       const base = join(root, 'lanes', name.name)
       // 名为 lead 的 lane 仍是历史约定里的统筹 lane，即使没有 team-plan 也按 leader 显示。
       const leader = leaderOf(name.name)
       const role: LaneRole = name.name === 'lead' || plan.has(name.name) ? 'lead' : leader ? 'worker' : 'other'
-      out.push(view(base, name.name, alive(base) ? 'running' : 'idle', role, leader))
+      out.push(view(base, name.name, alive(base) ? 'running' : 'idle', role, assigned, ownTask, leader))
     }
   } catch { /* 目录不存在或不可读：没有 lane */ }
   return out
@@ -1186,7 +1214,12 @@ function paneHandler(ctx: any) {
             const dir = String(ticket.execution?.directory ?? '')
             // 一张工单下的协作 lane：main 是传统单 worker，lanes/* 是 --lane 起的并行 worker。
             // 已结束的工单只有留下 lane 目录（真协作过）才上报，避免几百张历史单刷屏。
-            const lanes = readLanes(dir)
+            // main 行 = 这张工单自己的 worker：它「被分配的任务」就是工单本身。
+            // execution.assignment 是执行器收到的任务正文（派活路由备注/消息原文），没有时退回标题。
+            const ownTask = typeof ticket.execution?.assignment === 'string' && ticket.execution.assignment.trim()
+              ? ticket.execution.assignment
+              : String(ticket.title ?? '')
+            const lanes = readLanes(dir, ownTask)
             const ended = !!ticket?.ended
             if (ended && lanes.length === 0) continue
             live.push({

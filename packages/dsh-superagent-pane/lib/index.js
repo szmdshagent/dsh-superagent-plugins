@@ -929,7 +929,28 @@ async function collectExecutorSignals(ctx, ticket) {
 	} catch {}
 	return signals;
 }
-function readLanes(dir) {
+/**
+* 把 team-plan 里的派活原文压成约 10-14 个汉字的一行任务登记。
+*
+* 派活原文通常长这样：`统计 /tmp/x/A 的文件数（只读）。做法：… 验收：… 禁止：…`，
+* 面板只需要第一句「要做什么」：取第一个完整短句、去掉括号里的补充说明、
+* 把长路径压成末段（既保留 A/B/C 这种区分词，又不让路径吃掉整行预算），
+* 仍然超长就在词边界截断并加省略号。
+*/
+function summarizeTask(text) {
+	const flat = String(text ?? "").replace(/`/g, "").replace(/[（(][^）)]*[）)]/g, " ").replace(/\s+/g, " ").trim();
+	if (!flat) return "";
+	const sentences = flat.split(/[。！？；;\n]/).map((part) => part.trim()).filter((part) => part.length >= 4);
+	const line = (sentences.find((part) => /[一-鿿]/.test(part)) ?? sentences[0] ?? flat).replace(/[A-Za-z0-9_.~\-]*(?:\/[A-Za-z0-9_.~\-]+)+/g, (token) => token.split("/").filter(Boolean).pop() ?? token).trim();
+	if (!line) return "";
+	const chars = [...line];
+	const limit = 14;
+	if (chars.length <= 16) return line;
+	const head = chars.slice(0, 16).join("");
+	const cut = Math.max(head.lastIndexOf(" "), head.lastIndexOf("、"), head.lastIndexOf("，"));
+	return cut > 4 ? `${head.slice(0, cut)}…` : `${chars.slice(0, limit).join("")}…`;
+}
+function readLanes(dir, ownTask = "") {
 	if (!dir) return [];
 	const out = [];
 	const root = join(dir, ".cc-worker");
@@ -959,54 +980,48 @@ function readLanes(dir) {
 			return false;
 		}
 	};
-	const clipText = (text, max) => {
-		const one = text.replace(/\s+/g, " ").trim();
-		return one.length > max ? `${one.slice(0, max)}…` : one;
+	const assignedTasks = () => {
+		const map = /* @__PURE__ */ new Map();
+		try {
+			const data = JSON.parse(readFileSync(join(root, "team-plan.json"), "utf8"));
+			const entries = Array.isArray(data) ? data : data && typeof data === "object" ? Object.values(data).flatMap((members) => Array.isArray(members) ? members : []) : [];
+			for (const entry of entries) {
+				const lane = typeof entry?.lane === "string" ? entry.lane.trim() : typeof entry === "string" ? entry.trim() : "";
+				if (lane) map.set(lane, typeof entry?.task === "string" ? entry.task : "");
+			}
+		} catch {}
+		return map;
 	};
-	const registeredTask = (base) => {
+	const registered = (base) => {
 		try {
 			return readFileSync(join(base, "task.txt"), "utf8");
 		} catch {
 			return "";
 		}
 	};
-	const taskOf = (base, lane, state) => {
-		try {
-			const cc = readCcStatus(dir, lane);
-			if (!cc.present) return "没输出";
-			const last = cc.current ?? cc.steps[cc.steps.length - 1];
-			if (state === "running" && (cc.state === "running" || cc.state === "thinking")) {
-				if (last) return clipText(`第 ${last.step} 步 · ${last.tool ?? "工具"}${last.detail ? `: ${last.detail}` : ""}`, 160);
-				if (cc.state === "error") return "执行报错";
-				if (cc.state === "done") return "已完成";
-				return cc.state === "running" ? "执行中" : "思考中";
-			}
-			if (cc.state === "error") return "执行报错";
-			const source = registeredTask(base) || last?.detail || last?.tool || "";
-			return source ? clipText(source, 14) : "没输出";
-		} catch {
-			return "没输出";
-		}
+	const taskOf = (base, lane, assigned, ownTask = "") => {
+		return summarizeTask(assigned.get(lane) || registered(base) || (lane === "main" ? ownTask : "")) || "没输出";
 	};
-	const view = (base, lane, state, role, leader) => ({
+	const view = (base, lane, state, role, assigned, ownTask, leader) => ({
 		lane,
 		state,
-		task: taskOf(base, lane, state),
+		task: taskOf(base, lane, assigned, ownTask),
 		role,
 		...role === "worker" && leader ? { leader } : {}
 	});
 	try {
 		const plan = planned();
+		const assigned = assignedTasks();
 		const leaderOf = (lane) => {
 			for (const [leader, members] of plan) if (members.includes(lane)) return leader;
 		};
-		if (alive(root)) out.push(view(root, "main", "running", "other"));
+		if (alive(root)) out.push(view(root, "main", "running", "other", assigned, ownTask));
 		for (const name of readdirSync(join(root, "lanes"), { withFileTypes: true })) {
 			if (!name.isDirectory()) continue;
 			const base = join(root, "lanes", name.name);
 			const leader = leaderOf(name.name);
 			const role = name.name === "lead" || plan.has(name.name) ? "lead" : leader ? "worker" : "other";
-			out.push(view(base, name.name, alive(base) ? "running" : "idle", role, leader));
+			out.push(view(base, name.name, alive(base) ? "running" : "idle", role, assigned, ownTask, leader));
 		}
 	} catch {}
 	return out;
@@ -1736,7 +1751,7 @@ function paneHandler(ctx) {
 						const assignments = Array.isArray(ticket.assignments) ? ticket.assignments : [];
 						const last = assignments.length ? assignments[assignments.length - 1] : void 0;
 						const state = String(last?.state ?? "idle");
-						const lanes = readLanes(String(ticket.execution?.directory ?? ""));
+						const lanes = readLanes(String(ticket.execution?.directory ?? ""), typeof ticket.execution?.assignment === "string" && ticket.execution.assignment.trim() ? ticket.execution.assignment : String(ticket.title ?? ""));
 						const ended = !!ticket?.ended;
 						if (ended && lanes.length === 0) continue;
 						live.push({
@@ -2301,4 +2316,4 @@ function apply(ctx) {
 		};
 	}, "pane: scheduled dispatch");
 }
-export { apply, inject, name, paneTrigger };
+export { apply, inject, name, paneTrigger, summarizeTask };

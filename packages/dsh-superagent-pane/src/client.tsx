@@ -712,7 +712,7 @@ function workSummary(t: Translate, activity: Activity): WorkSummary {
 const DOT_STYLE = `.dsh-pane-dot-running{animation:dsh-pane-pulse 1.6s ease-in-out infinite}@keyframes dsh-pane-pulse{0%,100%{opacity:1}50%{opacity:.35}}`
 
 /** 对话上方的一条工单状态条：哪个工单、到哪一步、worker 此刻在做什么（说人话，详情可展开原始命令）。 */
-function TicketBar({ ticket, activity, t, ccStatus, ccExpanded, onToggleCc, onInterrupt, onClear, ccBusy, health, confirmStop, onClose, onComment, onOpenComment, crew, lanePick, laneStatus, onPickLane }: {
+function TicketBar({ ticket, activity, t, health, confirmStop, onClose, onComment, onOpenComment, crew, lanePick, laneStatus, onPickLane }: {
   ticket: Ticket; activity: Activity | null; t: Translate
   /** 本工单的协作 lane（来自 /crew）；没有或读不到时 undefined。 */
   crew?: CrewLane[]
@@ -722,8 +722,6 @@ function TicketBar({ ticket, activity, t, ccStatus, ccExpanded, onToggleCc, onIn
   laneStatus?: CcStatus | null
   /** 点击协作分工的行：选中该 lane；再点同一行则取消选择。 */
   onPickLane?: (lane: string) => void
-  ccStatus: CcStatus | null; ccExpanded: boolean
-  onToggleCc: () => void; onInterrupt: () => void; onClear: () => void; ccBusy: boolean
   health?: Health | null; confirmStop: boolean; onClose: () => void
   onComment?: (ticket: Ticket, text: string) => Promise<void>
   onOpenComment?: (ticket: Ticket) => void
@@ -919,11 +917,9 @@ function TicketBar({ ticket, activity, t, ccStatus, ccExpanded, onToggleCc, onIn
     </div>}
     {expanded && open && work?.raw && <div style={{ fontFamily: 'monospace', fontSize: 11, whiteSpace: 'pre-wrap', wordBreak: 'break-word',
       maxHeight: 140, overflowY: 'auto', background: 'rgba(0,0,0,.25)', padding: '6px 8px', borderRadius: 4, opacity: 0.85 }}>{work.raw}</div>}
-    {/* 选中某条 lane 时，成员详情已经是唯一的 CC 状态来源；这里再渲染工单级块就会同一状态显示两次
-        （main 更是同一份数据）。没选中（或选中的 lane 已不在分工里）时照旧显示工单级聚合。 */}
-    {expanded && !(crew ?? []).some(lane => lane.lane === lanePick) &&
-      <CcPanel status={ccStatus} expanded={ccExpanded} onToggle={onToggleCc}
-        onInterrupt={onInterrupt} onClear={onClear} busy={ccBusy} />}
+    {/* 工单级 CC 块已删除（owner 决定 2026-11-17）：它和成员行详情是同一份状态，重复显示。
+        唯一的「Claude Code 执行实况」入口是点开某个成员行后展开的那条 lane 自己的进度。
+        main 行代表工单自己的 worker，要看待工单级实况就点 main 行。 */}
     {zombie && <div style={{ color: '#e53e3e', fontSize: 11 }}>⚠ {health?.detail ?? '执行器卡死，新消息投进去出不来。建议停止该工单后重新派活。'}</div>}
     {/* 展开态就是「展开看全文」：摘要框限高 + 框内滚轮下滑，卡片自身负责折叠。
         运行中（working）也显示已有 summary——worker 在跑不代表报告内容不该看。 */}
@@ -1419,9 +1415,6 @@ function PanePanel({ t }: { t: Translate }) {
   const [crew, setCrew] = useState<Crew | null>(null)
   const [tickets, setTickets] = useState<Ticket[]>([])
   const [activities, setActivities] = useState<Record<string, Activity>>({})
-  const [ccStatuses, setCcStatuses] = useState<Record<string, CcStatus>>({})
-  const [ccExpanded, setCcExpanded] = useState(false)
-  const [ccBusy, setCcBusy] = useState(false)
   /** 每张工单在协作分工里选中查看的 lane（点行选中，再点同一行取消）。 */
   const [lanePicks, setLanePicks] = useState<Record<string, string>>({})
   /** 被选中 lane 的实况，键是「工单 id:lane」，与工单级聚合互不影响。 */
@@ -1642,16 +1635,6 @@ function PanePanel({ t }: { t: Translate }) {
         }
       }
       setActivities(next)
-      // Claude Code 的执行实况：每个工单单独读，失败不影响工单本身。
-      const cc: Record<string, CcStatus> = {}
-      for (const item of list) {
-        if (!item.id) continue
-        try {
-          const info = await request(`${API}/cc/${encodeURIComponent(item.id)}`)
-          if (info?.cc) cc[item.id] = info.cc as CcStatus
-        } catch { /* 读不到就当作没有委托 */ }
-      }
-      setCcStatuses(cc)
       // 真实健康度：识别假 idle 的僵尸工单。
       const hs: Record<string, Health> = {}
       for (const item of list) {
@@ -1725,15 +1708,6 @@ function PanePanel({ t }: { t: Translate }) {
     const timer = setInterval(() => { if (live) void read() }, 2500)
     return () => { live = false; clearInterval(timer) }
   }, [laneKey])
-
-  /** 中止请求：写 interrupt 标记并立刻刷新一次。 */
-  const ccCommand = useCallback(async (ticketId: string, action: 'interrupt' | 'clear') => {
-    setCcBusy(true)
-    try {
-      await call(`/cc/${encodeURIComponent(ticketId)}/${action}`, { method: 'POST', body: '{}' })
-      await pollStatus()
-    } catch { /* 失败就保持现状，下一轮轮询会如实反映 */ } finally { setCcBusy(false) }
-  }, [pollStatus])
 
   /**
    * 关闭一张工单卡。已结束的直接收起（记进名单，不动工单）；进行中的先停止——两步确认，
@@ -1843,15 +1817,10 @@ function PanePanel({ t }: { t: Translate }) {
         <TicketBar key={ticket.id} ticket={ticket}
           crew={crew?.items.find(item => item.ticketId === ticket.id)?.lanes}
           activity={ticket.sessionId ? activities[ticket.sessionId] ?? null : null} t={t}
-          ccStatus={ccStatuses[ticket.id] ?? null} ccExpanded={ccExpanded}
           lanePick={lanePicks[ticket.id]}
           laneStatus={lanePicks[ticket.id] ? laneStatuses[`${ticket.id}:${lanePicks[ticket.id]}`] ?? null : null}
           onPickLane={lane => pickLane(ticket.id, lane)}
           health={healths[ticket.id] ?? null}
-          onToggleCc={() => setCcExpanded(value => !value)}
-          ccBusy={ccBusy}
-          onInterrupt={() => { void ccCommand(ticket.id, 'interrupt') }}
-          onClear={() => { void ccCommand(ticket.id, 'clear') }}
           onComment={commentOnTicket}
           onOpenComment={ticket => { setConversation(commentConversation(ticket.id)); setItems([]) }}
           confirmStop={confirmStop === ticket.id}
