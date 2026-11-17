@@ -540,7 +540,11 @@ function crewLabels(lanes: CrewLane[]): Map<string, string> {
     for (const lane of lanes) if (lane.role === 'worker' && lane.leader === leader.lane) workerOrder.push(lane.lane)
   }
   for (const lane of lanes) if (lane.role === 'worker' && !workerOrder.includes(lane.lane)) workerOrder.push(lane.lane)
-  leaders.forEach((lane, index) => labels.set(lane.lane, `leader${index + 1}`))
+  // 编号只给真正带下属的 leader；不带下属的统筹 lane（orchestrator / 空转 lead）叫 lead，
+  // 否则它会占掉 leader1 这个位置，让真正带人的 leader 全部后移一位。
+  const hasMembers = (lane: CrewLane) => lanes.some(item => item.role === 'worker' && item.leader === lane.lane)
+  let leaderNo = 0
+  for (const lane of leaders) labels.set(lane.lane, hasMembers(lane) ? `leader${++leaderNo}` : 'lead')
   workerOrder.forEach((lane, index) => labels.set(lane.lane, `ccw${index + 1}`))
   // 剩余两类：main（无协作时的工单 worker，只有一个）与 other（协作下的其它一切）。
   // other 的显示名用 other + Claude Code worker 的缩写组合成 oth-ccw1、oth-ccw2…，
@@ -624,6 +628,27 @@ type Translate = (key: keyof typeof zh, values?: Record<string, string>) => stri
  * 治理面板没装或读不到时不补：面板按「没有 leader」显示，不报错。
  */
 type LaneRoleMap = Record<string, Record<string, { role?: 'leader' | 'worker' | 'main' | 'other'; leader?: string }>>
+
+/**
+ * 角色名归一化：把各种历史/服务端叫法收敛到四类。
+ *   lead / leadx / orchestrator / verifier(统筹侧) → leader
+ *   worker                                          → worker
+ *   main                                            → main
+ *   其余（verifier / other / 未知）                  → other
+ * 「未知一律 other」而不是「未知一律保留」，是为了让类型始终落在四类里，渲染分支不会漏。
+ */
+function normalizeRole(role: unknown): 'leader' | 'worker' | 'main' | 'other' {
+  const value = typeof role === 'string' ? role.trim().toLowerCase() : ''
+  if (value === 'leader' || value === 'lead' || value === 'orchestrator') return 'leader'
+  if (value === 'worker' || value === 'ccw') return 'worker'
+  if (value === 'main') return 'main'
+  return 'other'
+}
+
+/** 把一条 lane 的 role 归一化；没有 role 字段时保持缺失（交给兜底来源补）。 */
+function normalizeLane(lane: CrewLane): CrewLane {
+  return lane.role === undefined ? lane : { ...lane, role: normalizeRole(lane.role) }
+}
 let governanceRoles: { at: number; map: LaneRoleMap } | null = null
 async function rolesFromGovernance(): Promise<LaneRoleMap> {
   if (governanceRoles && Date.now() - governanceRoles.at < 60_000) return governanceRoles.map
@@ -632,10 +657,8 @@ async function rolesFromGovernance(): Promise<LaneRoleMap> {
   for (const lane of Array.isArray(body?.lanes) ? body.lanes : []) {
     const dir = typeof lane?.ticket === 'string' ? lane.ticket : ''
     const suffix = dir.split('-').pop() ?? ''
-    // 治理面板可能给旧口径（lead/worker/other）：lead 一律归一成 leader，其它原样认
-    const raw = lane?.role
-    const role = raw === 'leader' || raw === 'lead' ? 'leader'
-      : raw === 'worker' || raw === 'main' ? raw : 'other'
+    // 治理面板可能给旧口径（lead/worker/other）：统一走归一化，lead→leader
+    const role = normalizeRole(lane?.role)
     if (!suffix || typeof lane?.lane !== 'string') continue
     map[suffix] ??= {}
     map[suffix]![lane.lane] = role === 'worker' ? { role, leader: 'lead' } : { role }
@@ -650,7 +673,10 @@ function withLaneRoles(body: Crew, map: LaneRoleMap): Crew {
     items: body.items.map(item => {
       const suffix = item.ticketId.slice(0, 12)
       const per = map[suffix] ?? {}
-      return { ...item, lanes: (item.lanes ?? []).map(lane => lane.role ? lane : { ...lane, ...(per[lane.lane] ?? {}) }) }
+      return { ...item, lanes: (item.lanes ?? []).map(lane => {
+        const merged = lane.role ? lane : { ...lane, ...(per[lane.lane] ?? {}) }
+        return normalizeLane(merged)
+      }) }
     }),
   }
 }
@@ -1627,10 +1653,11 @@ function PanePanel({ t }: { t: Translate }) {
           if (needsRoles) {
             const map = await rolesFromGovernance().catch(() => null)
             if (!alive) return
-            setCrew(map ? withLaneRoles(body, map) : body)
+            setCrew(map ? withLaneRoles(body, map)
+              : { ...body, items: (body.items ?? []).map(item => ({ ...item, lanes: (item.lanes ?? []).map(normalizeLane) })) })
             return
           }
-          setCrew(body)
+          setCrew({ ...body, items: (body.items ?? []).map(item => ({ ...item, lanes: (item.lanes ?? []).map(normalizeLane) })) })
         })
         .catch(() => { /* 读不到就保持上次 */ })
     }
