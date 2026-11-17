@@ -547,7 +547,10 @@ function crewLabels(lanes: CrewLane[]): Map<string, string> {
   for (const lane of leaders) {
     labels.set(lane.lane, lane.lane === 'orchestrator' ? '切分' : `L${++leaderNo}`)
   }
-  workerOrder.forEach((lane, index) => labels.set(lane.lane, `M${index + 1}`))
+  // workerOrder 存的是 lane 名字（string），这里必须直接拿 name 当 key。
+  // 曾经写成 labels.set(lane.lane, ...) —— 字符串的 .lane 是 undefined，
+  // 编号全被写进 labels[undefined]，于是 leader 有 L1、minister 却一个 M 号都不显示。
+  workerOrder.forEach((name, index) => labels.set(name, `M${index + 1}`))
   // 剩余两类：main（无协作时的工单 worker，只有一个）与 other（协作下的其它一切）。
   // other 不再起合成别名（oth-ccwN 看不出是谁），直接显示真实 lane 目录名，
   // 名字列按内容自适应宽度，main-verify / orchestrator / l1_w1 这类名字可以完整读到。
