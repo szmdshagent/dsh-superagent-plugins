@@ -985,11 +985,10 @@ function TicketBar({ ticket, activity, t, health, confirmStop, onClose, onCommen
           : lane.role === 'worker' ? 'ccw'
           : lane.role === 'main' ? 'main' : 'other'
         const kindNo = labels.get(lane.lane) ?? ''
-        // leader1 / ccw3 这类已含身份词，直接用；other 类显示真实 lane 名
-        // 身份英文已在徽标里（👑 leader / 🎩 ccw），灰字只负责编号：
-        // leader1 -> 1、ccw3 -> 3；other 无编号，显示真实 lane 名。
-        const kindText = kindName === 'other' ? (kindNo || lane.lane)
-          : kindNo.replace(/^(leader|ccw)\s*/, '')
+        // 身份英文已在徽章里（👑 leader / 🎩 ccw / · other），灰字只负责**编号**：
+        // leader1 -> 1、ccw3 -> 3；切分/main/other 没有编号，灰字留空，
+        // 绝不再把身份词重复写一遍。
+        const kindText = /^(leader|ccw)\d+$/.test(kindNo) ? kindNo.replace(/^(leader|ccw)/, '') : ''
         const kindHint = lane.role === 'leader' ? '统筹：分配任务并在末尾归纳自己那块'
           : lane.role === 'worker' ? `队员：归 ${labels.get(lane.leader ?? '') ?? lane.leader ?? '?'} 管辖`
           : lane.lane === 'orchestrator' ? '切分：只把总任务切块分给各 leader，不做末尾归纳'
@@ -1067,7 +1066,7 @@ function TicketBar({ ticket, activity, t, health, confirmStop, onClose, onCommen
             minWidth: 58, maxWidth: 140, whiteSpace: 'nowrap',
             overflow: 'hidden', textOverflow: 'ellipsis',
             color: lane.state === 'running' ? '#9ae6b4' : '#aaa' }}
-            title={lane.lane}>{labels.get(lane.lane) ?? laneLabel(lane.lane)}</span>}
+            title={lane.lane}>{lane.role === 'other' ? lane.lane : (labels.get(lane.lane) ?? laneLabel(lane.lane))}</span>}
           <span style={{ flexShrink: 0, fontSize: 10, padding: '0 5px', borderRadius: 3,
             background: lane.state === 'running' ? '#1f4d33' : '#333',
             color: lane.state === 'running' ? '#9ae6b4' : '#999' }}>
